@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -277,6 +277,8 @@ mod tests {
                 encoding_config: EncodingProperties::Json(crate::parser::JsonProperties {
                     use_schema_registry: false,
                     timestamptz_handling: None,
+                    timestamp_handling: None,
+                    time_handling: None,
                 }),
             },
             data_types,

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::types::Fields;
+use risingwave_common::catalog::FragmentTypeFlag;
+use risingwave_common::types::{Fields, JsonbVal};
 use risingwave_frontend_macro::system_catalog;
-use risingwave_pb::stream_plan::FragmentTypeFlag;
+use serde_json::json;
 
 use crate::catalog::system_catalog::SysCatalogReaderImpl;
 use crate::error::Result;
@@ -29,14 +30,16 @@ struct RwFragment {
     upstream_fragment_ids: Vec<i32>,
     flags: Vec<String>,
     parallelism: i32,
+    max_parallelism: i32,
+    node: JsonbVal,
 }
 
-fn extract_fragment_type_flag(mask: u32) -> Vec<FragmentTypeFlag> {
+pub(super) fn extract_fragment_type_flag(mask: u32) -> Vec<FragmentTypeFlag> {
     let mut result = vec![];
     for i in 0..32 {
         let bit = 1 << i;
         if mask & bit != 0 {
-            match FragmentTypeFlag::try_from(bit as i32) {
+            match FragmentTypeFlag::try_from(bit) {
                 Err(_) => continue,
                 Ok(flag) => result.push(flag),
             };
@@ -67,17 +70,18 @@ async fn read_rw_fragment(reader: &SysCatalogReaderImpl) -> Result<Vec<RwFragmen
                 .collect(),
             flags: extract_fragment_type_flag(distribution.fragment_type_mask)
                 .into_iter()
-                .flat_map(|t| t.as_str_name().strip_prefix("FRAGMENT_TYPE_FLAG_"))
-                .map(|s| s.into())
+                .map(|t| t.as_str_name().to_owned())
                 .collect(),
             parallelism: distribution.parallelism as i32,
+            max_parallelism: distribution.vnode_count as i32,
+            node: json!(distribution.node).into(),
         })
         .collect())
 }
 
 #[cfg(test)]
 mod tests {
-    use risingwave_pb::stream_plan::FragmentTypeFlag;
+    use risingwave_common::catalog::FragmentTypeFlag;
 
     use super::extract_fragment_type_flag;
 

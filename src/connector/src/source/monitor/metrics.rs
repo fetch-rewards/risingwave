@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use prometheus::{exponential_buckets, histogram_opts, Registry};
+use prometheus::{Registry, exponential_buckets, histogram_opts};
 use risingwave_common::metrics::{
     LabelGuardedHistogramVec, LabelGuardedIntCounterVec, LabelGuardedIntGaugeVec,
 };
@@ -28,7 +28,7 @@ use crate::source::kafka::stats::RdKafkaStats;
 
 #[derive(Debug, Clone)]
 pub struct EnumeratorMetrics {
-    pub high_watermark: LabelGuardedIntGaugeVec<2>,
+    pub high_watermark: LabelGuardedIntGaugeVec,
 }
 
 pub static GLOBAL_ENUMERATOR_METRICS: LazyLock<EnumeratorMetrics> =
@@ -59,18 +59,19 @@ impl Default for EnumeratorMetrics {
 
 #[derive(Debug, Clone)]
 pub struct SourceMetrics {
-    pub partition_input_count: LabelGuardedIntCounterVec<5>,
+    pub partition_input_count: LabelGuardedIntCounterVec,
 
     // **Note**: for normal messages, the metric is the message's payload size.
     // For messages from load generator, the metric is the size of stream chunk.
-    pub partition_input_bytes: LabelGuardedIntCounterVec<5>,
+    pub partition_input_bytes: LabelGuardedIntCounterVec,
     /// Report latest message id
-    pub latest_message_id: LabelGuardedIntGaugeVec<3>,
+    pub latest_message_id: LabelGuardedIntGaugeVec,
     pub rdkafka_native_metric: Arc<RdKafkaStats>,
 
-    pub connector_source_rows_received: LabelGuardedIntCounterVec<2>,
+    pub direct_cdc_event_lag_latency: LabelGuardedHistogramVec,
 
-    pub direct_cdc_event_lag_latency: LabelGuardedHistogramVec<1>,
+    pub parquet_source_skip_row_count: LabelGuardedIntCounterVec,
+    pub file_source_input_row_count: LabelGuardedIntCounterVec,
 }
 
 pub static GLOBAL_SOURCE_METRICS: LazyLock<SourceMetrics> =
@@ -112,30 +113,40 @@ impl SourceMetrics {
         )
         .unwrap();
 
-        let connector_source_rows_received = register_guarded_int_counter_vec_with_registry!(
-            "source_rows_received",
-            "Number of rows received by source",
-            &["source_type", "source_id"],
-            registry
-        )
-        .unwrap();
-
         let opts = histogram_opts!(
             "source_cdc_event_lag_duration_milliseconds",
             "source_cdc_lag_latency",
             exponential_buckets(1.0, 2.0, 21).unwrap(), // max 1048s
         );
+
+        let parquet_source_skip_row_count = register_guarded_int_counter_vec_with_registry!(
+            "parquet_source_skip_row_count",
+            "Total number of rows that have been set to null in parquet source",
+            &["actor_id", "source_id", "source_name", "fragment_id"],
+            registry
+        )
+        .unwrap();
+
         let direct_cdc_event_lag_latency =
             register_guarded_histogram_vec_with_registry!(opts, &["table_name"], registry).unwrap();
 
         let rdkafka_native_metric = Arc::new(RdKafkaStats::new(registry.clone()));
+
+        let file_source_input_row_count = register_guarded_int_counter_vec_with_registry!(
+            "file_source_input_row_count",
+            "Total number of rows that have been read in file source",
+            &["source_id", "source_name", "actor_id", "fragment_id"],
+            registry
+        )
+        .unwrap();
         SourceMetrics {
             partition_input_count,
             partition_input_bytes,
             latest_message_id,
             rdkafka_native_metric,
-            connector_source_rows_received,
             direct_cdc_event_lag_latency,
+            parquet_source_skip_row_count,
+            file_source_input_row_count,
         }
     }
 }

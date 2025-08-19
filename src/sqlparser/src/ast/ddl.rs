@@ -20,9 +20,10 @@ use core::fmt;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use super::ConnectorSchema;
+use super::{ConfigParam, FormatEncodeOptions, SqlOption};
 use crate::ast::{
-    display_comma_separated, display_separated, DataType, Expr, Ident, ObjectName, SetVariableValue,
+    DataType, Expr, Ident, ObjectName, Query, SecretRefValue, SetVariableValue, Value,
+    display_comma_separated, display_separated,
 };
 use crate::tokenizer::Token;
 
@@ -31,6 +32,7 @@ use crate::tokenizer::Token;
 pub enum AlterDatabaseOperation {
     ChangeOwner { new_owner_name: Ident },
     RenameDatabase { database_name: ObjectName },
+    SetParam(ConfigParam),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -38,6 +40,7 @@ pub enum AlterDatabaseOperation {
 pub enum AlterSchemaOperation {
     ChangeOwner { new_owner_name: Ident },
     RenameSchema { schema_name: ObjectName },
+    SwapRenameSchema { target_schema: ObjectName },
 }
 
 /// An `ALTER TABLE` (`Statement::AlterTable`) operation
@@ -106,6 +109,24 @@ pub enum AlterTableOperation {
     SetSourceRateLimit {
         rate_limit: i32,
     },
+    /// SET BACKFILL_RATE_LIMIT TO <rate_limit>
+    SetBackfillRateLimit {
+        rate_limit: i32,
+    },
+    /// `SET DML_RATE_LIMIT TO <rate_limit>`
+    SetDmlRateLimit {
+        rate_limit: i32,
+    },
+    /// `SWAP WITH <table_name>`
+    SwapRenameTable {
+        target_table: ObjectName,
+    },
+    /// `DROP CONNECTOR`
+    DropConnector,
+    /// `ALTER CONNECTOR WITH (<connector_props>)`
+    AlterConnectorProps {
+        alter_props: Vec<SqlOption>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -138,9 +159,26 @@ pub enum AlterViewOperation {
         parallelism: SetVariableValue,
         deferred: bool,
     },
+    /// `SET RESOURCE_GROUP TO 'RESOURCE GROUP' [ DEFERRED ]`
+    /// `RESET RESOURCE_GROUP [ DEFERRED ]`
+    SetResourceGroup {
+        resource_group: Option<SetVariableValue>,
+        deferred: bool,
+    },
     /// `SET BACKFILL_RATE_LIMIT TO <rate_limit>`
     SetBackfillRateLimit {
         rate_limit: i32,
+    },
+    /// `SWAP WITH <view_name>`
+    SwapRenameView {
+        target_view: ObjectName,
+    },
+    SetStreamingEnableUnalignedJoin {
+        enable: bool,
+    },
+    /// `AS <query>`
+    AsQuery {
+        query: Box<Query>,
     },
 }
 
@@ -161,6 +199,19 @@ pub enum AlterSinkOperation {
         parallelism: SetVariableValue,
         deferred: bool,
     },
+    /// `SWAP WITH <sink_name>`
+    SwapRenameSink {
+        target_sink: ObjectName,
+    },
+    SetSinkRateLimit {
+        rate_limit: i32,
+    },
+    AlterConnectorProps {
+        alter_props: Vec<SqlOption>,
+    },
+    SetStreamingEnableUnalignedJoin {
+        enable: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -169,18 +220,42 @@ pub enum AlterSubscriptionOperation {
     RenameSubscription { subscription_name: ObjectName },
     ChangeOwner { new_owner_name: Ident },
     SetSchema { new_schema_name: ObjectName },
+    SwapRenameSubscription { target_subscription: ObjectName },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum AlterSourceOperation {
-    RenameSource { source_name: ObjectName },
-    AddColumn { column_def: ColumnDef },
-    ChangeOwner { new_owner_name: Ident },
-    SetSchema { new_schema_name: ObjectName },
-    FormatEncode { connector_schema: ConnectorSchema },
+    RenameSource {
+        source_name: ObjectName,
+    },
+    AddColumn {
+        column_def: ColumnDef,
+    },
+    ChangeOwner {
+        new_owner_name: Ident,
+    },
+    SetSchema {
+        new_schema_name: ObjectName,
+    },
+    FormatEncode {
+        format_encode: FormatEncodeOptions,
+    },
     RefreshSchema,
-    SetSourceRateLimit { rate_limit: i32 },
+    SetSourceRateLimit {
+        rate_limit: i32,
+    },
+    SwapRenameSource {
+        target_source: ObjectName,
+    },
+    /// `SET PARALLELISM TO <parallelism> [ DEFERRED ]`
+    SetParallelism {
+        parallelism: SetVariableValue,
+        deferred: bool,
+    },
+    AlterConnectorProps {
+        alter_props: Vec<SqlOption>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -193,6 +268,19 @@ pub enum AlterFunctionOperation {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum AlterConnectionOperation {
     SetSchema { new_schema_name: ObjectName },
+    ChangeOwner { new_owner_name: Ident },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum AlterSecretOperation {
+    ChangeCredential { new_credential: Value },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum AlterFragmentOperation {
+    AlterBackfillRateLimit { rate_limit: i32 },
 }
 
 impl fmt::Display for AlterDatabaseOperation {
@@ -203,6 +291,9 @@ impl fmt::Display for AlterDatabaseOperation {
             }
             AlterDatabaseOperation::RenameDatabase { database_name } => {
                 write!(f, "RENAME TO {}", database_name)
+            }
+            AlterDatabaseOperation::SetParam(ConfigParam { param, value }) => {
+                write!(f, "SET {} TO {}", param, value)
             }
         }
     }
@@ -216,6 +307,9 @@ impl fmt::Display for AlterSchemaOperation {
             }
             AlterSchemaOperation::RenameSchema { schema_name } => {
                 write!(f, "RENAME TO {}", schema_name)
+            }
+            AlterSchemaOperation::SwapRenameSchema { target_schema } => {
+                write!(f, "SWAP WITH {}", target_schema)
             }
         }
     }
@@ -282,7 +376,7 @@ impl fmt::Display for AlterTableOperation {
             } => {
                 write!(
                     f,
-                    "SET PARALLELISM TO {} {}",
+                    "SET PARALLELISM TO {}{}",
                     parallelism,
                     if *deferred { " DEFERRED" } else { "" }
                 )
@@ -292,6 +386,25 @@ impl fmt::Display for AlterTableOperation {
             }
             AlterTableOperation::SetSourceRateLimit { rate_limit } => {
                 write!(f, "SET SOURCE_RATE_LIMIT TO {}", rate_limit)
+            }
+            AlterTableOperation::SetBackfillRateLimit { rate_limit } => {
+                write!(f, "SET BACKFILL_RATE_LIMIT TO {}", rate_limit)
+            }
+            AlterTableOperation::SetDmlRateLimit { rate_limit } => {
+                write!(f, "SET DML_RATE_LIMIT TO {}", rate_limit)
+            }
+            AlterTableOperation::SwapRenameTable { target_table } => {
+                write!(f, "SWAP WITH {}", target_table)
+            }
+            AlterTableOperation::DropConnector => {
+                write!(f, "DROP CONNECTOR")
+            }
+            AlterTableOperation::AlterConnectorProps { alter_props } => {
+                write!(
+                    f,
+                    "CONNECTOR WITH ({})",
+                    display_comma_separated(alter_props)
+                )
             }
         }
     }
@@ -309,7 +422,7 @@ impl fmt::Display for AlterIndexOperation {
             } => {
                 write!(
                     f,
-                    "SET PARALLELISM TO {} {}",
+                    "SET PARALLELISM TO {}{}",
                     parallelism,
                     if *deferred { " DEFERRED" } else { "" }
                 )
@@ -336,13 +449,34 @@ impl fmt::Display for AlterViewOperation {
             } => {
                 write!(
                     f,
-                    "SET PARALLELISM TO {} {}",
+                    "SET PARALLELISM TO {}{}",
                     parallelism,
                     if *deferred { " DEFERRED" } else { "" }
                 )
             }
             AlterViewOperation::SetBackfillRateLimit { rate_limit } => {
                 write!(f, "SET BACKFILL_RATE_LIMIT TO {}", rate_limit)
+            }
+            AlterViewOperation::SwapRenameView { target_view } => {
+                write!(f, "SWAP WITH {}", target_view)
+            }
+            AlterViewOperation::SetResourceGroup {
+                resource_group,
+                deferred,
+            } => {
+                let deferred = if *deferred { " DEFERRED" } else { "" };
+
+                if let Some(resource_group) = resource_group {
+                    write!(f, "SET RESOURCE_GROUP TO {} {}", resource_group, deferred)
+                } else {
+                    write!(f, "RESET RESOURCE_GROUP {}", deferred)
+                }
+            }
+            AlterViewOperation::SetStreamingEnableUnalignedJoin { enable } => {
+                write!(f, "SET STREAMING_ENABLE_UNALIGNED_JOIN TO {}", enable)
+            }
+            AlterViewOperation::AsQuery { query } => {
+                write!(f, "AS {}", query)
             }
         }
     }
@@ -366,10 +500,28 @@ impl fmt::Display for AlterSinkOperation {
             } => {
                 write!(
                     f,
-                    "SET PARALLELISM TO {} {}",
+                    "SET PARALLELISM TO {}{}",
                     parallelism,
                     if *deferred { " DEFERRED" } else { "" }
                 )
+            }
+            AlterSinkOperation::SwapRenameSink { target_sink } => {
+                write!(f, "SWAP WITH {}", target_sink)
+            }
+            AlterSinkOperation::SetSinkRateLimit { rate_limit } => {
+                write!(f, "SET SINK_RATE_LIMIT TO {}", rate_limit)
+            }
+            AlterSinkOperation::AlterConnectorProps {
+                alter_props: changed_props,
+            } => {
+                write!(
+                    f,
+                    "CONNECTOR WITH ({})",
+                    display_comma_separated(changed_props)
+                )
+            }
+            AlterSinkOperation::SetStreamingEnableUnalignedJoin { enable } => {
+                write!(f, "SET STREAMING_ENABLE_UNALIGNED_JOIN TO {}", enable)
             }
         }
     }
@@ -386,6 +538,11 @@ impl fmt::Display for AlterSubscriptionOperation {
             }
             AlterSubscriptionOperation::SetSchema { new_schema_name } => {
                 write!(f, "SET SCHEMA {}", new_schema_name)
+            }
+            AlterSubscriptionOperation::SwapRenameSubscription {
+                target_subscription,
+            } => {
+                write!(f, "SWAP WITH {}", target_subscription)
             }
         }
     }
@@ -406,14 +563,35 @@ impl fmt::Display for AlterSourceOperation {
             AlterSourceOperation::SetSchema { new_schema_name } => {
                 write!(f, "SET SCHEMA {}", new_schema_name)
             }
-            AlterSourceOperation::FormatEncode { connector_schema } => {
-                write!(f, "{connector_schema}")
+            AlterSourceOperation::FormatEncode { format_encode } => {
+                write!(f, "{format_encode}")
             }
             AlterSourceOperation::RefreshSchema => {
                 write!(f, "REFRESH SCHEMA")
             }
             AlterSourceOperation::SetSourceRateLimit { rate_limit } => {
                 write!(f, "SET SOURCE_RATE_LIMIT TO {}", rate_limit)
+            }
+            AlterSourceOperation::SwapRenameSource { target_source } => {
+                write!(f, "SWAP WITH {}", target_source)
+            }
+            AlterSourceOperation::SetParallelism {
+                parallelism,
+                deferred,
+            } => {
+                write!(
+                    f,
+                    "SET PARALLELISM TO {}{}",
+                    parallelism,
+                    if *deferred { " DEFERRED" } else { "" }
+                )
+            }
+            AlterSourceOperation::AlterConnectorProps { alter_props } => {
+                write!(
+                    f,
+                    "CONNECTOR WITH ({})",
+                    display_comma_separated(alter_props)
+                )
             }
         }
     }
@@ -434,6 +612,19 @@ impl fmt::Display for AlterConnectionOperation {
         match self {
             AlterConnectionOperation::SetSchema { new_schema_name } => {
                 write!(f, "SET SCHEMA {new_schema_name}")
+            }
+            AlterConnectionOperation::ChangeOwner { new_owner_name } => {
+                write!(f, "OWNER TO {new_owner_name}")
+            }
+        }
+    }
+}
+
+impl fmt::Display for AlterSecretOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AlterSecretOperation::ChangeCredential { new_credential } => {
+                write!(f, "AS {new_credential}")
             }
         }
     }
@@ -467,7 +658,7 @@ impl fmt::Display for AlterColumnOperation {
             AlterColumnOperation::SetDefault { value } => {
                 write!(f, "SET DEFAULT {}", value)
             }
-            AlterColumnOperation::DropDefault {} => {
+            AlterColumnOperation::DropDefault => {
                 write!(f, "DROP DEFAULT")
             }
             AlterColumnOperation::SetDataType { data_type, using } => {
@@ -476,6 +667,16 @@ impl fmt::Display for AlterColumnOperation {
                 } else {
                     write!(f, "SET DATA TYPE {}", data_type)
                 }
+            }
+        }
+    }
+}
+
+impl fmt::Display for AlterFragmentOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AlterFragmentOperation::AlterBackfillRateLimit { rate_limit } => {
+                write!(f, "SET BACKFILL_RATE_LIMIT TO {}", rate_limit)
             }
         }
     }
@@ -614,7 +815,7 @@ impl fmt::Display for ColumnDef {
             if let Some(data_type) = &self.data_type {
                 data_type.to_string()
             } else {
-                "None".to_string()
+                "None".to_owned()
             }
         )?;
         for option in &self.options {
@@ -663,7 +864,17 @@ pub enum ColumnOption {
     /// `NOT NULL`
     NotNull,
     /// `DEFAULT <restricted-expr>`
-    DefaultColumns(Expr),
+    DefaultValue(Expr),
+    /// Default value from previous bound `DefaultColumnDesc`. Used internally
+    /// for schema change and should not be specified by users.
+    DefaultValueInternal {
+        /// Protobuf encoded `DefaultColumnDesc`.
+        persisted: Box<[u8]>,
+        /// Optional AST for unparsing. If `None`, the default value will be
+        /// shown as `DEFAULT INTERNAL` which is for demonstrating and should
+        /// not be specified by users.
+        expr: Option<Expr>,
+    },
     /// `{ PRIMARY KEY | UNIQUE }`
     Unique { is_primary: bool },
     /// A referential integrity constraint (`[FOREIGN KEY REFERENCES
@@ -693,7 +904,14 @@ impl fmt::Display for ColumnOption {
         match self {
             Null => write!(f, "NULL"),
             NotNull => write!(f, "NOT NULL"),
-            DefaultColumns(expr) => write!(f, "DEFAULT {}", expr),
+            DefaultValue(expr) => write!(f, "DEFAULT {}", expr),
+            DefaultValueInternal { persisted: _, expr } => {
+                if let Some(expr) = expr {
+                    write!(f, "DEFAULT {}", expr)
+                } else {
+                    write!(f, "DEFAULT INTERNAL")
+                }
+            }
             Unique { is_primary } => {
                 write!(f, "{}", if *is_primary { "PRIMARY KEY" } else { "UNIQUE" })
             }
@@ -724,7 +942,7 @@ impl fmt::Display for ColumnOption {
 
 fn display_constraint_name(name: &'_ Option<Ident>) -> impl fmt::Display + '_ {
     struct ConstraintName<'a>(&'a Option<Ident>);
-    impl<'a> fmt::Display for ConstraintName<'a> {
+    impl fmt::Display for ConstraintName<'_> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             if let Some(name) = self.0 {
                 write!(f, "CONSTRAINT {} ", name)?;
@@ -759,4 +977,14 @@ impl fmt::Display for ReferentialAction {
             ReferentialAction::SetDefault => "SET DEFAULT",
         })
     }
+}
+
+/// secure secret definition for webhook source
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct WebhookSourceInfo {
+    pub secret_ref: Option<SecretRefValue>,
+    pub signature_expr: Expr,
+    pub wait_for_persistence: bool,
+    pub is_batched: bool,
 }

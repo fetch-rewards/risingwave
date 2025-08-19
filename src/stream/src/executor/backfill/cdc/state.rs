@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -50,8 +50,8 @@ impl<S: StateStore> CdcBackfillState<S> {
         }
     }
 
-    pub fn init_epoch(&mut self, epoch: EpochPair) {
-        self.state_table.init_epoch(epoch)
+    pub async fn init_epoch(&mut self, epoch: EpochPair) -> StreamExecutorResult<()> {
+        self.state_table.init_epoch(epoch).await
     }
 
     /// Restore the backfill state from storage
@@ -132,6 +132,8 @@ impl<S: StateStore> CdcBackfillState<S> {
 
     /// Persist the state to storage
     pub async fn commit_state(&mut self, new_epoch: EpochPair) -> StreamExecutorResult<()> {
-        self.state_table.commit(new_epoch).await
+        self.state_table
+            .commit_assert_no_update_vnode_bitmap(new_epoch)
+            .await
     }
 }

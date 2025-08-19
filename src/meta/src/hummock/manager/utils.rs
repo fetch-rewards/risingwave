@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,35 +19,17 @@ macro_rules! commit_multi_var {
     ($meta_store:expr, $($val_txn:expr),*) => {
         {
             async {
-                use crate::model::{InMemValTransaction, ValTransaction};
-                match &$meta_store {
-                    $crate::manager::MetaStoreImpl::Kv(meta_store) => {
-                        use crate::storage::Transaction;
-                        use crate::storage::meta_store::MetaStore;
-                        let mut txn = Transaction::default();
-                        $(
-                            $val_txn.apply_to_txn(&mut txn).await?;
-                        )*
-                        meta_store.txn(txn).await?;
-                        $(
-                            $val_txn.commit();
-                        )*
-                        Result::Ok(())
-                    }
-                    crate::manager::MetaStoreImpl::Sql(sql_meta_store) => {
-                        use sea_orm::TransactionTrait;
-                        use crate::model::MetadataModelError;
-                        let mut txn = sql_meta_store.conn.begin().await.map_err(MetadataModelError::from)?;
-                        $(
-                            $val_txn.apply_to_txn(&mut txn).await?;
-                        )*
-                        txn.commit().await.map_err(MetadataModelError::from)?;
-                        $(
-                            $val_txn.commit();
-                        )*
-                        Result::Ok(())
-                    }
-                }
+                use crate::model::{MetadataModelError, InMemValTransaction, ValTransaction};
+                use sea_orm::TransactionTrait;
+                let mut txn = $meta_store.conn.begin().await.map_err(MetadataModelError::from)?;
+                $(
+                    $val_txn.apply_to_txn(&mut txn).await?;
+                )*
+                txn.commit().await.map_err(MetadataModelError::from)?;
+                $(
+                    $val_txn.commit();
+                )*
+                Result::Ok(())
             }.await
         }
     };
@@ -72,12 +54,12 @@ macro_rules! commit_multi_var_with_provided_txn {
     };
 }
 
-use risingwave_hummock_sdk::SstObjectIdRange;
+use risingwave_hummock_sdk::ObjectIdRange;
 pub(crate) use {commit_multi_var, commit_multi_var_with_provided_txn};
 
-use crate::hummock::error::Result;
-use crate::hummock::sequence::next_sstable_object_id;
 use crate::hummock::HummockManager;
+use crate::hummock::error::Result;
+use crate::hummock::sequence::next_raw_object_id;
 
 impl HummockManager {
     #[cfg(test)]
@@ -88,7 +70,6 @@ impl HummockManager {
         let mut compaction_guard = self.compaction.write().await;
         let mut versioning_guard = self.versioning.write().await;
         let mut context_info_guard = self.context_info.write().await;
-        let objects_to_delete = self.delete_object_tracker.current();
         // We don't check `checkpoint` because it's allowed to update its in memory state without
         // persisting to object store.
         let get_state = |compaction_guard: &mut Compaction,
@@ -97,14 +78,12 @@ impl HummockManager {
             let compact_statuses_copy = compaction_guard.compaction_statuses.clone();
             let compact_task_assignment_copy = compaction_guard.compact_task_assignment.clone();
             let pinned_versions_copy = context_info_guard.pinned_versions.clone();
-            let pinned_snapshots_copy = context_info_guard.pinned_snapshots.clone();
             let hummock_version_deltas_copy = versioning_guard.hummock_version_deltas.clone();
             let version_stats_copy = versioning_guard.version_stats.clone();
             ((
                 compact_statuses_copy,
                 compact_task_assignment_copy,
                 pinned_versions_copy,
-                pinned_snapshots_copy,
                 hummock_version_deltas_copy,
                 version_stats_copy,
             ),)
@@ -130,13 +109,10 @@ impl HummockManager {
             mem_state, loaded_state,
             "hummock in-mem state is inconsistent with meta store state",
         );
-        self.delete_object_tracker.clear();
-        self.delete_object_tracker
-            .add(objects_to_delete.into_iter());
     }
 
-    pub async fn get_new_sst_ids(&self, number: u32) -> Result<SstObjectIdRange> {
-        let start_id = next_sstable_object_id(&self.env, number).await?;
-        Ok(SstObjectIdRange::new(start_id, start_id + number as u64))
+    pub async fn get_new_object_ids(&self, number: u32) -> Result<ObjectIdRange> {
+        let start_id = next_raw_object_id(&self.env, number).await?;
+        Ok(ObjectIdRange::new(start_id, start_id + number as u64))
     }
 }

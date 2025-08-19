@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,8 @@ use futures::StreamExt;
 use iceberg::spec::ManifestList;
 use iceberg::table::Table;
 use risingwave_common::types::Fields;
-use risingwave_connector::sink::iceberg::IcebergConfig;
-use risingwave_connector::source::ConnectorProperties;
 use risingwave_connector::WithPropertiesExt;
+use risingwave_connector::source::ConnectorProperties;
 use risingwave_frontend_macro::system_catalog;
 
 use crate::catalog::system_catalog::SysCatalogReaderImpl;
@@ -81,8 +80,7 @@ async fn read(reader: &SysCatalogReaderImpl) -> Result<Vec<RwIcebergFiles>> {
     for (schema_name, source) in iceberg_sources {
         let config = ConnectorProperties::extract(source.with_properties.clone(), false)?;
         if let ConnectorProperties::Iceberg(iceberg_properties) = config {
-            let iceberg_config: IcebergConfig = iceberg_properties.to_iceberg_config();
-            let table: Table = iceberg_config.load_table_v2().await?;
+            let table: Table = iceberg_properties.load_table().await?;
             if let Some(snapshot) = table.metadata().current_snapshot() {
                 let manifest_list: ManifestList = snapshot
                     .load_manifest_list(table.file_io(), table.metadata())
@@ -103,7 +101,7 @@ async fn read(reader: &SysCatalogReaderImpl) -> Result<Vec<RwIcebergFiles>> {
                             schema_name: schema_name.clone(),
                             source_name: source.name.clone(),
                             content: file.content_type() as i32,
-                            file_path: file.file_path().to_string(),
+                            file_path: file.file_path().to_owned(),
                             file_format: file.file_format().to_string(),
                             record_count: file.record_count() as i64,
                             file_size_in_bytes: file.file_size_in_bytes() as i64,

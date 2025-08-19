@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,21 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
-use prost::Message;
-use risingwave_pb::telemetry::{
-    EventMessage as PbEventMessage, PbTelemetryDatabaseObject,
-    TelemetryEventStage as PbTelemetryEventStage,
+use risingwave_pb::telemetry::PbEventMessage;
+pub use risingwave_telemetry_event::{
+    TELEMETRY_EVENT_REPORT_INTERVAL, TELEMETRY_REPORT_URL, TELEMETRY_TRACKING_ID,
+    current_timestamp, do_telemetry_event_report, post_telemetry_report_pb,
+};
+use risingwave_telemetry_event::{
+    TELEMETRY_EVENT_REPORT_STASH_SIZE, TELEMETRY_EVENT_REPORT_TX,
+    get_telemetry_risingwave_cloud_uuid,
 };
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval as tokio_interval_fn};
 use uuid::Uuid;
 
-use super::{current_timestamp, Result, TELEMETRY_REPORT_INTERVAL, TELEMETRY_REPORT_URL};
+use super::{Result, TELEMETRY_REPORT_INTERVAL};
 use crate::telemetry::pb_compatible::TelemetryToProtobuf;
-use crate::telemetry::post_telemetry_report_pb;
 
 #[async_trait::async_trait]
 pub trait TelemetryInfoFetcher {
@@ -47,8 +50,6 @@ pub trait TelemetryReportCreator {
     fn report_type(&self) -> &str;
 }
 
-static TELEMETRY_TRACKING_ID: OnceLock<String> = OnceLock::new();
-
 pub async fn start_telemetry_reporting<F, I>(
     info_fetcher: Arc<I>,
     report_creator: Arc<F>,
@@ -64,23 +65,34 @@ where
 
         let begin_time = std::time::Instant::now();
         let session_id = Uuid::new_v4().to_string();
-        let mut interval = interval(Duration::from_secs(TELEMETRY_REPORT_INTERVAL));
+        let mut interval = tokio_interval_fn(Duration::from_secs(TELEMETRY_REPORT_INTERVAL));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        let mut event_interval =
+            tokio_interval_fn(Duration::from_secs(TELEMETRY_EVENT_REPORT_INTERVAL));
+        event_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         // fetch telemetry tracking_id from the meta node only at the beginning
-        // There is only one case tracking_id updated at the runtime ---- etcd data has been
-        // cleaned. There is no way that etcd has been cleaned but nodes are still running
-        let tracking_id = match info_fetcher.fetch_telemetry_info().await {
-            Ok(Some(id)) => id,
-            Ok(None) => {
-                tracing::info!("Telemetry is disabled");
-                return;
-            }
-            Err(err) => {
-                tracing::error!("Telemetry failed to get tracking_id, err {}", err);
-                return;
+        // There is only one case tracking_id updated at the runtime ---- metastore data has been
+        // cleaned. There is no way that metastore has been cleaned but nodes are still running
+        let tracking_id = {
+            match (
+                info_fetcher.fetch_telemetry_info().await,
+                get_telemetry_risingwave_cloud_uuid(),
+            ) {
+                (Ok(None), _) => {
+                    tracing::info!("Telemetry is disabled");
+                    return;
+                }
+                (Err(err), _) => {
+                    tracing::error!("Telemetry failed to get tracking_id, err {}", err);
+                    return;
+                }
+                (Ok(Some(_)), Some(cloud_uuid)) => cloud_uuid,
+                (Ok(Some(id)), None) => id,
             }
         };
+
         TELEMETRY_TRACKING_ID
             .set(tracking_id.clone())
             .unwrap_or_else(|_| {
@@ -89,9 +101,39 @@ where
                 )
             });
 
+        let (tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PbEventMessage>();
+
+        let mut enable_event_report = true;
+        TELEMETRY_EVENT_REPORT_TX.set(tx).unwrap_or_else(|_| {
+            tracing::warn!(
+                "Telemetry failed to set event reporting tx, event reporting will be disabled"
+            );
+            // possible failure:
+            // When running in standalone mode, the static TELEMETRY_EVENT_REPORT_TX is shared
+            // and can be set by meta/compute nodes.
+            // In such case, the one first set the static will do the event reporting and others'
+            // event report is disabled.
+            enable_event_report = false;
+        });
+        let mut event_stash = Vec::new();
+
         loop {
             tokio::select! {
                 _ = interval.tick() => {},
+                event = event_rx.recv(), if enable_event_report => {
+                    if let Some(event) = event {
+                        // handle None event in case of the close channel
+                        event_stash.push(event);
+                    }
+                    if event_stash.len() >= TELEMETRY_EVENT_REPORT_STASH_SIZE {
+                        do_telemetry_event_report(&mut event_stash).await;
+                    }
+                    continue;
+                }
+                _ = event_interval.tick(), if enable_event_report => {
+                    do_telemetry_event_report(&mut event_stash).await;
+                    continue;
+                },
                 _ = &mut shutdown_rx => {
                     tracing::info!("Telemetry exit");
                     return;
@@ -125,100 +167,4 @@ where
         }
     });
     (join_handle, shutdown_tx)
-}
-
-pub fn report_event_common(
-    event_stage: PbTelemetryEventStage,
-    event_name: &str,
-    catalog_id: i64,
-    connector_name: Option<String>,
-    object: Option<PbTelemetryDatabaseObject>,
-    attributes: Option<jsonbb::Value>, // any json string
-    node: String,
-) {
-    let event_tracking_id: String;
-    if let Some(tracking_id) = TELEMETRY_TRACKING_ID.get() {
-        event_tracking_id = tracking_id.to_string();
-    } else {
-        tracing::info!("Telemetry tracking_id is not set, event reporting disabled");
-        return;
-    }
-
-    request_to_telemetry_event(
-        event_tracking_id,
-        event_stage,
-        event_name,
-        catalog_id,
-        connector_name,
-        object,
-        attributes,
-        node,
-        false,
-    );
-}
-
-fn request_to_telemetry_event(
-    tracking_id: String,
-    event_stage: PbTelemetryEventStage,
-    event_name: &str,
-    catalog_id: i64,
-    connector_name: Option<String>,
-    object: Option<PbTelemetryDatabaseObject>,
-    attributes: Option<jsonbb::Value>, // any json string
-    node: String,
-    is_test: bool,
-) {
-    let event = PbEventMessage {
-        tracking_id,
-        event_time_sec: current_timestamp(),
-        event_stage: event_stage as i32,
-        event_name: event_name.to_string(),
-        connector_name,
-        object: object.map(|c| c as i32),
-        catalog_id,
-        attributes: attributes.map(|a| a.to_string()),
-        node,
-        is_test,
-    };
-    let report_bytes = event.encode_to_vec();
-
-    tokio::spawn(async move {
-        const TELEMETRY_EVENT_REPORT_TYPE: &str = "event";
-        let url = (TELEMETRY_REPORT_URL.to_owned() + "/" + TELEMETRY_EVENT_REPORT_TYPE).to_owned();
-        post_telemetry_report_pb(&url, report_bytes)
-            .await
-            .unwrap_or_else(|e| tracing::info!("{}", e))
-    });
-}
-
-#[cfg(test)]
-mod test {
-
-    use super::*;
-
-    #[ignore]
-    #[tokio::test]
-    async fn test_telemetry_report_event() {
-        let event_stage = PbTelemetryEventStage::CreateStreamJob;
-        let event_name = "test_feature";
-        let catalog_id = 1;
-        let connector_name = Some("test_connector".to_string());
-        let object = Some(PbTelemetryDatabaseObject::Source);
-        let attributes = None;
-        let node = "test_node".to_string();
-
-        request_to_telemetry_event(
-            "7d45669c-08c7-4571-ae3d-d3a3e70a2f7e".to_string(),
-            event_stage,
-            event_name,
-            catalog_id,
-            connector_name,
-            object,
-            attributes,
-            node,
-            true,
-        );
-
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    }
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ use risingwave_backup::{MetaBackupJobId, MetaSnapshotId, MetaSnapshotManifest};
 use risingwave_common::bail;
 use risingwave_common::config::ObjectStoreConfig;
 use risingwave_common::system_param::reader::SystemParamsRead;
-use risingwave_hummock_sdk::HummockSstableObjectId;
+use risingwave_hummock_sdk::HummockRawObjectId;
 use risingwave_object_store::object::build_remote_object_store;
 use risingwave_object_store::object::object_metrics::ObjectStoreMetrics;
 use risingwave_pb::backup_service::{BackupJobStatus, MetaBackupManifestId};
@@ -31,13 +31,13 @@ use risingwave_pb::meta::subscribe_response::{Info, Operation};
 use thiserror_ext::AsReport;
 use tokio::task::JoinHandle;
 
+use crate::MetaResult;
+use crate::backup_restore::meta_snapshot_builder;
 use crate::backup_restore::metrics::BackupManagerMetrics;
-use crate::backup_restore::{meta_snapshot_builder, meta_snapshot_builder_v2};
 use crate::hummock::sequence::next_meta_backup_id;
 use crate::hummock::{HummockManagerRef, HummockVersionSafePoint};
-use crate::manager::{LocalNotification, MetaSrvEnv, MetaStoreImpl};
+use crate::manager::{LocalNotification, MetaSrvEnv};
 use crate::rpc::metrics::MetaMetrics;
-use crate::MetaResult;
 
 pub enum BackupJobResult {
     Succeeded,
@@ -87,7 +87,7 @@ impl BackupManager {
         store_url: &str,
         store_dir: &str,
     ) -> MetaResult<Arc<Self>> {
-        let store_config = (store_url.to_string(), store_dir.to_string());
+        let store_config = (store_url.to_owned(), store_dir.to_owned());
         let store = create_snapshot_store(
             &store_config,
             metrics.object_store_metric.clone(),
@@ -108,8 +108,7 @@ impl BackupManager {
         let (local_notification_tx, mut local_notification_rx) =
             tokio::sync::mpsc::unbounded_channel();
         env.notification_manager()
-            .insert_local_sender(local_notification_tx)
-            .await;
+            .insert_local_sender(local_notification_tx);
         let this = instance.clone();
         tokio::spawn(async move {
             loop {
@@ -117,8 +116,8 @@ impl BackupManager {
                     Some(notification) => {
                         if let LocalNotification::SystemParamsChange(p) = notification {
                             let new_config = (
-                                p.backup_storage_url().to_string(),
-                                p.backup_storage_directory().to_string(),
+                                p.backup_storage_url().to_owned(),
+                                p.backup_storage_directory().to_owned(),
                             );
                             this.handle_new_config(new_config).await;
                         }
@@ -315,15 +314,15 @@ impl BackupManager {
         Ok(())
     }
 
-    /// List all `SSTables` required by backups.
-    pub fn list_pinned_ssts(&self) -> HashSet<HummockSstableObjectId> {
+    /// List id of all objects required by backups.
+    pub fn list_pinned_object_ids(&self) -> HashSet<HummockRawObjectId> {
         self.backup_store
             .load()
             .0
             .manifest()
             .snapshot_metadata
             .iter()
-            .flat_map(|s| s.ssts.clone())
+            .flat_map(|s| s.objects.iter().copied())
             .collect()
     }
 
@@ -346,40 +345,25 @@ impl BackupWorker {
         let backup_manager_clone = self.backup_manager.clone();
         let job = async move {
             let hummock_manager = backup_manager_clone.hummock_manager.clone();
-            let hummock_version_builder =
-                async move { hummock_manager.get_current_version().await };
-            match backup_manager_clone.env.meta_store() {
-                MetaStoreImpl::Kv(kv) => {
-                    let mut snapshot_builder =
-                        meta_snapshot_builder::MetaSnapshotV1Builder::new(kv.clone());
-                    // Reuse job id as snapshot id.
-                    snapshot_builder
-                        .build(job_id, hummock_version_builder)
-                        .await?;
-                    let snapshot = snapshot_builder.finish()?;
-                    backup_manager_clone
-                        .backup_store
-                        .load()
-                        .0
-                        .create(&snapshot, remarks)
-                        .await?;
-                }
-                MetaStoreImpl::Sql(sql) => {
-                    let mut snapshot_builder =
-                        meta_snapshot_builder_v2::MetaSnapshotV2Builder::new(sql.clone());
-                    // Reuse job id as snapshot id.
-                    snapshot_builder
-                        .build(job_id, hummock_version_builder)
-                        .await?;
-                    let snapshot = snapshot_builder.finish()?;
-                    backup_manager_clone
-                        .backup_store
-                        .load()
-                        .0
-                        .create(&snapshot, remarks)
-                        .await?;
-                }
-            }
+            let hummock_version_builder = async move {
+                hummock_manager
+                    .on_current_version(|version| version.clone())
+                    .await
+            };
+            let meta_store = backup_manager_clone.env.meta_store();
+            let mut snapshot_builder =
+                meta_snapshot_builder::MetaSnapshotV2Builder::new(meta_store);
+            // Reuse job id as snapshot id.
+            snapshot_builder
+                .build(job_id, hummock_version_builder)
+                .await?;
+            let snapshot = snapshot_builder.finish()?;
+            backup_manager_clone
+                .backup_store
+                .load()
+                .0
+                .create(&snapshot, remarks)
+                .await?;
             Ok(BackupJobResult::Succeeded)
         };
         tokio::spawn(async move {

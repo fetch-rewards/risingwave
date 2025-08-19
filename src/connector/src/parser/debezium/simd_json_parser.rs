@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,14 +15,16 @@
 use std::fmt::Debug;
 
 use anyhow::Context;
-use simd_json::prelude::MutableObject;
 use simd_json::BorrowedValue;
+use simd_json::prelude::MutableObject;
 
 use crate::error::ConnectorResult;
-use crate::parser::unified::debezium::MongoJsonAccess;
-use crate::parser::unified::json::{JsonAccess, JsonParseOptions, TimestamptzHandling};
 use crate::parser::unified::AccessImpl;
-use crate::parser::AccessBuilder;
+use crate::parser::unified::debezium::MongoJsonAccess;
+use crate::parser::unified::json::{
+    JsonAccess, JsonParseOptions, TimeHandling, TimestampHandling, TimestamptzHandling,
+};
+use crate::parser::{AccessBuilder, MongoProperties};
 
 #[derive(Debug)]
 pub struct DebeziumJsonAccessBuilder {
@@ -31,10 +33,18 @@ pub struct DebeziumJsonAccessBuilder {
 }
 
 impl DebeziumJsonAccessBuilder {
-    pub fn new(timestamptz_handling: TimestamptzHandling) -> ConnectorResult<Self> {
+    pub fn new(
+        timestamptz_handling: TimestamptzHandling,
+        timestamp_handling: TimestampHandling,
+        time_handling: TimeHandling,
+    ) -> ConnectorResult<Self> {
         Ok(Self {
             value: None,
-            json_parse_options: JsonParseOptions::new_for_debezium(timestamptz_handling),
+            json_parse_options: JsonParseOptions::new_for_debezium(
+                timestamptz_handling,
+                timestamp_handling,
+                time_handling,
+            ),
         })
     }
 
@@ -48,7 +58,11 @@ impl DebeziumJsonAccessBuilder {
 
 impl AccessBuilder for DebeziumJsonAccessBuilder {
     #[allow(clippy::unused_async)]
-    async fn generate_accessor(&mut self, payload: Vec<u8>) -> ConnectorResult<AccessImpl<'_>> {
+    async fn generate_accessor(
+        &mut self,
+        payload: Vec<u8>,
+        _: &crate::source::SourceMeta,
+    ) -> ConnectorResult<AccessImpl<'_>> {
         self.value = Some(payload);
         let mut event: BorrowedValue<'_> =
             simd_json::to_borrowed_value(self.value.as_mut().unwrap())
@@ -71,22 +85,30 @@ impl AccessBuilder for DebeziumJsonAccessBuilder {
 pub struct DebeziumMongoJsonAccessBuilder {
     value: Option<Vec<u8>>,
     json_parse_options: JsonParseOptions,
+    strong_schema: bool,
 }
 
 impl DebeziumMongoJsonAccessBuilder {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(props: MongoProperties) -> anyhow::Result<Self> {
         Ok(Self {
             value: None,
             json_parse_options: JsonParseOptions::new_for_debezium(
                 TimestamptzHandling::GuessNumberUnit,
+                TimestampHandling::GuessNumberUnit,
+                TimeHandling::Micro,
             ),
+            strong_schema: props.strong_schema,
         })
     }
 }
 
 impl AccessBuilder for DebeziumMongoJsonAccessBuilder {
     #[allow(clippy::unused_async)]
-    async fn generate_accessor(&mut self, payload: Vec<u8>) -> ConnectorResult<AccessImpl<'_>> {
+    async fn generate_accessor(
+        &mut self,
+        payload: Vec<u8>,
+        _: &crate::source::SourceMeta,
+    ) -> ConnectorResult<AccessImpl<'_>> {
         self.value = Some(payload);
         let mut event: BorrowedValue<'_> =
             simd_json::to_borrowed_value(self.value.as_mut().unwrap())
@@ -100,6 +122,7 @@ impl AccessBuilder for DebeziumMongoJsonAccessBuilder {
 
         Ok(AccessImpl::MongoJson(MongoJsonAccess::new(
             JsonAccess::new_with_options(payload, &self.json_parse_options),
+            self.strong_schema,
         )))
     }
 }
@@ -120,7 +143,7 @@ mod tests {
         DebeziumParser, DebeziumProps, EncodingProperties, JsonProperties, ProtocolProperties,
         SourceColumnDesc, SourceStreamChunkBuilder, SpecificParserConfig,
     };
-    use crate::source::SourceContext;
+    use crate::source::{SourceContext, SourceCtrlOpts};
 
     fn assert_json_eq(parse_result: &Option<ScalarImpl>, json_str: &str) {
         if let Some(ScalarImpl::Jsonb(json_val)) = parse_result {
@@ -140,6 +163,8 @@ mod tests {
             encoding_config: EncodingProperties::Json(JsonProperties {
                 use_schema_registry: false,
                 timestamptz_handling: None,
+                timestamp_handling: None,
+                time_handling: None,
             }),
             protocol_config: ProtocolProperties::Debezium(DebeziumProps::default()),
         };
@@ -153,15 +178,13 @@ mod tests {
         columns: Vec<SourceColumnDesc>,
         payload: Vec<u8>,
     ) -> Vec<(Op, OwnedRow)> {
-        let mut builder = SourceStreamChunkBuilder::with_capacity(columns, 2);
-        {
-            let writer = builder.row_writer();
-            parser
-                .parse_inner(None, Some(payload), writer)
-                .await
-                .unwrap();
-        }
-        let chunk = builder.finish();
+        let mut builder = SourceStreamChunkBuilder::new(columns, SourceCtrlOpts::for_test());
+        parser
+            .parse_inner(None, Some(payload), builder.row_writer())
+            .await
+            .unwrap();
+        builder.finish_current_chunk();
+        let chunk = builder.consume_ready_chunks().next().unwrap();
         chunk
             .rows()
             .map(|(op, row_ref)| (op, row_ref.into_owned_row()))
@@ -509,7 +532,8 @@ mod tests {
             ];
             let mut parser = build_parser(columns.clone()).await;
 
-            let mut builder = SourceStreamChunkBuilder::with_capacity(columns, 2);
+            let mut dummy_builder =
+                SourceStreamChunkBuilder::new(columns, SourceCtrlOpts::for_test());
 
             let normal_values = ["111", "1", "33", "444", "555.0", "666.0"];
             let overflow_values = [
@@ -530,7 +554,7 @@ mod tests {
                 ).as_bytes().to_vec();
 
                 let res = parser
-                    .parse_inner(None, Some(data), builder.row_writer())
+                    .parse_inner(None, Some(data), dummy_builder.row_writer())
                     .await;
                 if i < 5 {
                     // For other overflow, the parsing succeeds but the type conversion fails
@@ -604,13 +628,12 @@ mod tests {
                 SourceColumnDesc::simple("o_xml", DataType::Varchar, ColumnId::from(5)),
                 SourceColumnDesc::simple("o_uuid", DataType::Varchar, ColumnId::from(6)),
                 SourceColumnDesc {
-                    name: "o_point".to_string(),
+                    name: "o_point".to_owned(),
                     data_type: DataType::Struct(StructType::new(vec![
                         ("x", DataType::Float32),
                         ("y", DataType::Float32),
                     ])),
                     column_id: 7.into(),
-                    fields: vec![],
                     column_type: SourceColumnType::Normal,
                     is_pk: false,
                     is_hidden_addition_col: false,

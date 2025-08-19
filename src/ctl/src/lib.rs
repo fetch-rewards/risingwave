@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,24 +13,22 @@
 // limitations under the License.
 
 #![feature(let_chains)]
-#![feature(hash_extract_if)]
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use cmd_impl::bench::BenchCommands;
 use cmd_impl::hummock::SstDumpArgs;
-use itertools::Itertools;
 use risingwave_common::util::tokio_util::sync::CancellationToken;
-use risingwave_hummock_sdk::HummockEpoch;
+use risingwave_hummock_sdk::{HummockEpoch, HummockVersionId};
 use risingwave_meta::backup_restore::RestoreOpts;
 use risingwave_pb::hummock::rise_ctl_update_compaction_config_request::CompressionAlgorithm;
 use risingwave_pb::meta::update_worker_node_schedulability_request::Schedulability;
 use thiserror_ext::AsReport;
 
 use crate::cmd_impl::hummock::{
-    build_compaction_config_vec, list_pinned_snapshots, list_pinned_versions,
+    build_compaction_config_vec, list_pinned_versions, migrate_legacy_object,
 };
-use crate::cmd_impl::meta::EtcdBackend;
+use crate::cmd_impl::scale::set_cdc_table_backfill_parallelism;
 use crate::cmd_impl::throttle::apply_throttle;
 use crate::common::CtlContext;
 
@@ -72,12 +70,10 @@ enum Commands {
     /// Commands for Benchmarks
     #[clap(subcommand)]
     Bench(BenchCommands),
-    /// Commands for Debug
+    /// Commands for await-tree, such as dumping, analyzing and transcribing
     #[clap(subcommand)]
-    Debug(DebugCommands),
-    /// Dump the await-tree of compute nodes and compactors
     #[clap(visible_alias("trace"))]
-    AwaitTree,
+    AwaitTree(AwaitTreeCommands),
     // TODO(yuhao): profile other nodes
     /// Commands for profilng the compute nodes
     #[clap(subcommand)]
@@ -86,83 +82,13 @@ enum Commands {
     Throttle(ThrottleCommands),
 }
 
-#[derive(clap::ValueEnum, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-enum DebugCommonKind {
-    Worker,
-    User,
-    Table,
-    MetaMember,
-    SourceCatalog,
-    SinkCatalog,
-    IndexCatalog,
-    FunctionCatalog,
-    ViewCatalog,
-    ConnectionCatalog,
-    DatabaseCatalog,
-    SchemaCatalog,
-    TableCatalog,
-}
-
-#[derive(clap::ValueEnum, Clone, Debug)]
-enum DebugCommonOutputFormat {
-    Json,
-    Yaml,
-}
-
-#[derive(clap::Args, Debug, Clone)]
-pub struct DebugCommon {
-    /// The address of the etcd cluster
-    #[clap(long, value_delimiter = ',', default_value = "localhost:2388")]
-    etcd_endpoints: Vec<String>,
-
-    /// The username for etcd authentication, used if `--enable-etcd-auth` is set
-    #[clap(long)]
-    etcd_username: Option<String>,
-
-    /// The password for etcd authentication, used if `--enable-etcd-auth` is set
-    #[clap(long)]
-    etcd_password: Option<String>,
-
-    /// Whether to enable etcd authentication
-    #[clap(long, default_value_t = false, requires_all = &["etcd_username", "etcd_password"])]
-    enable_etcd_auth: bool,
-
-    /// Kinds of debug info to dump
-    #[clap(value_enum, value_delimiter = ',')]
-    kinds: Vec<DebugCommonKind>,
-
-    /// The output format
-    #[clap(value_enum, long = "output", short = 'o', default_value_t = DebugCommonOutputFormat::Yaml)]
-    format: DebugCommonOutputFormat,
-}
-
-#[derive(Subcommand, Clone, Debug)]
-pub enum DebugCommands {
-    /// Dump debug info from the raw state store
-    Dump {
-        #[command(flatten)]
-        common: DebugCommon,
-    },
-    /// Fix table fragments by cleaning up some un-exist fragments, which happens when the upstream
-    /// streaming job is failed to create and the fragments are not cleaned up due to some unidentified issues.
-    FixDirtyUpstreams {
-        #[command(flatten)]
-        common: DebugCommon,
-
-        #[clap(long)]
-        table_id: u32,
-
-        #[clap(long, value_delimiter = ',')]
-        dirty_fragment_ids: Vec<u32>,
-    },
-}
-
 #[derive(Subcommand)]
 enum ComputeCommands {
     /// Show all the configuration parameters on compute node
     ShowConfig { host: String },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum HummockCommands {
     /// list latest Hummock version on meta node
@@ -223,8 +149,6 @@ enum HummockCommands {
     },
     /// List pinned versions of each worker.
     ListPinnedVersions {},
-    /// List pinned snapshots of each worker.
-    ListPinnedSnapshots {},
     /// List all compaction groups.
     ListCompactionGroup,
     /// Update compaction config for compaction groups.
@@ -267,6 +191,24 @@ enum HummockCommands {
         compression_algorithm: Option<String>,
         #[clap(long)]
         max_l0_compact_level: Option<u32>,
+        #[clap(long)]
+        sst_allowed_trivial_move_min_size: Option<u64>,
+        #[clap(long)]
+        disable_auto_group_scheduling: Option<bool>,
+        #[clap(long)]
+        max_overlapping_level_size: Option<u64>,
+        #[clap(long)]
+        sst_allowed_trivial_move_max_count: Option<u32>,
+        #[clap(long)]
+        emergency_level0_sst_file_count: Option<u32>,
+        #[clap(long)]
+        emergency_level0_sub_level_partition: Option<u32>,
+        #[clap(long)]
+        level0_stop_write_threshold_max_sst_count: Option<u32>,
+        #[clap(long)]
+        level0_stop_write_threshold_max_size: Option<u64>,
+        #[clap(long)]
+        enable_optimize_l0_interval_selection: Option<bool>,
     },
     /// Split given compaction group into two. Moves the given tables to the new group.
     SplitCompactionGroup {
@@ -274,6 +216,8 @@ enum HummockCommands {
         compaction_group_id: u64,
         #[clap(long, value_delimiter = ',')]
         table_ids: Vec<u32>,
+        #[clap(long, default_value_t = 0)]
+        partition_vnode_count: u32,
     },
     /// Pause version checkpoint, which subsequently pauses GC of delta log and SST object.
     PauseVersionCheckpoint,
@@ -337,6 +281,25 @@ enum HummockCommands {
         record_hybrid_remove_threshold_ms: Option<u32>,
         #[clap(long)]
         record_hybrid_fetch_threshold_ms: Option<u32>,
+    },
+    MergeCompactionGroup {
+        #[clap(long)]
+        left_group_id: u64,
+        #[clap(long)]
+        right_group_id: u64,
+    },
+    MigrateLegacyObject {
+        url: String,
+        source_dir: String,
+        target_dir: String,
+        #[clap(long, default_value = "100")]
+        concurrency: u32,
+    },
+    ResizeCache {
+        #[clap(long)]
+        meta_cache_capacity_mb: Option<u64>,
+        #[clap(long)]
+        data_cache_capacity_mb: Option<u64>,
     },
 }
 
@@ -402,7 +365,10 @@ enum MetaCommands {
     /// get cluster info
     ClusterInfo,
     /// get source split info
-    SourceSplitInfo,
+    SourceSplitInfo {
+        #[clap(long)]
+        ignore_id: bool,
+    },
     /// Reschedule the actors in the stream graph
     ///
     /// The format is `fragment_id-[worker_id:count]+[worker_id:count]`
@@ -492,27 +458,43 @@ enum MetaCommands {
         props: String,
     },
 
-    /// Migration from etcd meta store to sql backend
-    Migration {
-        #[clap(
-            long,
-            required = true,
-            value_delimiter = ',',
-            value_name = "host:port, ..."
-        )]
-        etcd_endpoints: String,
-        #[clap(long, value_name = "username:password")]
-        etcd_user_password: Option<String>,
+    /// Performing graph check for scaling.
+    #[clap(verbatim_doc_comment)]
+    GraphCheck {
+        /// SQL endpoint
+        #[clap(long, required = true)]
+        endpoint: String,
+    },
 
-        #[clap(
-            long,
-            required = true,
-            value_name = "postgres://user:password@host:port/dbname or mysql://user:password@host:port/dbname or sqlite://path?mode=rwc"
-        )]
-        sql_endpoint: String,
+    SetCdcTableBackfillParallelism {
+        #[clap(long, required = true)]
+        table_id: u32,
+        #[clap(long, required = true)]
+        parallelism: u32,
+    },
+}
 
-        #[clap(short = 'f', long, default_value_t = false)]
-        force_clean: bool,
+#[derive(Subcommand, Clone, Debug)]
+pub enum AwaitTreeCommands {
+    /// Dump Await Tree
+    Dump {
+        /// The format of actor traces in the diagnose file. Allowed values: `json`, `text`. `json` by default.
+        #[clap(short, long = "actor-traces-format")]
+        actor_traces_format: Option<String>,
+    },
+    /// Analyze Await Tree
+    Analyze {
+        /// The path to the diagnose file, if None, ctl will first pull one from the cluster
+        /// The actor traces format can be either `json` or `text`. The analyze command will
+        /// automatically detect the format.
+        #[clap(long = "path")]
+        path: Option<String>,
+    },
+    /// Transcribe Await Tree From JSON to Text format
+    Transcribe {
+        /// The path to the await tree file to be transcribed
+        #[clap(long = "path")]
+        path: String,
     },
 }
 
@@ -594,7 +576,12 @@ async fn start_impl(opts: CliOpts, context: &CtlContext) -> Result<()> {
             start_id,
             num_epochs,
         }) => {
-            cmd_impl::hummock::list_version_deltas(context, start_id, num_epochs).await?;
+            cmd_impl::hummock::list_version_deltas(
+                context,
+                HummockVersionId::new(start_id),
+                num_epochs,
+            )
+            .await?;
         }
         Commands::Hummock(HummockCommands::ListKv {
             epoch,
@@ -636,9 +623,6 @@ async fn start_impl(opts: CliOpts, context: &CtlContext) -> Result<()> {
         Commands::Hummock(HummockCommands::ListPinnedVersions {}) => {
             list_pinned_versions(context).await?
         }
-        Commands::Hummock(HummockCommands::ListPinnedSnapshots {}) => {
-            list_pinned_snapshots(context).await?
-        }
         Commands::Hummock(HummockCommands::ListCompactionGroup) => {
             cmd_impl::hummock::list_compaction_group(context).await?
         }
@@ -662,6 +646,15 @@ async fn start_impl(opts: CliOpts, context: &CtlContext) -> Result<()> {
             compression_level,
             compression_algorithm,
             max_l0_compact_level,
+            sst_allowed_trivial_move_min_size,
+            disable_auto_group_scheduling,
+            max_overlapping_level_size,
+            sst_allowed_trivial_move_max_count,
+            emergency_level0_sst_file_count,
+            emergency_level0_sub_level_partition,
+            level0_stop_write_threshold_max_sst_count,
+            level0_stop_write_threshold_max_size,
+            enable_optimize_l0_interval_selection,
         }) => {
             cmd_impl::hummock::update_compaction_config(
                 context,
@@ -692,6 +685,15 @@ async fn start_impl(opts: CliOpts, context: &CtlContext) -> Result<()> {
                         None
                     },
                     max_l0_compact_level,
+                    sst_allowed_trivial_move_min_size,
+                    disable_auto_group_scheduling,
+                    max_overlapping_level_size,
+                    sst_allowed_trivial_move_max_count,
+                    emergency_level0_sst_file_count,
+                    emergency_level0_sub_level_partition,
+                    level0_stop_write_threshold_max_sst_count,
+                    level0_stop_write_threshold_max_size,
+                    enable_optimize_l0_interval_selection,
                 ),
             )
             .await?
@@ -699,9 +701,15 @@ async fn start_impl(opts: CliOpts, context: &CtlContext) -> Result<()> {
         Commands::Hummock(HummockCommands::SplitCompactionGroup {
             compaction_group_id,
             table_ids,
+            partition_vnode_count,
         }) => {
-            cmd_impl::hummock::split_compaction_group(context, compaction_group_id, &table_ids)
-                .await?;
+            cmd_impl::hummock::split_compaction_group(
+                context,
+                compaction_group_id,
+                &table_ids,
+                partition_vnode_count,
+            )
+            .await?;
         }
         Commands::Hummock(HummockCommands::PauseVersionCheckpoint) => {
             cmd_impl::hummock::pause_version_checkpoint(context).await?;
@@ -737,7 +745,7 @@ async fn start_impl(opts: CliOpts, context: &CtlContext) -> Result<()> {
         }) => {
             cmd_impl::hummock::print_version_delta_in_archive(
                 context,
-                archive_ids,
+                archive_ids.into_iter().map(HummockVersionId::new),
                 data_dir,
                 sst_id,
                 use_new_object_prefix_strategy,
@@ -752,7 +760,7 @@ async fn start_impl(opts: CliOpts, context: &CtlContext) -> Result<()> {
         }) => {
             cmd_impl::hummock::print_user_key_in_archive(
                 context,
-                archive_ids,
+                archive_ids.into_iter().map(HummockVersionId::new),
                 data_dir,
                 user_key,
                 use_new_object_prefix_strategy,
@@ -778,6 +786,34 @@ async fn start_impl(opts: CliOpts, context: &CtlContext) -> Result<()> {
             )
             .await?
         }
+        Commands::Hummock(HummockCommands::MergeCompactionGroup {
+            left_group_id,
+            right_group_id,
+        }) => {
+            cmd_impl::hummock::merge_compaction_group(context, left_group_id, right_group_id)
+                .await?
+        }
+
+        Commands::Hummock(HummockCommands::MigrateLegacyObject {
+            url,
+            source_dir,
+            target_dir,
+            concurrency,
+        }) => {
+            migrate_legacy_object(url, source_dir, target_dir, concurrency).await?;
+        }
+        Commands::Hummock(HummockCommands::ResizeCache {
+            meta_cache_capacity_mb,
+            data_cache_capacity_mb,
+        }) => {
+            const MIB: u64 = 1024 * 1024;
+            cmd_impl::hummock::resize_cache(
+                context,
+                meta_cache_capacity_mb.map(|v| v * MIB),
+                data_cache_capacity_mb.map(|v| v * MIB),
+            )
+            .await?
+        }
         Commands::Table(TableCommands::Scan {
             mv_name,
             data_dir,
@@ -799,8 +835,8 @@ async fn start_impl(opts: CliOpts, context: &CtlContext) -> Result<()> {
         Commands::Meta(MetaCommands::Pause) => cmd_impl::meta::pause(context).await?,
         Commands::Meta(MetaCommands::Resume) => cmd_impl::meta::resume(context).await?,
         Commands::Meta(MetaCommands::ClusterInfo) => cmd_impl::meta::cluster_info(context).await?,
-        Commands::Meta(MetaCommands::SourceSplitInfo) => {
-            cmd_impl::meta::source_split_info(context).await?
+        Commands::Meta(MetaCommands::SourceSplitInfo { ignore_id }) => {
+            cmd_impl::meta::source_split_info(context, ignore_id).await?
         }
         Commands::Meta(MetaCommands::Reschedule {
             from,
@@ -845,31 +881,18 @@ async fn start_impl(opts: CliOpts, context: &CtlContext) -> Result<()> {
         Commands::Meta(MetaCommands::ValidateSource { props }) => {
             cmd_impl::meta::validate_source(context, props).await?
         }
-        Commands::Meta(MetaCommands::Migration {
-            etcd_endpoints,
-            etcd_user_password,
-            sql_endpoint,
-            force_clean,
-        }) => {
-            let credentials = match etcd_user_password {
-                Some(user_pwd) => {
-                    let user_pwd_vec = user_pwd.splitn(2, ':').collect_vec();
-                    if user_pwd_vec.len() != 2 {
-                        return Err(anyhow::Error::msg(format!(
-                            "invalid etcd user password: {user_pwd}"
-                        )));
-                    }
-                    Some((user_pwd_vec[0].to_string(), user_pwd_vec[1].to_string()))
-                }
-                None => None,
-            };
-            let etcd_backend = EtcdBackend {
-                endpoints: etcd_endpoints.split(',').map(|s| s.to_string()).collect(),
-                credentials,
-            };
-            cmd_impl::meta::migrate(etcd_backend, sql_endpoint, force_clean).await?
+        Commands::Meta(MetaCommands::GraphCheck { endpoint }) => {
+            cmd_impl::meta::graph_check(endpoint).await?
         }
-        Commands::AwaitTree => cmd_impl::await_tree::dump(context).await?,
+        Commands::AwaitTree(AwaitTreeCommands::Dump {
+            actor_traces_format,
+        }) => cmd_impl::await_tree::dump(context, actor_traces_format).await?,
+        Commands::AwaitTree(AwaitTreeCommands::Analyze { path }) => {
+            cmd_impl::await_tree::bottleneck_detect(context, path).await?
+        }
+        Commands::AwaitTree(AwaitTreeCommands::Transcribe { path }) => {
+            rw_diagnose_tools::await_tree::transcribe(path)?
+        }
         Commands::Profile(ProfileCommands::Cpu { sleep }) => {
             cmd_impl::profile::cpu_profile(context, sleep).await?
         }
@@ -884,17 +907,17 @@ async fn start_impl(opts: CliOpts, context: &CtlContext) -> Result<()> {
             cmd_impl::scale::update_schedulability(context, workers, Schedulability::Schedulable)
                 .await?
         }
-        Commands::Debug(DebugCommands::Dump { common }) => cmd_impl::debug::dump(common).await?,
-        Commands::Debug(DebugCommands::FixDirtyUpstreams {
-            common,
-            table_id,
-            dirty_fragment_ids,
-        }) => cmd_impl::debug::fix_table_fragments(common, table_id, dirty_fragment_ids).await?,
         Commands::Throttle(ThrottleCommands::Source(args)) => {
             apply_throttle(context, risingwave_pb::meta::PbThrottleTarget::Source, args).await?
         }
         Commands::Throttle(ThrottleCommands::Mv(args)) => {
             apply_throttle(context, risingwave_pb::meta::PbThrottleTarget::Mv, args).await?;
+        }
+        Commands::Meta(MetaCommands::SetCdcTableBackfillParallelism {
+            table_id,
+            parallelism,
+        }) => {
+            set_cdc_table_backfill_parallelism(context, table_id, parallelism).await?;
         }
     }
     Ok(())

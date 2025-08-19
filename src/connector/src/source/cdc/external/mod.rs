@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,42 +14,45 @@
 
 pub mod mock_external_table;
 pub mod postgres;
+pub mod sql_server;
 
-#[cfg(not(madsim))]
-mod maybe_tls_connector;
 pub mod mysql;
 
 use std::collections::{BTreeMap, HashMap};
-use std::fmt;
 
 use anyhow::anyhow;
 use futures::pin_mut;
 use futures::stream::BoxStream;
 use futures_async_stream::try_stream;
 use risingwave_common::bail;
-use risingwave_common::catalog::{ColumnDesc, Schema};
+use risingwave_common::catalog::{ColumnDesc, Field, Schema};
 use risingwave_common::row::OwnedRow;
 use risingwave_common::secret::LocalSecretManager;
 use risingwave_pb::secret::PbSecretRef;
 use serde_derive::{Deserialize, Serialize};
 
+use crate::WithPropertiesExt;
+use crate::connector_common::{PostgresExternalTable, SslMode};
 use crate::error::{ConnectorError, ConnectorResult};
 use crate::parser::mysql_row_to_owned_row;
+use crate::source::CdcTableSnapshotSplit;
+use crate::source::cdc::CdcSourceType;
 use crate::source::cdc::external::mock_external_table::MockExternalTableReader;
 use crate::source::cdc::external::mysql::{
     MySqlExternalTable, MySqlExternalTableReader, MySqlOffset,
 };
-use crate::source::cdc::external::postgres::{
-    PostgresExternalTable, PostgresExternalTableReader, PostgresOffset,
+use crate::source::cdc::external::postgres::{PostgresExternalTableReader, PostgresOffset};
+use crate::source::cdc::external::sql_server::{
+    SqlServerExternalTable, SqlServerExternalTableReader, SqlServerOffset,
 };
-use crate::source::cdc::CdcSourceType;
-use crate::WithPropertiesExt;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CdcTableType {
     Undefined,
+    Mock,
     MySql,
     Postgres,
+    SqlServer,
     Citus,
 }
 
@@ -60,12 +63,24 @@ impl CdcTableType {
             "mysql-cdc" => Self::MySql,
             "postgres-cdc" => Self::Postgres,
             "citus-cdc" => Self::Citus,
+            "sqlserver-cdc" => Self::SqlServer,
             _ => Self::Undefined,
         }
     }
 
     pub fn can_backfill(&self) -> bool {
+        matches!(self, Self::MySql | Self::Postgres | Self::SqlServer)
+    }
+
+    pub fn enable_transaction_metadata(&self) -> bool {
+        // In Debezium, transactional metadata cause delay of the newest events, as the `END` message is never sent unless a new transaction starts.
+        // So we only allow transactional metadata for MySQL and Postgres.
+        // See more in https://debezium.io/documentation/reference/2.6/connectors/sqlserver.html#sqlserver-transaction-metadata
         matches!(self, Self::MySql | Self::Postgres)
+    }
+
+    pub fn shareable_only(&self) -> bool {
+        matches!(self, Self::SqlServer)
     }
 
     pub async fn create_table_reader(
@@ -73,20 +88,27 @@ impl CdcTableType {
         config: ExternalTableConfig,
         schema: Schema,
         pk_indices: Vec<usize>,
+        schema_table_name: SchemaTableName,
     ) -> ConnectorResult<ExternalTableReaderImpl> {
         match self {
             Self::MySql => Ok(ExternalTableReaderImpl::MySql(
-                MySqlExternalTableReader::new(config, schema).await?,
+                MySqlExternalTableReader::new(config, schema)?,
             )),
             Self::Postgres => Ok(ExternalTableReaderImpl::Postgres(
-                PostgresExternalTableReader::new(config, schema, pk_indices).await?,
+                PostgresExternalTableReader::new(config, schema, pk_indices, schema_table_name)
+                    .await?,
             )),
+            Self::SqlServer => Ok(ExternalTableReaderImpl::SqlServer(
+                SqlServerExternalTableReader::new(config, schema, pk_indices).await?,
+            )),
+            // citus is never supported for cdc backfill (create source + create table).
+            Self::Mock => Ok(ExternalTableReaderImpl::Mock(MockExternalTableReader::new())),
             _ => bail!("invalid external table type: {:?}", *self),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SchemaTableName {
     // namespace of the table, e.g. database in mysql, schema in postgres
     pub schema_name: String,
@@ -110,6 +132,7 @@ impl SchemaTableName {
             CdcTableType::Postgres | CdcTableType::Citus => {
                 properties.get(SCHEMA_NAME_KEY).cloned().unwrap_or_default()
             }
+            CdcTableType::SqlServer => properties.get(SCHEMA_NAME_KEY).cloned().unwrap_or_default(),
             _ => {
                 unreachable!("invalid external table type: {:?}", table_type);
             }
@@ -126,6 +149,7 @@ impl SchemaTableName {
 pub enum CdcOffset {
     MySql(MySqlOffset),
     Postgres(PostgresOffset),
+    SqlServer(SqlServerOffset),
 }
 
 // Example debezium offset for Postgres:
@@ -169,12 +193,22 @@ pub struct DebeziumSourceOffset {
     #[serde(rename = "txId")]
     pub txid: Option<i64>,
     pub tx_usec: Option<u64>,
+
+    // sql server offset
+    pub commit_lsn: Option<String>,
+    pub change_lsn: Option<String>,
 }
 
 pub type CdcOffsetParseFunc = Box<dyn Fn(&str) -> ConnectorResult<CdcOffset> + Send>;
 
-pub trait ExternalTableReader {
+pub trait ExternalTableReader: Sized {
     async fn current_cdc_offset(&self) -> ConnectorResult<CdcOffset>;
+
+    // Currently, MySQL cdc uses a connection pool to manage connections to MySQL, and other CDC processes do not require the disconnect step for now.
+    #[allow(clippy::unused_async)]
+    async fn disconnect(self) -> ConnectorResult<()> {
+        Ok(())
+    }
 
     fn snapshot_read(
         &self,
@@ -183,15 +217,35 @@ pub trait ExternalTableReader {
         primary_keys: Vec<String>,
         limit: u32,
     ) -> BoxStream<'_, ConnectorResult<OwnedRow>>;
+
+    fn get_parallel_cdc_splits(
+        &self,
+        options: CdcTableSnapshotSplitOption,
+    ) -> BoxStream<'_, ConnectorResult<CdcTableSnapshotSplit>>;
+
+    fn split_snapshot_read(
+        &self,
+        table_name: SchemaTableName,
+        left: OwnedRow,
+        right: OwnedRow,
+        split_columns: Vec<Field>,
+    ) -> BoxStream<'_, ConnectorResult<OwnedRow>>;
+}
+
+pub struct CdcTableSnapshotSplitOption {
+    pub backfill_num_rows_per_split: u64,
+    pub backfill_as_even_splits: bool,
+    pub backfill_split_pk_column_index: u32,
 }
 
 pub enum ExternalTableReaderImpl {
     MySql(MySqlExternalTableReader),
     Postgres(PostgresExternalTableReader),
+    SqlServer(SqlServerExternalTableReader),
     Mock(MockExternalTableReader),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct ExternalTableConfig {
     pub connector: String,
 
@@ -209,8 +263,23 @@ pub struct ExternalTableConfig {
     /// `ssl.mode` specifies the SSL/TLS encryption level for secure communication with Postgres.
     /// Choices include `disabled`, `preferred`, and `required`.
     /// This field is optional.
-    #[serde(rename = "ssl.mode", default = "Default::default")]
-    pub sslmode: SslMode,
+    #[serde(rename = "ssl.mode", default = "postgres_ssl_mode_default")]
+    #[serde(alias = "debezium.database.sslmode")]
+    pub ssl_mode: SslMode,
+
+    #[serde(rename = "ssl.root.cert")]
+    #[serde(alias = "debezium.database.sslrootcert")]
+    pub ssl_root_cert: Option<String>,
+
+    /// `encrypt` specifies whether connect to SQL Server using SSL.
+    /// Only "true" means using SSL. All other values are treated as "false".
+    #[serde(rename = "database.encrypt", default = "Default::default")]
+    pub encrypt: String,
+}
+
+fn postgres_ssl_mode_default() -> SslMode {
+    // NOTE(StrikeW): Default to `disabled` for backward compatibility
+    SslMode::Disabled
 }
 
 impl ExternalTableConfig {
@@ -226,39 +295,12 @@ impl ExternalTableConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SslMode {
-    #[serde(alias = "disable")]
-    Disabled,
-    #[serde(alias = "prefer")]
-    Preferred,
-    #[serde(alias = "require")]
-    Required,
-}
-
-impl Default for SslMode {
-    fn default() -> Self {
-        // default to `disabled` for backward compatibility
-        Self::Disabled
-    }
-}
-
-impl fmt::Display for SslMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            SslMode::Disabled => "disabled",
-            SslMode::Preferred => "preferred",
-            SslMode::Required => "required",
-        })
-    }
-}
-
 impl ExternalTableReader for ExternalTableReaderImpl {
     async fn current_cdc_offset(&self) -> ConnectorResult<CdcOffset> {
         match self {
             ExternalTableReaderImpl::MySql(mysql) => mysql.current_cdc_offset().await,
             ExternalTableReaderImpl::Postgres(postgres) => postgres.current_cdc_offset().await,
+            ExternalTableReaderImpl::SqlServer(sql_server) => sql_server.current_cdc_offset().await,
             ExternalTableReaderImpl::Mock(mock) => mock.current_cdc_offset().await,
         }
     }
@@ -272,6 +314,23 @@ impl ExternalTableReader for ExternalTableReaderImpl {
     ) -> BoxStream<'_, ConnectorResult<OwnedRow>> {
         self.snapshot_read_inner(table_name, start_pk, primary_keys, limit)
     }
+
+    fn get_parallel_cdc_splits(
+        &self,
+        options: CdcTableSnapshotSplitOption,
+    ) -> BoxStream<'_, ConnectorResult<CdcTableSnapshotSplit>> {
+        self.get_parallel_cdc_splits_inner(options)
+    }
+
+    fn split_snapshot_read(
+        &self,
+        table_name: SchemaTableName,
+        left: OwnedRow,
+        right: OwnedRow,
+        split_columns: Vec<Field>,
+    ) -> BoxStream<'_, ConnectorResult<OwnedRow>> {
+        self.split_snapshot_read_inner(table_name, left, right, split_columns)
+    }
 }
 
 impl ExternalTableReaderImpl {
@@ -280,6 +339,9 @@ impl ExternalTableReaderImpl {
             ExternalTableReaderImpl::MySql(_) => MySqlExternalTableReader::get_cdc_offset_parser(),
             ExternalTableReaderImpl::Postgres(_) => {
                 PostgresExternalTableReader::get_cdc_offset_parser()
+            }
+            ExternalTableReaderImpl::SqlServer(_) => {
+                SqlServerExternalTableReader::get_cdc_offset_parser()
             }
             ExternalTableReaderImpl::Mock(_) => MockExternalTableReader::get_cdc_offset_parser(),
         }
@@ -300,8 +362,58 @@ impl ExternalTableReaderImpl {
             ExternalTableReaderImpl::Postgres(postgres) => {
                 postgres.snapshot_read(table_name, start_pk, primary_keys, limit)
             }
+            ExternalTableReaderImpl::SqlServer(sql_server) => {
+                sql_server.snapshot_read(table_name, start_pk, primary_keys, limit)
+            }
             ExternalTableReaderImpl::Mock(mock) => {
                 mock.snapshot_read(table_name, start_pk, primary_keys, limit)
+            }
+        };
+
+        pin_mut!(stream);
+        #[for_await]
+        for row in stream {
+            let row = row?;
+            yield row;
+        }
+    }
+
+    #[try_stream(boxed, ok = CdcTableSnapshotSplit, error = ConnectorError)]
+    async fn get_parallel_cdc_splits_inner(&self, options: CdcTableSnapshotSplitOption) {
+        let stream = match self {
+            ExternalTableReaderImpl::MySql(e) => e.get_parallel_cdc_splits(options),
+            ExternalTableReaderImpl::Postgres(e) => e.get_parallel_cdc_splits(options),
+            ExternalTableReaderImpl::SqlServer(e) => e.get_parallel_cdc_splits(options),
+            ExternalTableReaderImpl::Mock(e) => e.get_parallel_cdc_splits(options),
+        };
+        pin_mut!(stream);
+        #[for_await]
+        for row in stream {
+            let row = row?;
+            yield row;
+        }
+    }
+
+    #[try_stream(boxed, ok = OwnedRow, error = ConnectorError)]
+    async fn split_snapshot_read_inner(
+        &self,
+        table_name: SchemaTableName,
+        left: OwnedRow,
+        right: OwnedRow,
+        split_columns: Vec<Field>,
+    ) {
+        let stream = match self {
+            ExternalTableReaderImpl::MySql(mysql) => {
+                mysql.split_snapshot_read(table_name, left, right, split_columns)
+            }
+            ExternalTableReaderImpl::Postgres(postgres) => {
+                postgres.split_snapshot_read(table_name, left, right, split_columns)
+            }
+            ExternalTableReaderImpl::SqlServer(sql_server) => {
+                sql_server.split_snapshot_read(table_name, left, right, split_columns)
+            }
+            ExternalTableReaderImpl::Mock(mock) => {
+                mock.split_snapshot_read(table_name, left, right, split_columns)
             }
         };
 
@@ -317,6 +429,7 @@ impl ExternalTableReaderImpl {
 pub enum ExternalTableImpl {
     MySql(MySqlExternalTable),
     Postgres(PostgresExternalTable),
+    SqlServer(SqlServerExternalTable),
 }
 
 impl ExternalTableImpl {
@@ -327,7 +440,22 @@ impl ExternalTableImpl {
                 MySqlExternalTable::connect(config).await?,
             )),
             CdcSourceType::Postgres => Ok(ExternalTableImpl::Postgres(
-                PostgresExternalTable::connect(config).await?,
+                PostgresExternalTable::connect(
+                    &config.username,
+                    &config.password,
+                    &config.host,
+                    config.port.parse::<u16>().unwrap(),
+                    &config.database,
+                    &config.schema,
+                    &config.table,
+                    &config.ssl_mode,
+                    &config.ssl_root_cert,
+                    false,
+                )
+                .await?,
+            )),
+            CdcSourceType::SqlServer => Ok(ExternalTableImpl::SqlServer(
+                SqlServerExternalTable::connect(config).await?,
             )),
             _ => Err(anyhow!("Unsupported cdc connector type: {}", config.connector).into()),
         }
@@ -337,6 +465,7 @@ impl ExternalTableImpl {
         match self {
             ExternalTableImpl::MySql(mysql) => mysql.column_descs(),
             ExternalTableImpl::Postgres(postgres) => postgres.column_descs(),
+            ExternalTableImpl::SqlServer(sql_server) => sql_server.column_descs(),
         }
     }
 
@@ -344,6 +473,7 @@ impl ExternalTableImpl {
         match self {
             ExternalTableImpl::MySql(mysql) => mysql.pk_names(),
             ExternalTableImpl::Postgres(postgres) => postgres.pk_names(),
+            ExternalTableImpl::SqlServer(sql_server) => sql_server.pk_names(),
         }
     }
 }

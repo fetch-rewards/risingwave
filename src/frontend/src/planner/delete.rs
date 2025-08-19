@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,19 +17,21 @@ use fixedbitset::FixedBitSet;
 use super::Planner;
 use crate::binder::BoundDelete;
 use crate::error::Result;
-use crate::optimizer::plan_node::{generic, LogicalDelete, LogicalProject};
+use crate::optimizer::plan_node::{LogicalDelete, LogicalProject, generic};
 use crate::optimizer::property::{Order, RequiredDist};
-use crate::optimizer::{PlanRef, PlanRoot};
+use crate::optimizer::{LogicalPlanRef as PlanRef, LogicalPlanRoot, PlanRoot};
 
 impl Planner {
-    pub(super) fn plan_delete(&mut self, delete: BoundDelete) -> Result<PlanRoot> {
+    pub(super) fn plan_delete(&mut self, delete: BoundDelete) -> Result<LogicalPlanRoot> {
         let scan = self.plan_base_table(&delete.table)?;
         let input = if let Some(expr) = delete.selection {
             self.plan_where(scan, expr)?
         } else {
             scan
         };
-        let input = if delete.table.table_catalog.has_generated_column() {
+        let input = if delete.table.table_catalog.has_generated_column()
+            || delete.table.table_catalog.has_rw_timestamp_column()
+        {
             LogicalProject::with_out_col_idx(
                 input,
                 delete
@@ -38,7 +40,7 @@ impl Planner {
                     .columns()
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, c)| (!c.is_generated()).then_some(i)),
+                    .filter_map(|(i, c)| (c.can_dml()).then_some(i)),
             )
             .into()
         } else {

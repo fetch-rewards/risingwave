@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use std::alloc::Global;
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use either::Either;
-use futures::stream::{self, PollNext};
 use futures::TryStreamExt;
+use futures::stream::{self, PollNext};
 use itertools::Itertools;
 use local_stats_alloc::{SharedStatsAlloc, StatsAlloc};
 use lru::DefaultHasher;
@@ -31,12 +31,12 @@ use risingwave_common_estimate_size::{EstimateSize, KvSize};
 use risingwave_expr::expr::NonStrictExpression;
 use risingwave_hummock_sdk::{HummockEpoch, HummockReadEpoch};
 use risingwave_storage::store::PrefetchOptions;
-use risingwave_storage::table::batch_table::storage_table::StorageTable;
 use risingwave_storage::table::TableIter;
+use risingwave_storage::table::batch_table::BatchTable;
 
 use super::join::{JoinType, JoinTypePrimitive};
 use super::monitor::TemporalJoinMetrics;
-use crate::cache::{cache_may_stale, ManagedLruCache};
+use crate::cache::{ManagedLruCache, cache_may_stale};
 use crate::common::metrics::MetricsInfo;
 use crate::executor::join::builder::JoinStreamChunkBuilder;
 use crate::executor::prelude::*;
@@ -104,7 +104,7 @@ impl JoinEntry {
 }
 
 struct TemporalSide<K: HashKey, S: StateStore> {
-    source: StorageTable<S>,
+    source: BatchTable<S>,
     table_stream_key_indices: Vec<usize>,
     table_output_indices: Vec<usize>,
     cache: ManagedLruCache<K, JoinEntry, DefaultHasher, SharedStatsAlloc<Global>>,
@@ -312,7 +312,7 @@ pub(super) fn apply_indices_map(chunk: StreamChunk, indices: &[usize]) -> Stream
 pub(super) mod phase1 {
     use std::ops::Bound;
 
-    use futures::{pin_mut, StreamExt};
+    use futures::{StreamExt, pin_mut};
     use futures_async_stream::try_stream;
     use risingwave_common::array::stream_chunk_builder::StreamChunkBuilder;
     use risingwave_common::array::{Op, StreamChunk};
@@ -597,7 +597,7 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive, const APPEND_ONLY: b
         info: ExecutorInfo,
         left: Executor,
         right: Executor,
-        table: StorageTable<S>,
+        table: BatchTable<S>,
         left_join_keys: Vec<usize>,
         right_join_keys: Vec<usize>,
         null_safe: Vec<bool>,
@@ -811,19 +811,33 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive, const APPEND_ONLY: b
                     }
                 }
                 InternalMessage::Barrier(updates, barrier) => {
+                    let update_vnode_bitmap = barrier.as_update_vnode_bitmap(self.ctx.id);
+                    let barrier_epoch = barrier.epoch;
                     if !APPEND_ONLY {
                         if wait_first_barrier {
                             wait_first_barrier = false;
-                            self.memo_table.as_mut().unwrap().init_epoch(barrier.epoch);
-                        } else {
+                            yield Message::Barrier(barrier);
                             self.memo_table
+                                .as_mut()
+                                .unwrap()
+                                .init_epoch(barrier_epoch)
+                                .await?;
+                        } else {
+                            let post_commit = self
+                                .memo_table
                                 .as_mut()
                                 .unwrap()
                                 .commit(barrier.epoch)
                                 .await?;
+                            yield Message::Barrier(barrier);
+                            post_commit
+                                .post_yield_barrier(update_vnode_bitmap.clone())
+                                .await?;
                         }
+                    } else {
+                        yield Message::Barrier(barrier);
                     }
-                    if let Some(vnodes) = barrier.as_update_vnode_bitmap(self.ctx.id) {
+                    if let Some(vnodes) = update_vnode_bitmap {
                         let prev_vnodes =
                             self.right_table.source.update_vnode_bitmap(vnodes.clone());
                         if cache_may_stale(&prev_vnodes, &vnodes) {
@@ -835,8 +849,7 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive, const APPEND_ONLY: b
                         &self.right_join_keys,
                         &right_stream_key_indices,
                     )?;
-                    prev_epoch = Some(barrier.epoch.curr);
-                    yield Message::Barrier(barrier)
+                    prev_epoch = Some(barrier_epoch.curr);
                 }
             }
         }

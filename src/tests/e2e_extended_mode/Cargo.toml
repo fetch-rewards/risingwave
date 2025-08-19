@@ -7,18 +7,12 @@ keywords = { workspace = true }
 license = { workspace = true }
 repository = { workspace = true }
 
-[package.metadata.cargo-machete]
-ignored = ["workspace-hack"]
-
-[package.metadata.cargo-udeps.ignore]
-normal = ["workspace-hack"]
-
 [dependencies]
 anyhow = { version = "1", features = ["backtrace"] }
-chrono = { version = "0.4", features = ['serde'] }
+chrono = { workspace = true, features = ['serde'] }
 clap = { workspace = true }
 pg_interval = "0.4"
-rust_decimal = { version = "1.35", features = ["db-postgres"] }
+rust_decimal = { version = "1.37", features = ["db-postgres"] }
 tokio = { version = "0.2", package = "madsim-tokio", features = [
     "rt",
     "macros",

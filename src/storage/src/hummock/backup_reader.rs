@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,12 +19,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use futures::future::Shared;
 use futures::FutureExt;
+use futures::future::Shared;
 use risingwave_backup::error::BackupError;
 use risingwave_backup::meta_snapshot::{MetaSnapshot, Metadata};
 use risingwave_backup::storage::{MetaSnapshotStorage, ObjectStoreMetaSnapshotStorage};
-use risingwave_backup::{meta_snapshot_v1, meta_snapshot_v2, MetaSnapshotId};
+use risingwave_backup::{MetaSnapshotId, meta_snapshot_v1, meta_snapshot_v2};
 use risingwave_common::catalog::TableId;
 use risingwave_common::config::ObjectStoreConfig;
 use risingwave_common::system_param::local_manager::SystemParamsReaderRef;
@@ -34,8 +34,8 @@ use risingwave_object_store::object::object_metrics::ObjectStoreMetrics;
 use thiserror_ext::AsReport;
 
 use crate::error::{StorageError, StorageResult};
-use crate::hummock::local_version::pinned_version::{PinVersionAction, PinnedVersion};
 use crate::hummock::HummockError;
+use crate::hummock::local_version::pinned_version::{PinVersionAction, PinnedVersion};
 
 pub type BackupReaderRef = Arc<BackupReader>;
 
@@ -80,7 +80,7 @@ impl BackupReader {
         storage_directory: &str,
         object_store_config: &ObjectStoreConfig,
     ) -> StorageResult<BackupReaderRef> {
-        let config = (storage_url.to_string(), storage_directory.to_string());
+        let config = (storage_url.to_owned(), storage_directory.to_owned());
         let store = create_snapshot_store(&config, object_store_config).await?;
         tracing::info!(
             "backup reader is initialized: url={}, dir={}",
@@ -195,11 +195,8 @@ impl BackupReader {
             .snapshot_metadata
             .iter()
             .find(|v| {
-                if v.state_table_info.is_empty() {
-                    return epoch >= v.safe_epoch && epoch <= v.max_committed_epoch;
-                }
-                if let Some(m) = v.state_table_info.get(&table_id) {
-                    return epoch >= m.safe_epoch && epoch <= m.committed_epoch;
+                if let Some(m) = v.state_table_info.get(&table_id.table_id()) {
+                    return epoch == m.committed_epoch;
                 }
                 false
             })
@@ -269,8 +266,8 @@ impl BackupReader {
             }
             let p = rx.borrow().load();
             let config = (
-                p.backup_storage_url().to_string(),
-                p.backup_storage_directory().to_string(),
+                p.backup_storage_url().to_owned(),
+                p.backup_storage_directory().to_owned(),
             );
             if config == self.store.load().1 {
                 continue;

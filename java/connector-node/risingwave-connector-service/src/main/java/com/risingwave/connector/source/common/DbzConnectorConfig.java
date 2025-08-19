@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -54,12 +54,19 @@ public class DbzConnectorConfig {
     public static final String PG_PUB_NAME = "publication.name";
     public static final String PG_PUB_CREATE = "publication.create.enable";
     public static final String PG_SCHEMA_NAME = "schema.name";
+    public static final String PG_SSL_ROOT_CERT = "ssl.root.cert";
+    public static final String PG_TEST_ONLY_FORCE_RDS = "test.only.force.rds";
+
+    /* Sql Server configs */
+    public static final String SQL_SERVER_SCHEMA_NAME = "schema.name";
+    public static final String SQL_SERVER_ENCRYPT = "database.encrypt";
 
     /* RisingWave configs */
     private static final String DBZ_CONFIG_FILE = "debezium.properties";
     private static final String MYSQL_CONFIG_FILE = "mysql.properties";
     private static final String POSTGRES_CONFIG_FILE = "postgres.properties";
     private static final String MONGODB_CONFIG_FILE = "mongodb.properties";
+    private static final String SQL_SERVER_CONFIG_FILE = "sql_server.properties";
 
     private static final String DBZ_PROPERTY_PREFIX = "debezium.";
 
@@ -126,16 +133,17 @@ public class DbzConnectorConfig {
                         && userProps.get(SNAPSHOT_MODE_KEY).equals(SNAPSHOT_MODE_BACKFILL);
         var waitStreamingStartTimeout =
                 Integer.parseInt(
-                        userProps.getOrDefault(WAIT_FOR_STREAMING_START_TIMEOUT_SECS, "30"));
+                        userProps.getOrDefault(WAIT_FOR_STREAMING_START_TIMEOUT_SECS, "60"));
 
         LOG.info(
-                "DbzConnectorConfig: source={}, sourceId={}, startOffset={}, snapshotDone={}, isCdcBackfill={}, isCdcSourceJob={}",
+                "DbzConnectorConfig: source={}, sourceId={}, startOffset={}, snapshotDone={}, isCdcBackfill={}, isCdcSourceJob={}, waitStreamingStartTimeout={}",
                 source,
                 sourceId,
                 startOffset,
                 snapshotDone,
                 isCdcBackfill,
-                isCdcSourceJob);
+                isCdcSourceJob,
+                waitStreamingStartTimeout);
 
         if (source == SourceTypeE.MYSQL) {
             var mysqlProps = initiateDbConfig(MYSQL_CONFIG_FILE, substitutor);
@@ -168,6 +176,13 @@ public class DbzConnectorConfig {
 
             dbzProps.putAll(mysqlProps);
 
+            if (isCdcSourceJob) {
+                // remove table filtering for the shared MySQL source, since we
+                // allow user to ingest tables in different database
+                LOG.info("Disable table filtering for the shared MySQL source");
+                dbzProps.remove("table.include.list");
+            }
+
         } else if (source == SourceTypeE.POSTGRES) {
             var postgresProps = initiateDbConfig(POSTGRES_CONFIG_FILE, substitutor);
 
@@ -199,6 +214,23 @@ public class DbzConnectorConfig {
                 }
             }
 
+            // adapt value of sslmode to the expected value
+            var sslMode = postgresProps.getProperty("database.sslmode");
+            if (sslMode != null) {
+                switch (sslMode) {
+                    case "disabled":
+                        sslMode = "disable";
+                        break;
+                    case "preferred":
+                        sslMode = "prefer";
+                        break;
+                    case "required":
+                        sslMode = "require";
+                        break;
+                }
+                postgresProps.setProperty("database.sslmode", sslMode);
+            }
+
             dbzProps.putAll(postgresProps);
 
             if (isCdcSourceJob) {
@@ -206,6 +238,10 @@ public class DbzConnectorConfig {
                 // allow user to ingest tables in different schemas
                 LOG.info("Disable table filtering for the shared Postgres source");
                 dbzProps.remove("table.include.list");
+            }
+
+            if (userProps.containsKey(PG_SSL_ROOT_CERT)) {
+                dbzProps.setProperty("database.sslrootcert", userProps.get(PG_SSL_ROOT_CERT));
             }
         } else if (source == SourceTypeE.CITUS) {
             var postgresProps = initiateDbConfig(POSTGRES_CONFIG_FILE, substitutor);
@@ -249,15 +285,46 @@ public class DbzConnectorConfig {
             mongodbProps.setProperty("name", connectorName);
 
             dbzProps.putAll(mongodbProps);
+        } else if (source == SourceTypeE.SQL_SERVER) {
+            var sqlServerProps = initiateDbConfig(SQL_SERVER_CONFIG_FILE, substitutor);
+            // disable snapshot locking at all
+            sqlServerProps.setProperty("snapshot.locking.mode", "none");
 
+            if (isCdcBackfill) {
+                // if startOffset is specified, we should continue
+                // reading changes from the given offset
+                if (null != startOffset && !startOffset.isBlank()) {
+                    // skip the initial snapshot for cdc backfill
+                    sqlServerProps.setProperty("snapshot.mode", "recovery");
+                    sqlServerProps.setProperty(
+                            ConfigurableOffsetBackingStore.OFFSET_STATE_VALUE, startOffset);
+                } else {
+                    sqlServerProps.setProperty("snapshot.mode", "no_data");
+                }
+            } else {
+                // if snapshot phase is finished and offset is specified, we will continue reading
+                // changes from the given offset
+                if (snapshotDone && null != startOffset && !startOffset.isBlank()) {
+                    sqlServerProps.setProperty("snapshot.mode", "recovery");
+                    sqlServerProps.setProperty(
+                            ConfigurableOffsetBackingStore.OFFSET_STATE_VALUE, startOffset);
+                }
+            }
+            dbzProps.putAll(sqlServerProps);
+            if (isCdcSourceJob) {
+                // remove table filtering for the shared Sql Server source, since we
+                // allow user to ingest tables in different schemas
+                LOG.info("Disable table filtering for the shared Sql Server source");
+                dbzProps.remove("table.include.list");
+            }
         } else {
             throw new RuntimeException("unsupported source type: " + source);
         }
-
         var otherProps = extractDebeziumProperties(userProps);
         for (var entry : otherProps.entrySet()) {
             dbzProps.putIfAbsent(entry.getKey(), entry.getValue());
         }
+        LOG.info("Final Debezium properties: {}", dbzProps);
 
         this.sourceId = sourceId;
         this.sourceType = source;
@@ -271,8 +338,9 @@ public class DbzConnectorConfig {
         try (var input = getClass().getClassLoader().getResourceAsStream(fileName)) {
             assert input != null;
             var inputStr = IOUtils.toString(input, StandardCharsets.UTF_8);
-            var resolvedStr = substitutor.replace(inputStr);
-            dbProps.load(new StringReader(resolvedStr));
+            // load before substitution, so that we do not need to escape the substituted text
+            dbProps.load(new StringReader(inputStr));
+            dbProps.replaceAll((k, v) -> substitutor.replace(v));
         } catch (IOException e) {
             throw new RuntimeException("failed to load config file " + fileName, e);
         }

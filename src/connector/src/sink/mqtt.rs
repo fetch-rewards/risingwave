@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,35 +13,34 @@
 // limitations under the License.
 use core::fmt::Debug;
 use std::collections::BTreeMap;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
-use anyhow::{anyhow, Context as _};
+use anyhow::{Context as _, anyhow};
 use risingwave_common::array::{Op, RowRef, StreamChunk};
 use risingwave_common::catalog::Schema;
 use risingwave_common::row::Row;
-use risingwave_common::session_config::sink_decouple::SinkDecouple;
 use risingwave_common::types::{DataType, ScalarRefImpl};
-use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::ConnectionError;
+use rumqttc::v5::mqttbytes::QoS;
 use serde_derive::Deserialize;
 use serde_with::serde_as;
 use thiserror_ext::AsReport;
 use with_options::WithOptions;
 
+use super::SinkWriterParam;
 use super::catalog::{SinkEncode, SinkFormat, SinkFormatDesc};
 use super::encoder::{
     DateHandlingMode, JsonEncoder, JsonbHandlingMode, ProtoEncoder, ProtoHeader, RowEncoder, SerTo,
     TimeHandlingMode, TimestampHandlingMode, TimestamptzHandlingMode,
 };
 use super::writer::AsyncTruncateSinkWriterExt;
-use super::{DummySinkCommitCoordinator, SinkWriterParam};
 use crate::connector_common::MqttCommon;
 use crate::deserialize_bool_from_string;
-use crate::sink::catalog::desc::SinkDesc;
+use crate::enforce_secret::EnforceSecret;
 use crate::sink::log_store::DeliveryFutureManagerAddFuture;
 use crate::sink::writer::{AsyncTruncateLogSinkerOf, AsyncTruncateSinkWriter};
-use crate::sink::{Result, Sink, SinkError, SinkParam, SINK_TYPE_APPEND_ONLY};
+use crate::sink::{Result, SINK_TYPE_APPEND_ONLY, Sink, SinkError, SinkParam};
 
 pub const MQTT_SINK: &str = "mqtt";
 
@@ -64,6 +63,12 @@ pub struct MqttConfig {
     // if set, will use a field value as the topic name, if topic is also set it will be used as a fallback
     #[serde(rename = "topic.field")]
     pub topic_field: Option<String>,
+}
+
+impl EnforceSecret for MqttConfig {
+    fn enforce_one(prop: &str) -> crate::error::ConnectorResult<()> {
+        MqttCommon::enforce_one(prop)
+    }
 }
 
 pub enum RowEncoderWrapper {
@@ -116,6 +121,17 @@ pub struct MqttSink {
     name: String,
 }
 
+impl EnforceSecret for MqttSink {
+    fn enforce_secret<'a>(
+        prop_iter: impl Iterator<Item = &'a str>,
+    ) -> crate::error::ConnectorResult<()> {
+        for prop in prop_iter {
+            MqttConfig::enforce_one(prop)?;
+        }
+        Ok(())
+    }
+}
+
 // sink write
 pub struct MqttSinkWriter {
     pub config: MqttConfig,
@@ -160,17 +176,9 @@ impl TryFrom<SinkParam> for MqttSink {
 }
 
 impl Sink for MqttSink {
-    type Coordinator = DummySinkCommitCoordinator;
     type LogSinker = AsyncTruncateLogSinkerOf<MqttSinkWriter>;
 
     const SINK_NAME: &'static str = MQTT_SINK;
-
-    fn is_sink_decouple(_desc: &SinkDesc, user_specified: &SinkDecouple) -> Result<bool> {
-        match user_specified {
-            SinkDecouple::Default | SinkDecouple::Enable => Ok(true),
-            SinkDecouple::Disable => Ok(false),
-        }
-    }
 
     async fn validate(&self) -> Result<()> {
         if !self.is_append_only {
@@ -256,13 +264,13 @@ impl MqttSinkWriter {
                     return Err(SinkError::Config(anyhow!(
                         "mqtt sink encode unsupported: {:?}",
                         format_desc.encode,
-                    )))
+                    )));
                 }
             },
             _ => {
                 return Err(SinkError::Config(anyhow!(
                     "MQTT sink only supports append-only mode"
-                )))
+                )));
             }
         };
         let qos = config.common.qos();

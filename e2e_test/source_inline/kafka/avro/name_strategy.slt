@@ -25,7 +25,7 @@ create source s1 () with (
 # Currently we are abusing this test case to also test data types.
 
 system ok
-python3 scripts/source/schema_registry_producer.py  "${RISEDEV_KAFKA_BOOTSTRAP_SERVERS}" "${RISEDEV_SCHEMA_REGISTRY_URL}" e2e_test/source_inline/kafka/avro/upsert_avro_json "topic" "avro"
+python3 e2e_test/source_legacy/basic/scripts/schema_registry_producer.py  "${RISEDEV_KAFKA_BOOTSTRAP_SERVERS}" "${RISEDEV_SCHEMA_REGISTRY_URL}" e2e_test/source_inline/kafka/avro/upsert_avro_json "topic" "avro"
 
 statement ok
 CREATE TABLE t_topic ( primary key (rw_key) )
@@ -44,7 +44,7 @@ FORMAT UPSERT ENCODE AVRO (schema.registry = '${RISEDEV_SCHEMA_REGISTRY_URL}');
 
 ## topic: upsert_avro_json-record, key subject: string, value subject: CPLM.OBJ_ATTRIBUTE_VALUE
 system ok
-python3 scripts/source/schema_registry_producer.py  "${RISEDEV_KAFKA_BOOTSTRAP_SERVERS}" "${RISEDEV_SCHEMA_REGISTRY_URL}" e2e_test/source_inline/kafka/avro/upsert_avro_json "record" "avro"
+python3 e2e_test/source_legacy/basic/scripts/schema_registry_producer.py  "${RISEDEV_KAFKA_BOOTSTRAP_SERVERS}" "${RISEDEV_SCHEMA_REGISTRY_URL}" e2e_test/source_inline/kafka/avro/upsert_avro_json "record" "avro"
 
 
 statement error key\.message
@@ -80,7 +80,7 @@ create table t_record_format_plain () with (
 ## key subject: upsert_avro_json-topic-record-string
 ## value subject: upsert_avro_json-topic-record-CPLM.OBJ_ATTRIBUTE_VALUE
 system ok
-python3 scripts/source/schema_registry_producer.py  "${RISEDEV_KAFKA_BOOTSTRAP_SERVERS}" "${RISEDEV_SCHEMA_REGISTRY_URL}" e2e_test/source_inline/kafka/avro/upsert_avro_json "topic-record" "avro"
+python3 e2e_test/source_legacy/basic/scripts/schema_registry_producer.py  "${RISEDEV_KAFKA_BOOTSTRAP_SERVERS}" "${RISEDEV_SCHEMA_REGISTRY_URL}" e2e_test/source_inline/kafka/avro/upsert_avro_json "topic-record" "avro"
 
 
 
@@ -105,7 +105,7 @@ with (
 sleep 2s
 
 
-query II
+query II retry 3 backoff 5s
 SELECT
  * except (rw_key)
 FROM
@@ -121,7 +121,7 @@ NULL id6 NULL NULL NULL NULL NULL NULL NULL -0.01 NULL (abcdefg) NULL NaN
 NULL id7 NULL NULL NULL NULL NULL NULL NULL -0.01 NULL NULL 67e55044-10b1-426f-9247-bb680e5fe0c8 NaN
 
 
-query II
+query II retry 3 backoff 5s
 SELECT
   *
 FROM
@@ -140,7 +140,7 @@ NULL id7 NULL NULL NULL NULL NULL NULL NULL -0.01 NULL NULL 67e55044-10b1-426f-9
 NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL
 
 
-query II
+query II retry 3 backoff 5s
 SELECT
  * except (rw_key)
 FROM

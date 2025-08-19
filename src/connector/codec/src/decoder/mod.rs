@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 
 pub mod avro;
 pub mod json;
+pub mod protobuf;
 pub mod utils;
 
 use risingwave_common::error::NotImplemented;
@@ -37,6 +38,9 @@ pub enum AccessError {
 
     #[error("Unsupported additional column `{name}`")]
     UnsupportedAdditionalColumn { name: String },
+
+    #[error("Fail to convert protobuf Any into jsonb: {0}")]
+    ProtobufAnyToJson(#[source] serde_json::Error),
 
     /// Errors that are not categorized into variants above.
     #[error("{message}")]
@@ -69,7 +73,7 @@ pub trait Access {
     /// TODO: the meaning of `path` is a little confusing and maybe over-abstracted.
     /// `access` does not need to serve arbitrarily deep `path` access, but just "top-level" access.
     /// The API creates an illusion that arbitrary access is supported, but it's not.
-    /// Perhapts we should separate out another trait like `ToDatum`,
+    /// Perhaps we should separate out another trait like `ToDatum`,
     /// which only does type mapping, without caring about the path. And `path` itself is only an `enum` instead of `&[&str]`.
     ///
     /// What `path` to access is decided by the CDC layer, i.e., the `FORMAT ...` part (`ChangeEvent`).

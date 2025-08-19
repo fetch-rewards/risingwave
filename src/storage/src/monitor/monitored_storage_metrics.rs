@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,8 +18,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use prometheus::{
-    exponential_buckets, histogram_opts, linear_buckets, register_histogram_with_registry,
-    Histogram, Registry,
+    Histogram, Registry, exponential_buckets, histogram_opts, linear_buckets,
+    register_histogram_with_registry,
 };
 use risingwave_common::config::MetricLevel;
 use risingwave_common::metrics::{
@@ -34,27 +34,27 @@ use risingwave_common::{
 };
 
 use crate::store::{
-    ChangeLogValue, IterItem, StateStoreIterItem, StateStoreIterItemRef, StateStoreReadLogItem,
+    ChangeLogValue, IterItem, StateStoreKeyedRow, StateStoreKeyedRowRef, StateStoreReadLogItem,
     StateStoreReadLogItemRef,
 };
 
 /// [`MonitoredStorageMetrics`] stores the performance and IO metrics of Storage.
 #[derive(Debug, Clone)]
 pub struct MonitoredStorageMetrics {
-    pub get_duration: RelabeledGuardedHistogramVec<1>,
-    pub get_key_size: RelabeledGuardedHistogramVec<1>,
-    pub get_value_size: RelabeledGuardedHistogramVec<1>,
+    pub get_duration: RelabeledGuardedHistogramVec,
+    pub get_key_size: RelabeledGuardedHistogramVec,
+    pub get_value_size: RelabeledGuardedHistogramVec,
 
     // [table_id, iter_type: {"iter", "iter_log"}]
-    pub iter_size: RelabeledGuardedHistogramVec<2>,
-    pub iter_item: RelabeledGuardedHistogramVec<2>,
-    pub iter_init_duration: RelabeledGuardedHistogramVec<2>,
-    pub iter_scan_duration: RelabeledGuardedHistogramVec<2>,
-    pub iter_counts: RelabeledGuardedIntCounterVec<2>,
-    pub iter_in_progress_counts: RelabeledGuardedIntGaugeVec<2>,
+    pub iter_size: RelabeledGuardedHistogramVec,
+    pub iter_item: RelabeledGuardedHistogramVec,
+    pub iter_init_duration: RelabeledGuardedHistogramVec,
+    pub iter_scan_duration: RelabeledGuardedHistogramVec,
+    pub iter_counts: RelabeledGuardedIntCounterVec,
+    pub iter_in_progress_counts: RelabeledGuardedIntGaugeVec,
 
     // [table_id, op_type]
-    pub iter_log_op_type_counts: LabelGuardedIntCounterVec<2>,
+    pub iter_log_op_type_counts: LabelGuardedIntCounterVec,
 
     pub sync_duration: Histogram,
     pub sync_size: Histogram,
@@ -70,8 +70,8 @@ pub fn global_storage_metrics(metric_level: MetricLevel) -> MonitoredStorageMetr
 
 impl MonitoredStorageMetrics {
     pub fn new(registry: &Registry, metric_level: MetricLevel) -> Self {
-        // 256B ~ max 4GB
-        let size_buckets = exponential_buckets(256.0, 16.0, 7).unwrap();
+        // 256B ~ max 64GB
+        let size_buckets = exponential_buckets(256.0, 16.0, 8).unwrap();
         // 10ms ~ max 2.7h
         let time_buckets = exponential_buckets(0.01, 10.0, 7).unwrap();
         // ----- get -----
@@ -287,27 +287,27 @@ impl MonitoredStorageMetrics {
     ) -> LocalIterMetricsInner {
         let iter_init_duration = self
             .iter_init_duration
-            .with_label_values(&[table_label, iter_type])
+            .with_guarded_label_values(&[table_label, iter_type])
             .local();
         let iter_counts = self
             .iter_counts
-            .with_label_values(&[table_label, iter_type])
+            .with_guarded_label_values(&[table_label, iter_type])
             .local();
         let iter_scan_duration = self
             .iter_scan_duration
-            .with_label_values(&[table_label, iter_type])
+            .with_guarded_label_values(&[table_label, iter_type])
             .local();
         let iter_item = self
             .iter_item
-            .with_label_values(&[table_label, iter_type])
+            .with_guarded_label_values(&[table_label, iter_type])
             .local();
         let iter_size = self
             .iter_size
-            .with_label_values(&[table_label, iter_type])
+            .with_guarded_label_values(&[table_label, iter_type])
             .local();
         let iter_in_progress_counts = self
             .iter_in_progress_counts
-            .with_label_values(&[table_label, iter_type]);
+            .with_guarded_label_values(&[table_label, iter_type]);
 
         LocalIterMetricsInner {
             iter_init_duration,
@@ -343,11 +343,17 @@ impl MonitoredStorageMetrics {
     }
 
     fn local_get_metrics(&self, table_label: &str) -> LocalGetMetrics {
-        let get_duration = self.get_duration.with_label_values(&[table_label]).local();
-        let get_key_size = self.get_key_size.with_label_values(&[table_label]).local();
+        let get_duration = self
+            .get_duration
+            .with_guarded_label_values(&[table_label])
+            .local();
+        let get_key_size = self
+            .get_key_size
+            .with_guarded_label_values(&[table_label])
+            .local();
         let get_value_size = self
             .get_value_size
-            .with_label_values(&[table_label])
+            .with_guarded_label_values(&[table_label])
             .local();
 
         LocalGetMetrics {
@@ -360,12 +366,12 @@ impl MonitoredStorageMetrics {
 }
 
 struct LocalIterMetricsInner {
-    iter_init_duration: LabelGuardedLocalHistogram<2>,
-    iter_scan_duration: LabelGuardedLocalHistogram<2>,
-    iter_counts: LabelGuardedLocalIntCounter<2>,
-    iter_item: LabelGuardedLocalHistogram<2>,
-    iter_size: LabelGuardedLocalHistogram<2>,
-    iter_in_progress_counts: LabelGuardedIntGauge<2>,
+    iter_init_duration: LabelGuardedLocalHistogram,
+    iter_scan_duration: LabelGuardedLocalHistogram,
+    iter_counts: LabelGuardedLocalIntCounter,
+    iter_item: LabelGuardedLocalHistogram,
+    iter_size: LabelGuardedLocalHistogram,
+    iter_in_progress_counts: LabelGuardedIntGauge,
 }
 
 struct LocalIterMetrics {
@@ -394,9 +400,9 @@ impl LocalIterMetricsInner {
 }
 
 struct LocalGetMetrics {
-    get_duration: LabelGuardedLocalHistogram<1>,
-    get_key_size: LabelGuardedLocalHistogram<1>,
-    get_value_size: LabelGuardedLocalHistogram<1>,
+    get_duration: LabelGuardedLocalHistogram,
+    get_key_size: LabelGuardedLocalHistogram,
+    get_value_size: LabelGuardedLocalHistogram,
     report_count: usize,
 }
 
@@ -414,9 +420,9 @@ impl LocalGetMetrics {
 
 struct LocalIterLogMetrics {
     iter_metrics: LocalIterMetricsInner,
-    insert_count: LabelGuardedLocalIntCounter<2>,
-    update_count: LabelGuardedLocalIntCounter<2>,
-    delete_count: LabelGuardedLocalIntCounter<2>,
+    insert_count: LabelGuardedLocalIntCounter,
+    update_count: LabelGuardedLocalIntCounter,
+    delete_count: LabelGuardedLocalIntCounter,
     report_count: usize,
 }
 
@@ -494,7 +500,7 @@ impl StateStoreIterStats {
 }
 
 impl StateStoreIterStatsTrait for StateStoreIterStats {
-    type Item = StateStoreIterItem;
+    type Item = StateStoreKeyedRow;
 
     fn new(table_id: u32, metrics: &MonitoredStorageMetrics, iter_init_duration: Duration) -> Self {
         Self::for_table_metrics(table_id, metrics, |metrics| {
@@ -505,7 +511,7 @@ impl StateStoreIterStatsTrait for StateStoreIterStats {
         }
     }
 
-    fn observe(&mut self, (key, value): StateStoreIterItemRef<'_>) {
+    fn observe(&mut self, (key, value): StateStoreKeyedRowRef<'_>) {
         self.inner.total_items += 1;
         self.inner.total_size += key.encoded_len() + value.len();
     }

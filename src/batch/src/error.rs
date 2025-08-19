@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(clippy::disallowed_types, clippy::disallowed_methods)]
-
 use std::sync::Arc;
 
 pub use anyhow::anyhow;
+use mysql_async::Error as MySqlError;
 use parquet::errors::ParquetError;
 use risingwave_common::array::ArrayError;
-use risingwave_common::error::BoxedError;
+use risingwave_common::error::{BoxedError, IcebergError, def_anyhow_newtype, def_anyhow_variant};
 use risingwave_common::util::value_encoding::error::ValueEncodingError;
 use risingwave_connector::error::ConnectorError;
 use risingwave_dml::error::DmlError;
@@ -29,6 +28,7 @@ use risingwave_rpc_client::error::{RpcError, ToTonicStatus};
 use risingwave_storage::error::StorageError;
 use thiserror::Error;
 use thiserror_ext::Construct;
+use tokio_postgres::Error as PostgresError;
 use tonic::Status;
 
 use crate::worker_manager::worker_node_manager::FragmentId;
@@ -113,18 +113,11 @@ pub enum BatchError {
         DmlError,
     ),
 
-    #[error(transparent)]
-    Iceberg(
+    #[error("External system error: {0}")]
+    ExternalSystemError(
         #[from]
         #[backtrace]
-        iceberg::Error,
-    ),
-
-    #[error(transparent)]
-    Parquet(
-        #[from]
-        #[backtrace]
-        ParquetError,
+        BatchExternalSystemError,
     ),
 
     // Make the ref-counted type to be a variant for easier code structuring.
@@ -190,5 +183,23 @@ impl From<BatchError> for Status {
 impl From<ConnectorError> for BatchError {
     fn from(value: ConnectorError) -> Self {
         Self::Connector(value.into())
+    }
+}
+
+// Define a external system error
+def_anyhow_variant! {
+    pub BatchExternalSystemError,
+    BatchError ExternalSystemError,
+
+    PostgresError => "Postgres error",
+    IcebergError => "Iceberg error",
+    ParquetError => "Parquet error",
+    MySqlError => "MySQL error",
+}
+
+#[expect(clippy::disallowed_types)]
+impl From<iceberg::Error> for BatchExternalSystemError {
+    fn from(value: iceberg::Error) -> Self {
+        risingwave_common::error::IcebergError::from(value).into()
     }
 }

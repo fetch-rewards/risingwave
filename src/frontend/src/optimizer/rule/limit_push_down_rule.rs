@@ -1,4 +1,4 @@
-//  Copyright 2024 RisingWave Labs
+//  Copyright 2025 RisingWave Labs
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -17,13 +17,12 @@
 // COPYING file in the root directory) and Apache 2.0 License
 // (found in the LICENSE.Apache file in the root directory).
 
-use super::{BoxedRule, Rule};
+use super::prelude::{PlanRef, *};
 use crate::optimizer::plan_node::{LogicalLimit, LogicalProject, PlanTreeNodeUnary};
-use crate::optimizer::PlanRef;
 
 pub struct LimitPushDownRule {}
 
-impl Rule for LimitPushDownRule {
+impl Rule<Logical> for LimitPushDownRule {
     fn apply(&self, plan: PlanRef) -> Option<PlanRef> {
         let limit: &LogicalLimit = plan.as_logical_limit()?;
         let project: LogicalProject = limit.input().as_logical_project()?.to_owned();

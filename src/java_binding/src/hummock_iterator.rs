@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use bytes::Bytes;
-use foyer::HybridCacheBuilder;
+use foyer::{CacheBuilder, Engine, HybridCacheBuilder, LargeEngineOptions};
 use futures::{TryFutureExt, TryStreamExt};
 use risingwave_common::catalog::ColumnDesc;
 use risingwave_common::config::{MetricLevel, ObjectStoreConfig};
@@ -24,7 +24,7 @@ use risingwave_common::hash::VirtualNode;
 use risingwave_common::row::OwnedRow;
 use risingwave_common::util::value_encoding::column_aware_row_encoding::ColumnAwareSerde;
 use risingwave_common::util::value_encoding::{BasicSerde, EitherSerde, ValueRowDeserializer};
-use risingwave_hummock_sdk::key::{prefixed_range_with_vnode, TableKeyRange};
+use risingwave_hummock_sdk::key::{TableKeyRange, prefixed_range_with_vnode};
 use risingwave_hummock_sdk::version::HummockVersion;
 use risingwave_jni_core::HummockJavaBindingIterator;
 use risingwave_object_store::object::build_remote_object_store;
@@ -33,12 +33,12 @@ use risingwave_pb::java_binding::key_range::Bound;
 use risingwave_pb::java_binding::{KeyRange, ReadPlan};
 use risingwave_storage::error::{StorageError, StorageResult};
 use risingwave_storage::hummock::local_version::pinned_version::PinnedVersion;
-use risingwave_storage::hummock::store::version::HummockVersionReader;
 use risingwave_storage::hummock::store::HummockStorageIterator;
+use risingwave_storage::hummock::store::version::HummockVersionReader;
 use risingwave_storage::hummock::{
-    get_committed_read_version_tuple, CachePolicy, HummockError, SstableStore, SstableStoreConfig,
+    CachePolicy, HummockError, SstableStore, SstableStoreConfig, get_committed_read_version_tuple,
 };
-use risingwave_storage::monitor::{global_hummock_state_store_metrics, HummockStateStoreMetrics};
+use risingwave_storage::monitor::{HummockStateStoreMetrics, global_hummock_state_store_metrics};
 use risingwave_storage::row_serde::value_serde::ValueRowSerdeNew;
 use risingwave_storage::store::{ReadOptions, StateStoreIterExt};
 use rw_futures_util::select_all;
@@ -83,7 +83,7 @@ pub(crate) async fn new_hummock_java_binding_iter(
         let meta_cache = HybridCacheBuilder::new()
             .memory(1 << 10)
             .with_shards(2)
-            .storage()
+            .storage(Engine::Large(LargeEngineOptions::new()))
             .build()
             .map_err(HummockError::foyer_error)
             .map_err(StorageError::from)
@@ -91,7 +91,7 @@ pub(crate) async fn new_hummock_java_binding_iter(
         let block_cache = HybridCacheBuilder::new()
             .memory(1 << 10)
             .with_shards(2)
-            .storage()
+            .storage(Engine::Large(LargeEngineOptions::new()))
             .build()
             .map_err(HummockError::foyer_error)
             .map_err(StorageError::from)
@@ -109,6 +109,8 @@ pub(crate) async fn new_hummock_java_binding_iter(
             use_new_object_prefix_strategy: read_plan.use_new_object_prefix_strategy,
             meta_cache,
             block_cache,
+            vector_meta_cache: CacheBuilder::new(1 << 10).build(),
+            vector_block_cache: CacheBuilder::new(1 << 10).build(),
         }));
         let reader = HummockVersionReader::new(
             sstable_store,
@@ -159,8 +161,8 @@ pub(crate) async fn new_hummock_java_binding_iter(
                 .iter(
                     key_range,
                     read_plan.epoch,
+                    table_id,
                     ReadOptions {
-                        table_id,
                         cache_policy: CachePolicy::NotFill,
                         ..Default::default()
                     },

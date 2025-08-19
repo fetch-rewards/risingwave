@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,15 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use risingwave_common::catalog::TableId;
 use risingwave_hummock_sdk::HummockEpoch;
 
+use crate::hummock::event_handler::LocalInstanceId;
 use crate::hummock::event_handler::uploader::{
     LocalInstanceUnsyncData, UnsyncData, UnsyncEpochId, UploadTaskInput,
 };
-use crate::hummock::event_handler::LocalInstanceId;
 
 #[derive(Default)]
 struct EpochSpillableDataInfo {
@@ -75,7 +76,20 @@ impl<'a> Spiller<'a> {
         if let Some(unsync_epoch_id) = self
             .epoch_info
             .iter()
-            .max_by_key(|(_, info)| info.payload_size)
+            .max_by(
+                |(UnsyncEpochId(_, table1), info1), (UnsyncEpochId(_, table2), info2)| {
+                    info1.payload_size.cmp(&info2.payload_size).then_with(|| {
+                        if !cfg!(test) {
+                            Ordering::Equal
+                        } else {
+                            assert_ne!(table1, table2);
+                            // enforce deterministic spill order in test
+                            // smaller table id will be spilled first.
+                            table2.cmp(table1)
+                        }
+                    })
+                },
+            )
             .map(|(unsync_epoch_id, _)| *unsync_epoch_id)
         {
             let spill_epoch = unsync_epoch_id.epoch();
@@ -150,8 +164,8 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::ops::Deref;
 
-    use futures::future::join_all;
     use futures::FutureExt;
+    use futures::future::join_all;
     use itertools::Itertools;
     use risingwave_common::catalog::TableId;
     use risingwave_common::util::epoch::EpochExt;
@@ -322,17 +336,17 @@ mod tests {
         //  epoch4  spill(imm1_1_4, imm1_2_4, size 2)               spill(imm2_4_1, size 1), imm2_4_2   |
 
         let (sync_tx1_1, sync_rx1_1) = oneshot::channel();
-        uploader.start_sync_epoch(epoch1, sync_tx1_1, HashSet::from_iter([table_id1]));
+        uploader.start_single_epoch_sync(epoch1, sync_tx1_1, HashSet::from_iter([table_id1]));
         let (sync_tx2_1, sync_rx2_1) = oneshot::channel();
-        uploader.start_sync_epoch(epoch2, sync_tx2_1, HashSet::from_iter([table_id1]));
+        uploader.start_single_epoch_sync(epoch2, sync_tx2_1, HashSet::from_iter([table_id1]));
         let (sync_tx3_1, sync_rx3_1) = oneshot::channel();
-        uploader.start_sync_epoch(epoch3, sync_tx3_1, HashSet::from_iter([table_id1]));
+        uploader.start_single_epoch_sync(epoch3, sync_tx3_1, HashSet::from_iter([table_id1]));
         let (sync_tx1_2, sync_rx1_2) = oneshot::channel();
-        uploader.start_sync_epoch(epoch1, sync_tx1_2, HashSet::from_iter([table_id2]));
+        uploader.start_single_epoch_sync(epoch1, sync_tx1_2, HashSet::from_iter([table_id2]));
         let (sync_tx2_2, sync_rx2_2) = oneshot::channel();
-        uploader.start_sync_epoch(epoch2, sync_tx2_2, HashSet::from_iter([table_id2]));
+        uploader.start_single_epoch_sync(epoch2, sync_tx2_2, HashSet::from_iter([table_id2]));
         let (sync_tx3_2, sync_rx3_2) = oneshot::channel();
-        uploader.start_sync_epoch(epoch3, sync_tx3_2, HashSet::from_iter([table_id2]));
+        uploader.start_single_epoch_sync(epoch3, sync_tx3_2, HashSet::from_iter([table_id2]));
 
         let (await_start2_4_2, finish_tx2_4_2) = new_task_notifier(HashMap::from_iter([(
             instance_id2,
@@ -398,7 +412,11 @@ mod tests {
 
             // trigger the sync after the spill task is finished and acked to cover the case
             let (sync_tx4, mut sync_rx4) = oneshot::channel();
-            uploader.start_sync_epoch(epoch4, sync_tx4, HashSet::from_iter([table_id1, table_id2]));
+            uploader.start_single_epoch_sync(
+                epoch4,
+                sync_tx4,
+                HashSet::from_iter([table_id1, table_id2]),
+            );
             await_start2_4_2.await;
 
             let sst = uploader.next_uploaded_sst().await;

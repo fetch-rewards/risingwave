@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,8 +16,9 @@ use std::time::Duration;
 
 use futures::future::try_join_all;
 use itertools::Itertools;
-use risingwave_pb::monitor_service::monitor_service_client::MonitorServiceClient;
+use risingwave_common::monitor::EndpointExt;
 use risingwave_pb::monitor_service::TieredCacheTracingRequest;
+use risingwave_pb::monitor_service::monitor_service_client::MonitorServiceClient;
 use tonic::transport::Endpoint;
 
 use crate::common::CtlContext;
@@ -40,7 +41,7 @@ pub async fn tiered_cache_tracing(
             let addr = worker_node.get_host().unwrap();
             let channel = Endpoint::from_shared(format!("http://{}:{}", addr.host, addr.port))?
                 .connect_timeout(Duration::from_secs(5))
-                .connect()
+                .monitored_connect("grpc-tiered-cache-tracing-client", Default::default())
                 .await?;
             let mut client = MonitorServiceClient::new(channel);
             client

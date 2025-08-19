@@ -7,11 +7,8 @@ keywords = { workspace = true }
 license = { workspace = true }
 repository = { workspace = true }
 
-[package.metadata.cargo-machete]
-ignored = ["workspace-hack"]
-
-[package.metadata.cargo-udeps.ignore]
-normal = ["workspace-hack"]
+[lib]
+test = false
 
 [dependencies]
 anyhow = "1"
@@ -40,11 +37,8 @@ walkdir = "2"
 workspace-hack = { path = "../../workspace-hack" }
 
 [dev-dependencies]
-libtest-mimic = "0.7"
+libtest-mimic = "0.8"
 tempfile = "3"
-
-[lib]
-test = false
 
 [[test]]
 name = "planner_test_runner"

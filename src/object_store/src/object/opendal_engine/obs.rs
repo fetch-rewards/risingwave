@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,14 +14,14 @@
 
 use std::sync::Arc;
 
+use opendal::Operator;
 use opendal::layers::LoggingLayer;
 use opendal::services::Obs;
-use opendal::Operator;
 use risingwave_common::config::ObjectStoreConfig;
 
-use super::{EngineType, OpendalObjectStore};
-use crate::object::object_metrics::ObjectStoreMetrics;
+use super::{MediaType, OpendalObjectStore};
 use crate::object::ObjectResult;
+use crate::object::object_metrics::ObjectStoreMetrics;
 
 impl OpendalObjectStore {
     /// create opendal obs engine.
@@ -32,11 +32,7 @@ impl OpendalObjectStore {
         metrics: Arc<ObjectStoreMetrics>,
     ) -> ObjectResult<Self> {
         // Create obs backend builder.
-        let mut builder = Obs::default();
-
-        builder.bucket(&bucket);
-
-        builder.root(&root);
+        let mut builder = Obs::default().bucket(&bucket).root(&root);
 
         let endpoint = std::env::var("OBS_ENDPOINT")
             .unwrap_or_else(|_| panic!("OBS_ENDPOINT not found from environment variables"));
@@ -46,16 +42,17 @@ impl OpendalObjectStore {
             panic!("OBS_SECRET_ACCESS_KEY not found from environment variables")
         });
 
-        builder.endpoint(&endpoint);
-        builder.access_key_id(&access_key_id);
-        builder.secret_access_key(&secret_access_key);
+        builder = builder
+            .endpoint(&endpoint)
+            .access_key_id(&access_key_id)
+            .secret_access_key(&secret_access_key);
 
         let op: Operator = Operator::new(builder)?
             .layer(LoggingLayer::default())
             .finish();
         Ok(Self {
             op,
-            engine_type: EngineType::Obs,
+            media_type: MediaType::Obs,
             config,
             metrics,
         })

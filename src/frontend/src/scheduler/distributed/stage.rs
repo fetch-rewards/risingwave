@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,10 +21,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use StageEvent::Failed;
 use anyhow::anyhow;
 use arc_swap::ArcSwap;
 use futures::stream::Fuse;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream};
 use futures_async_stream::for_await;
 use itertools::Itertools;
 use risingwave_batch::error::BatchError;
@@ -45,26 +46,25 @@ use risingwave_pb::batch_plan::{
 use risingwave_pb::common::{BatchQueryEpoch, HostAddress, WorkerNode};
 use risingwave_pb::plan_common::ExprContext;
 use risingwave_pb::task_service::{CancelTaskRequest, TaskInfoResponse};
-use risingwave_rpc_client::error::RpcError;
 use risingwave_rpc_client::ComputeClientPoolRef;
+use risingwave_rpc_client::error::RpcError;
 use rw_futures_util::select_all;
 use thiserror_ext::AsReport;
 use tokio::spawn;
-use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tonic::Streaming;
-use tracing::{debug, error, warn, Instrument};
-use StageEvent::Failed;
+use tracing::{Instrument, debug, error, warn};
 
 use crate::catalog::catalog_service::CatalogReader;
 use crate::catalog::{FragmentId, TableId};
-use crate::optimizer::plan_node::PlanNodeType;
-use crate::scheduler::distributed::stage::StageState::Pending;
-use crate::scheduler::distributed::QueryMessage;
-use crate::scheduler::plan_fragmenter::{
-    ExecutionPlanNode, PartitionInfo, QueryStageRef, StageId, TaskId, ROOT_TASK_ID,
-};
+use crate::optimizer::plan_node::BatchPlanNodeType;
 use crate::scheduler::SchedulerError::{TaskExecutionError, TaskRunningOutOfMemory};
+use crate::scheduler::distributed::QueryMessage;
+use crate::scheduler::distributed::stage::StageState::Pending;
+use crate::scheduler::plan_fragmenter::{
+    ExecutionPlanNode, PartitionInfo, QueryStageRef, ROOT_TASK_ID, StageId, TaskId,
+};
 use crate::scheduler::{ExecutionContextRef, SchedulerError, SchedulerResult};
 
 const TASK_SCHEDULING_PARALLELISM: usize = 10;
@@ -196,7 +196,7 @@ impl StageExecution {
         match cur_state {
             Pending { msg_sender } => {
                 let runner = StageRunner {
-                    epoch: self.epoch.clone(),
+                    epoch: self.epoch,
                     stage: self.stage.clone(),
                     worker_node_manager: self.worker_node_manager.clone(),
                     tasks: self.tasks.clone(),
@@ -264,7 +264,7 @@ impl StageExecution {
 
     pub async fn is_scheduled(&self) -> bool {
         let s = self.state.read().await;
-        matches!(*s, StageState::Running { .. } | StageState::Completed)
+        matches!(*s, StageState::Running | StageState::Completed)
     }
 
     pub async fn is_pending(&self) -> bool {
@@ -380,30 +380,57 @@ impl StageRunner {
                 ));
             }
         } else if let Some(source_info) = self.stage.source_info.as_ref() {
-            let chunk_size = (source_info.split_info().unwrap().len() as f32
+            // If there is no file in source, the `chunk_size` is set to 1.
+            let chunk_size = ((source_info.split_info().unwrap().len() as f32
                 / self.stage.parallelism.unwrap() as f32)
-                .ceil() as usize;
-            for (id, split) in source_info
-                .split_info()
-                .unwrap()
-                .chunks(chunk_size)
-                .enumerate()
-            {
+                .ceil() as usize)
+                .max(1);
+            if source_info.split_info().unwrap().is_empty() {
+                // No file in source, schedule an empty task.
+                const EMPTY_TASK_ID: u64 = 0;
                 let task_id = PbTaskId {
                     query_id: self.stage.query_id.id.clone(),
                     stage_id: self.stage.id,
-                    task_id: id as u64,
+                    task_id: EMPTY_TASK_ID,
                 };
-                let plan_fragment = self
-                    .create_plan_fragment(id as u64, Some(PartitionInfo::Source(split.to_vec())));
-                let worker =
-                    self.choose_worker(&plan_fragment, id as u32, self.stage.dml_table_id)?;
+                let plan_fragment =
+                    self.create_plan_fragment(EMPTY_TASK_ID, Some(PartitionInfo::Source(vec![])));
+                let worker = self.choose_worker(
+                    &plan_fragment,
+                    EMPTY_TASK_ID as u32,
+                    self.stage.dml_table_id,
+                )?;
                 futures.push(self.schedule_task(
                     task_id,
                     plan_fragment,
                     worker,
                     expr_context.clone(),
                 ));
+            } else {
+                for (id, split) in source_info
+                    .split_info()
+                    .unwrap()
+                    .chunks(chunk_size)
+                    .enumerate()
+                {
+                    let task_id = PbTaskId {
+                        query_id: self.stage.query_id.id.clone(),
+                        stage_id: self.stage.id,
+                        task_id: id as u64,
+                    };
+                    let plan_fragment = self.create_plan_fragment(
+                        id as u64,
+                        Some(PartitionInfo::Source(split.to_vec())),
+                    );
+                    let worker =
+                        self.choose_worker(&plan_fragment, id as u32, self.stage.dml_table_id)?;
+                    futures.push(self.schedule_task(
+                        task_id,
+                        plan_fragment,
+                        worker,
+                        expr_context.clone(),
+                    ));
+                }
             }
         } else if let Some(file_scan_info) = self.stage.file_scan_info.as_ref() {
             let chunk_size = (file_scan_info.file_location.len() as f32
@@ -614,7 +641,14 @@ impl StageRunner {
         };
 
         // Notify QueryRunner to poll chunk from result_rx.
-        let (result_tx, result_rx) = tokio::sync::mpsc::channel(100);
+        let (result_tx, result_rx) = tokio::sync::mpsc::channel(
+            self.ctx
+                .session
+                .env()
+                .batch_config()
+                .developer
+                .root_stage_channel_size,
+        );
         self.notify_stage_scheduled(QueryMessage::Stage(StageEvent::ScheduledRoot(result_rx)))
             .await;
 
@@ -622,13 +656,13 @@ impl StageRunner {
             &plan_node,
             &task_id,
             self.ctx.to_batch_task_context(),
-            self.epoch.clone(),
+            self.epoch,
             shutdown_rx.clone(),
         );
 
         let shutdown_rx0 = shutdown_rx.clone();
 
-        expr_context_scope(expr_context, async {
+        let result = expr_context_scope(expr_context, async {
             let executor = executor.build().await?;
             let chunk_stream = executor.execute();
             let cancelled = pin!(shutdown_rx.cancelled());
@@ -655,7 +689,19 @@ impl StageRunner {
                 }
             }
             Ok(())
-        }).await?;
+        }).await;
+
+        if let Err(err) = &result {
+            // If we encountered error when executing root stage locally, we have to notify the result fetcher, which is
+            // returned by `distribute_execute` and being listened by the FE handler task. Otherwise the FE handler cannot
+            // properly throw the error to the PG client.
+            if let Err(_e) = result_tx
+                .send(Err(TaskExecutionError(err.to_report_string())))
+                .await
+            {
+                warn!("Send task execution failed");
+            }
+        }
 
         // Terminated by other tasks execution error, so no need to return error here.
         match shutdown_rx0.message() {
@@ -674,12 +720,15 @@ impl StageRunner {
             self.stage.id
         );
 
-        Ok(())
+        // We still have to throw the error in this current task, so that `StageRunner::run` can further
+        // send `Failed` event to stop other stages.
+        result.map(|_| ())
     }
 
     async fn schedule_tasks_for_all(&mut self, shutdown_rx: ShutdownToken) -> SchedulerResult<()> {
         let expr_context = ExprContext {
             time_zone: self.ctx.session().config().timezone().to_owned(),
+            strict_mode: self.ctx.session().config().batch_expr_strict_mode(),
         };
         // If root, we execute it locally.
         if !self.is_root_stage() {
@@ -908,7 +957,7 @@ impl StageRunner {
         let t_id = task_id.task_id;
 
         let stream_status: Fuse<Streaming<TaskInfoResponse>> = compute_client
-            .create_task(task_id, plan_fragment, self.epoch.clone(), expr_context)
+            .create_task(task_id, plan_fragment, self.epoch, expr_context)
             .await
             .inspect_err(|_| self.mask_failed_serving_worker(&worker))
             .map_err(|e| anyhow!(e))?
@@ -956,7 +1005,7 @@ impl StageRunner {
         };
 
         match execution_plan_node.plan_node_type {
-            PlanNodeType::BatchExchange => {
+            BatchPlanNodeType::BatchExchange => {
                 // Find the stage this exchange node should fetch from and get all exchange sources.
                 let child_stage = self
                     .children
@@ -992,7 +1041,7 @@ impl StageRunner {
                     _ => unreachable!(),
                 }
             }
-            PlanNodeType::BatchSeqScan => {
+            BatchPlanNodeType::BatchSeqScan => {
                 let node_body = execution_plan_node.node.clone();
                 let NodeBody::RowSeqScan(mut scan_node) = node_body else {
                     unreachable!();
@@ -1001,7 +1050,7 @@ impl StageRunner {
                     .expect("no partition info for seq scan")
                     .into_table()
                     .expect("PartitionInfo should be TablePartitionInfo");
-                scan_node.vnode_bitmap = Some(partition.vnode_bitmap);
+                scan_node.vnode_bitmap = Some(partition.vnode_bitmap.to_protobuf());
                 scan_node.scan_ranges = partition.scan_ranges;
                 PbPlanNode {
                     children: vec![],
@@ -1009,7 +1058,7 @@ impl StageRunner {
                     node_body: Some(NodeBody::RowSeqScan(scan_node)),
                 }
             }
-            PlanNodeType::BatchLogSeqScan => {
+            BatchPlanNodeType::BatchLogSeqScan => {
                 let node_body = execution_plan_node.node.clone();
                 let NodeBody::LogRowSeqScan(mut scan_node) = node_body else {
                     unreachable!();
@@ -1018,16 +1067,14 @@ impl StageRunner {
                     .expect("no partition info for seq scan")
                     .into_table()
                     .expect("PartitionInfo should be TablePartitionInfo");
-                scan_node.vnode_bitmap = Some(partition.vnode_bitmap);
+                scan_node.vnode_bitmap = Some(partition.vnode_bitmap.to_protobuf());
                 PbPlanNode {
                     children: vec![],
                     identity,
                     node_body: Some(NodeBody::LogRowSeqScan(scan_node)),
                 }
             }
-            PlanNodeType::BatchSource
-            | PlanNodeType::BatchKafkaScan
-            | PlanNodeType::BatchIcebergScan => {
+            BatchPlanNodeType::BatchSource | BatchPlanNodeType::BatchKafkaScan => {
                 let node_body = execution_plan_node.node.clone();
                 let NodeBody::Source(mut source_node) = node_body else {
                     unreachable!();
@@ -1045,6 +1092,26 @@ impl StageRunner {
                     children: vec![],
                     identity,
                     node_body: Some(NodeBody::Source(source_node)),
+                }
+            }
+            BatchPlanNodeType::BatchIcebergScan => {
+                let node_body = execution_plan_node.node.clone();
+                let NodeBody::IcebergScan(mut iceberg_scan_node) = node_body else {
+                    unreachable!();
+                };
+
+                let partition = partition
+                    .expect("no partition info for seq scan")
+                    .into_source()
+                    .expect("PartitionInfo should be SourcePartitionInfo");
+                iceberg_scan_node.split = partition
+                    .into_iter()
+                    .map(|split| split.encode_to_bytes().into())
+                    .collect_vec();
+                PbPlanNode {
+                    children: vec![],
+                    identity,
+                    node_body: Some(NodeBody::IcebergScan(iceberg_scan_node)),
                 }
             }
             _ => {
@@ -1070,7 +1137,7 @@ impl StageRunner {
     }
 
     fn mask_failed_serving_worker(&self, worker: &WorkerNode) {
-        if !worker.property.as_ref().map_or(false, |p| p.is_serving) {
+        if !worker.property.as_ref().is_some_and(|p| p.is_serving) {
             return;
         }
         let duration = Duration::from_secs(std::cmp::max(

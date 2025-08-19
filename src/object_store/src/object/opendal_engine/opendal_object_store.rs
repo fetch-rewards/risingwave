@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fail::fail_point;
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use opendal::layers::{RetryLayer, TimeoutLayer};
 use opendal::raw::BoxedStaticFuture;
 use opendal::services::Memory;
@@ -29,22 +29,22 @@ use thiserror_ext::AsReport;
 
 use crate::object::object_metrics::ObjectStoreMetrics;
 use crate::object::{
-    prefix, ObjectDataStream, ObjectError, ObjectMetadata, ObjectMetadataIter, ObjectRangeBounds,
-    ObjectResult, ObjectStore, OperationType, StreamingUploader,
+    ObjectDataStream, ObjectError, ObjectMetadata, ObjectMetadataIter, ObjectRangeBounds,
+    ObjectResult, ObjectStore, OperationType, StreamingUploader, prefix,
 };
 
 /// Opendal object storage.
 #[derive(Clone)]
 pub struct OpendalObjectStore {
     pub(crate) op: Operator,
-    pub(crate) engine_type: EngineType,
+    pub(crate) media_type: MediaType,
 
     pub(crate) config: Arc<ObjectStoreConfig>,
     pub(crate) metrics: Arc<ObjectStoreMetrics>,
 }
 
 #[derive(Clone)]
-pub enum EngineType {
+pub enum MediaType {
     Memory,
     Hdfs,
     Gcs,
@@ -57,6 +57,23 @@ pub enum EngineType {
     Fs,
 }
 
+impl MediaType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MediaType::Memory => "Memory",
+            MediaType::Hdfs => "Hdfs",
+            MediaType::Gcs => "Gcs",
+            MediaType::Minio => "Minio",
+            MediaType::S3 => "S3",
+            MediaType::Obs => "Obs",
+            MediaType::Oss => "Oss",
+            MediaType::Webhdfs => "Webhdfs",
+            MediaType::Azblob => "Azblob",
+            MediaType::Fs => "Fs",
+        }
+    }
+}
+
 impl OpendalObjectStore {
     /// create opendal memory engine, used for unit tests.
     pub fn test_new_memory_engine() -> ObjectResult<Self> {
@@ -65,7 +82,7 @@ impl OpendalObjectStore {
         let op: Operator = Operator::new(builder)?.finish();
         Ok(Self {
             op,
-            engine_type: EngineType::Memory,
+            media_type: MediaType::Memory,
             config: Arc::new(ObjectStoreConfig::default()),
             metrics: Arc::new(ObjectStoreMetrics::unused()),
         })
@@ -77,17 +94,17 @@ impl ObjectStore for OpendalObjectStore {
     type StreamingUploader = OpendalStreamingUploader;
 
     fn get_object_prefix(&self, obj_id: u64, use_new_object_prefix_strategy: bool) -> String {
-        match self.engine_type {
-            EngineType::S3 => prefix::s3::get_object_prefix(obj_id),
-            EngineType::Minio => prefix::s3::get_object_prefix(obj_id),
-            EngineType::Memory => String::default(),
-            EngineType::Hdfs
-            | EngineType::Gcs
-            | EngineType::Obs
-            | EngineType::Oss
-            | EngineType::Webhdfs
-            | EngineType::Azblob
-            | EngineType::Fs => {
+        match self.media_type {
+            MediaType::S3 => prefix::s3::get_object_prefix(obj_id),
+            MediaType::Minio => prefix::s3::get_object_prefix(obj_id),
+            MediaType::Memory => String::default(),
+            MediaType::Hdfs
+            | MediaType::Gcs
+            | MediaType::Obs
+            | MediaType::Oss
+            | MediaType::Webhdfs
+            | MediaType::Azblob
+            | MediaType::Fs => {
                 prefix::opendal_engine::get_object_prefix(obj_id, use_new_object_prefix_strategy)
             }
         }
@@ -105,7 +122,7 @@ impl ObjectStore for OpendalObjectStore {
     async fn streaming_upload(&self, path: &str) -> ObjectResult<Self::StreamingUploader> {
         Ok(OpendalStreamingUploader::new(
             self.op.clone(),
-            path.to_string(),
+            path.to_owned(),
             self.config.clone(),
             self.metrics.clone(),
             self.store_media_type(),
@@ -187,7 +204,7 @@ impl ObjectStore for OpendalObjectStore {
 
     async fn metadata(&self, path: &str) -> ObjectResult<ObjectMetadata> {
         let opendal_metadata = self.op.stat(path).await?;
-        let key = path.to_string();
+        let key = path.to_owned();
         let last_modified = match opendal_metadata.last_modified() {
             Some(t) => t.timestamp() as f64,
             None => 0_f64,
@@ -214,18 +231,26 @@ impl ObjectStore for OpendalObjectStore {
         Ok(())
     }
 
-    async fn list(&self, prefix: &str) -> ObjectResult<ObjectMetadataIter> {
-        let object_lister = self
+    async fn list(
+        &self,
+        prefix: &str,
+        start_after: Option<String>,
+        limit: Option<usize>,
+    ) -> ObjectResult<ObjectMetadataIter> {
+        let mut object_lister = self
             .op
             .lister_with(prefix)
             .recursive(true)
-            .metakey(Metakey::ContentLength)
-            .await?;
+            .metakey(Metakey::ContentLength);
+        if let Some(start_after) = start_after {
+            object_lister = object_lister.start_after(&start_after);
+        }
+        let object_lister = object_lister.await?;
 
         let stream = stream::unfold(object_lister, |mut object_lister| async move {
             match object_lister.next().await {
                 Some(Ok(object)) => {
-                    let key = object.path().to_string();
+                    let key = object.path().to_owned();
                     let om = object.metadata();
                     let last_modified = match om.last_modified() {
                         Some(t) => t.timestamp() as f64,
@@ -244,26 +269,22 @@ impl ObjectStore for OpendalObjectStore {
             }
         });
 
-        Ok(stream.boxed())
+        Ok(stream.take(limit.unwrap_or(usize::MAX)).boxed())
     }
 
     fn store_media_type(&self) -> &'static str {
-        match self.engine_type {
-            EngineType::Memory => "Memory",
-            EngineType::Hdfs => "Hdfs",
-            EngineType::Minio => "Minio",
-            EngineType::S3 => "S3",
-            EngineType::Gcs => "Gcs",
-            EngineType::Obs => "Obs",
-            EngineType::Oss => "Oss",
-            EngineType::Webhdfs => "Webhdfs",
-            EngineType::Azblob => "Azblob",
-            EngineType::Fs => "Fs",
-        }
+        self.media_type.as_str()
     }
 
     fn support_streaming_upload(&self) -> bool {
         self.op.info().native_capability().write_can_multi
+    }
+}
+
+impl OpendalObjectStore {
+    pub async fn copy(&self, from_path: &str, to_path: &str) -> ObjectResult<()> {
+        self.op.copy(from_path, to_path).await?;
+        Ok(())
     }
 }
 
@@ -313,11 +334,11 @@ pub struct OpendalStreamingUploader {
     is_valid: bool,
 
     abort_on_err: bool,
+
+    upload_part_size: usize,
 }
 
 impl OpendalStreamingUploader {
-    const UPLOAD_BUFFER_SIZE: usize = 16 * 1024 * 1024;
-
     pub async fn new(
         op: Operator,
         path: String,
@@ -354,6 +375,7 @@ impl OpendalStreamingUploader {
             not_uploaded_len: 0,
             is_valid: true,
             abort_on_err: config.opendal_writer_abort_on_err,
+            upload_part_size: config.upload_part_size,
         })
     }
 
@@ -380,7 +402,7 @@ impl StreamingUploader for OpendalStreamingUploader {
         assert!(self.is_valid);
         self.not_uploaded_len += data.len();
         self.buf.push(data);
-        if self.not_uploaded_len >= Self::UPLOAD_BUFFER_SIZE {
+        if self.not_uploaded_len >= self.upload_part_size {
             self.flush().await?;
         }
         Ok(())
@@ -409,8 +431,9 @@ impl StreamingUploader for OpendalStreamingUploader {
         Ok(())
     }
 
+    // Not absolutely accurate. Some bytes may be in the infight request.
     fn get_memory_usage(&self) -> u64 {
-        Self::UPLOAD_BUFFER_SIZE as u64
+        self.not_uploaded_len as u64
     }
 }
 
@@ -422,7 +445,7 @@ mod tests {
 
     async fn list_all(prefix: &str, store: &OpendalObjectStore) -> Vec<ObjectMetadata> {
         store
-            .list(prefix)
+            .list(prefix, None, None)
             .await
             .unwrap()
             .try_collect::<Vec<_>>()
@@ -440,7 +463,7 @@ mod tests {
         store.read("/ab", 0..3).await.unwrap_err();
 
         let bytes = store.read("/abc", 4..6).await.unwrap();
-        assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), "56".to_string());
+        assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), "56".to_owned());
 
         store.delete("/abc").await.unwrap();
 
@@ -462,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn test_memory_metadata() {
         let block = Bytes::from("123456");
-        let path = "/abc".to_string();
+        let path = "/abc".to_owned();
         let obj_store = OpendalObjectStore::test_new_memory_engine().unwrap();
         obj_store.upload("/abc", block).await.unwrap();
 

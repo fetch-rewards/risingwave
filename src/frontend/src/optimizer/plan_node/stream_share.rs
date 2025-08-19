@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,17 +15,21 @@
 use std::cell::RefCell;
 
 use pretty_xmlish::XmlNode;
-use risingwave_pb::stream_plan::stream_node::PbNodeBody;
 use risingwave_pb::stream_plan::PbStreamNode;
+use risingwave_pb::stream_plan::stream_node::PbNodeBody;
 
 use super::stream::prelude::*;
 use super::utils::Distill;
-use super::{generic, ExprRewritable, PlanRef, PlanTreeNodeUnary, StreamExchange, StreamNode};
+use super::{
+    ExprRewritable, PlanTreeNodeUnary, ShareNode, StreamExchange, StreamNode,
+    StreamPlanRef as PlanRef, generic,
+};
+use crate::Explain;
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
+use crate::optimizer::plan_node::generic::Share;
 use crate::optimizer::plan_node::{LogicalShare, PlanBase, PlanTreeNode};
 use crate::scheduler::SchedulerResult;
 use crate::stream_fragmenter::BuildFragmentGraphState;
-use crate::Explain;
 
 /// `StreamShare` will be translated into an `ExchangeNode` based on its distribution finally.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -43,7 +47,7 @@ impl StreamShare {
             PlanBase::new_stream_with_core(
                 &core,
                 dist,
-                input.append_only(),
+                input.stream_kind(),
                 input.emit_on_window_close(),
                 input.watermark_columns().clone(),
                 input.columns_monotonicity().clone(),
@@ -67,29 +71,33 @@ impl Distill for StreamShare {
     }
 }
 
-impl PlanTreeNodeUnary for StreamShare {
+impl PlanTreeNodeUnary<Stream> for StreamShare {
     fn input(&self) -> PlanRef {
         self.core.input.borrow().clone()
     }
 
-    fn clone_with_input(&self, input: PlanRef) -> Self {
-        let core = self.core.clone();
-        core.replace_input(input);
-        Self::new(core)
+    fn clone_with_input(&self, _input: PlanRef) -> Self {
+        unreachable!("shared node should be handled specially in PlanRef::clone_with_input")
     }
 }
 
-impl StreamShare {
-    pub fn replace_input(&self, plan: PlanRef) {
+impl ShareNode<Stream> for StreamShare {
+    fn new_share(core: Share<PlanRef>) -> PlanRef {
+        Self::new(core).into()
+    }
+
+    fn replace_input(&self, plan: PlanRef) {
         self.core.replace_input(plan);
     }
 }
 
-impl_plan_tree_node_for_unary! { StreamShare }
+impl_plan_tree_node_for_unary! { Stream, StreamShare }
 
 impl StreamNode for StreamShare {
     fn to_stream_prost_body(&self, _state: &mut BuildFragmentGraphState) -> PbNodeBody {
-        unreachable!("stream scan cannot be converted into a prost body -- call `adhoc_to_stream_prost` instead.")
+        unreachable!(
+            "stream scan cannot be converted into a prost body -- call `adhoc_to_stream_prost` instead."
+        )
     }
 }
 
@@ -136,6 +144,6 @@ impl StreamShare {
     }
 }
 
-impl ExprRewritable for StreamShare {}
+impl ExprRewritable<Stream> for StreamShare {}
 
 impl ExprVisitable for StreamShare {}

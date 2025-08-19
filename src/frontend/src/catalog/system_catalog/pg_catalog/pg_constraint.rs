@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,10 @@
 use risingwave_common::types::Fields;
 use risingwave_frontend_macro::system_catalog;
 
+use crate::TableCatalog;
 use crate::catalog::schema_catalog::SchemaCatalog;
 use crate::catalog::system_catalog::{SysCatalogReaderImpl, SystemTableCatalog};
 use crate::error::Result;
-use crate::TableCatalog;
 
 /// The catalog `pg_constraint` records information about table and index inheritance hierarchies.
 /// Ref: [`https://www.postgresql.org/docs/current/catalog-pg-constraint.html`]
@@ -140,7 +140,7 @@ fn read_pg_constraint_in_schema(schema: &SchemaCatalog) -> Vec<PgConstraint> {
         .map(|table| PgConstraint::from_system_table(schema, table.as_ref()));
 
     let table_rows = schema
-        .iter_valid_table()
+        .iter_table_mv_indices()
         .map(|table| PgConstraint::from_table(schema, table.as_ref()));
 
     system_table_rows.chain(table_rows).collect()

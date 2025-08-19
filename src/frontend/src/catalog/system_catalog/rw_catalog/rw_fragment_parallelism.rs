@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -36,7 +36,8 @@ use risingwave_frontend_macro::system_catalog;
         f.state_table_ids,
         f.upstream_fragment_ids,
         f.flags,
-        f.parallelism
+        f.parallelism,
+        f.max_parallelism
     FROM all_streaming_jobs job
     INNER JOIN rw_fragments f ON job.id = f.table_id
     ORDER BY job.id"
@@ -52,4 +53,5 @@ struct RwFragmentParallelism {
     upstream_fragment_ids: Vec<i32>,
     flags: Vec<String>,
     parallelism: i32,
+    max_parallelism: i32,
 }

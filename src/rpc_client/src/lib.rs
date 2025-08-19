@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,6 @@
 #![feature(associated_type_defaults)]
 #![feature(coroutines)]
 #![feature(iterator_try_collect)]
-#![feature(hash_extract_if)]
 #![feature(try_blocks)]
 #![feature(let_chains)]
 #![feature(impl_trait_in_assoc_type)]
@@ -31,53 +30,64 @@
 use std::any::type_name;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
-use std::iter::repeat;
+use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use async_trait::async_trait;
+pub use compactor_client::{CompactorClient, GrpcCompactorProxyClient};
+pub use compute_client::{ComputeClient, ComputeClientPool, ComputeClientPoolRef};
+pub use connector_client::{SinkCoordinatorStreamHandle, SinkWriterStreamHandle};
+use error::Result;
+pub use frontend_client::{FrontendClientPool, FrontendClientPoolRef};
 use futures::future::try_join_all;
 use futures::stream::{BoxStream, Peekable};
 use futures::{Stream, StreamExt};
-use moka::future::Cache;
-use rand::prelude::SliceRandom;
-use risingwave_common::util::addr::HostAddr;
-use risingwave_pb::common::WorkerNode;
-use risingwave_pb::meta::heartbeat_request::extra_info;
-use tokio::sync::mpsc::{
-    channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
+pub use hummock_meta_client::{
+    CompactionEventItem, HummockMetaClient, HummockMetaClientChangeLogInfo,
+    IcebergCompactionEventItem,
 };
-
-pub mod error;
-use error::Result;
-mod compactor_client;
-mod compute_client;
-mod connector_client;
-mod hummock_meta_client;
-mod meta_client;
-mod sink_coordinate_client;
-mod stream_client;
-mod tracing;
-
-pub use compactor_client::{CompactorClient, GrpcCompactorProxyClient};
-pub use compute_client::{ComputeClient, ComputeClientPool, ComputeClientPoolRef};
-pub use connector_client::{ConnectorClient, SinkCoordinatorStreamHandle, SinkWriterStreamHandle};
-pub use hummock_meta_client::{CompactionEventItem, HummockMetaClient};
 pub use meta_client::{MetaClient, SinkCoordinationRpcClient};
+use moka::future::Cache;
+use rand::prelude::IndexedRandom;
+use risingwave_common::config::RpcClientConfig;
+use risingwave_common::util::addr::HostAddr;
+use risingwave_pb::common::{WorkerNode, WorkerType};
 use rw_futures_util::await_future_with_monitor_error_stream;
 pub use sink_coordinate_client::CoordinatorStreamHandle;
 pub use stream_client::{
     StreamClient, StreamClientPool, StreamClientPoolRef, StreamingControlHandle,
 };
+use tokio::sync::mpsc::{
+    Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
+};
+
+pub mod error;
+
+mod channel;
+mod compactor_client;
+mod compute_client;
+mod connector_client;
+mod frontend_client;
+mod hummock_meta_client;
+mod meta_client;
+mod sink_coordinate_client;
+mod stream_client;
 
 #[async_trait]
 pub trait RpcClient: Send + Sync + 'static + Clone {
-    async fn new_client(host_addr: HostAddr) -> Result<Self>;
+    async fn new_client(host_addr: HostAddr, opts: &RpcClientConfig) -> Result<Self>;
 
-    async fn new_clients(host_addr: HostAddr, size: usize) -> Result<Arc<Vec<Self>>> {
-        try_join_all(repeat(host_addr).take(size).map(Self::new_client))
-            .await
-            .map(Arc::new)
+    async fn new_clients(
+        host_addr: HostAddr,
+        size: usize,
+        opts: &RpcClientConfig,
+    ) -> Result<Arc<Vec<Self>>> {
+        try_join_all(
+            std::iter::repeat_n(host_addr, size).map(|host_addr| Self::new_client(host_addr, opts)),
+        )
+        .await
+        .map(Arc::new)
     }
 }
 
@@ -86,6 +96,8 @@ pub struct RpcClientPool<S> {
     connection_pool_size: u16,
 
     clients: Cache<HostAddr, Arc<Vec<S>>>,
+
+    opts: RpcClientConfig,
 }
 
 impl<S> std::fmt::Debug for RpcClientPool<S> {
@@ -107,10 +119,11 @@ where
 {
     /// Create a new pool with the given `connection_pool_size`, which is the number of
     /// connections to each node that will be reused.
-    pub fn new(connection_pool_size: u16) -> Self {
+    pub fn new(connection_pool_size: u16, opts: RpcClientConfig) -> Self {
         Self {
             connection_pool_size,
             clients: Cache::new(u64::MAX),
+            opts,
         }
     }
 
@@ -121,13 +134,22 @@ where
 
     /// Create a pool for ad-hoc usage, where the number of connections to each node is 1.
     pub fn adhoc() -> Self {
-        Self::new(1)
+        Self::new(1, RpcClientConfig::default())
     }
 
     /// Gets the RPC client for the given node. If the connection is not established, a
     /// new client will be created and returned.
     pub async fn get(&self, node: &WorkerNode) -> Result<S> {
-        let addr: HostAddr = node.get_host().unwrap().into();
+        let addr = if node.get_type().unwrap() == WorkerType::Frontend {
+            let prop = node
+                .property
+                .as_ref()
+                .expect("frontend node property is missing");
+            HostAddr::from_str(prop.internal_rpc_host_addr.as_str())?
+        } else {
+            node.get_host().unwrap().into()
+        };
+
         self.get_by_addr(addr).await
     }
 
@@ -138,11 +160,11 @@ where
             .clients
             .try_get_with(
                 addr.clone(),
-                S::new_clients(addr.clone(), self.connection_pool_size as usize),
+                S::new_clients(addr.clone(), self.connection_pool_size as usize, &self.opts),
             )
             .await
             .with_context(|| format!("failed to create RPC client to {addr}"))?
-            .choose(&mut rand::thread_rng())
+            .choose(&mut rand::rng())
             .unwrap()
             .clone())
     }
@@ -151,15 +173,6 @@ where
         self.clients.invalidate_all()
     }
 }
-
-/// `ExtraInfoSource` is used by heartbeat worker to pull extra info that needs to be piggybacked.
-#[async_trait::async_trait]
-pub trait ExtraInfoSource: Send + Sync {
-    /// None means the info is not available at the moment.
-    async fn get_extra_info(&self) -> Option<extra_info::Info>;
-}
-
-pub type ExtraInfoSourceRef = Arc<dyn ExtraInfoSource>;
 
 #[macro_export]
 macro_rules! stream_rpc_client_method_impl {

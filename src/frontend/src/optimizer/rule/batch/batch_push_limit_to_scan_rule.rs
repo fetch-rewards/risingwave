@@ -1,4 +1,4 @@
-//  Copyright 2024 RisingWave Labs
+//  Copyright 2025 RisingWave Labs
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -19,14 +19,13 @@
 
 use itertools::Itertools;
 
+use super::prelude::*;
 use crate::optimizer::plan_node::generic::PhysicalPlanRef;
 use crate::optimizer::plan_node::{BatchLimit, BatchSeqScan, PlanTreeNodeUnary};
-use crate::optimizer::rule::{BoxedRule, Rule};
-use crate::optimizer::PlanRef;
 
 pub struct BatchPushLimitToScanRule {}
 
-impl Rule for BatchPushLimitToScanRule {
+impl Rule<Batch> for BatchPushLimitToScanRule {
     fn apply(&self, plan: PlanRef) -> Option<PlanRef> {
         let limit: &BatchLimit = plan.as_batch_limit()?;
         let limit_input = limit.input();

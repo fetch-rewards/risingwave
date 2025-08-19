@@ -69,7 +69,7 @@ check_version() {
   local VERSION=$1
   local raw_version=$(run_sql "SELECT version();")
   echo "--- Version"
-  echo "$raw_version"
+  echo "raw_version: $raw_version"
   local version=$(echo $raw_version | grep -i risingwave | sed 's/^.*risingwave-\([0-9]*\.[0-9]*\.[0-9]\).*$/\1/i')
   if [[ "$version" != "$VERSION" ]]; then
     echo "Version mismatch, expected $VERSION, got $version"
@@ -121,10 +121,9 @@ get_old_version() {
     local VERSION_OFFSET=1
   fi
 
-  # First we obtain a list of versions from git branch names.
-  # Then we normalize them to semver format (MAJOR.MINOR.PATCH).
-  echo "--- git branch origin output"
-  git branch -r | grep origin
+  # First get the new version to offset against
+  get_new_version
+  echo "--- NEW VERSION: $NEW_VERSION"
 
   # Extract X.Y.Z tags
   echo "--- VERSION BRANCHES"
@@ -133,12 +132,40 @@ get_old_version() {
 
   # Then we sort them in descending order.
   echo "--- VERSIONS"
-  local sorted_versions=$(echo -e "$tags" | sort -t '.' -n)
+  local sorted_versions=$(echo -e "$tags" | sort -V)
   echo "$sorted_versions"
 
-  # Then we take the Nth latest version.
-  # We set $OLD_VERSION to this.
-  OLD_VERSION=$(echo -e "$sorted_versions" | tail -n $VERSION_OFFSET | head -1)
+  # Find the index of NEW_VERSION in the sorted list
+  local new_version_index=$(echo -e "$sorted_versions" | grep -n "$NEW_VERSION" | cut -d: -f1)
+  if [[ -z $new_version_index ]]; then
+    echo "Could not find NEW_VERSION ($NEW_VERSION) in git tags, looking for latest version in same minor series"
+    # Extract major.minor from NEW_VERSION
+    local major_minor=$(echo "$NEW_VERSION" | cut -d. -f1,2)
+    # Find the latest version in the same minor series
+    local latest_in_series=$(echo -e "$sorted_versions" | grep "^$major_minor\." | tail -n1)
+    if [[ -n "$latest_in_series" ]]; then
+      echo "Found latest version in series $major_minor: $latest_in_series"
+      new_version_index=$(echo -e "$sorted_versions" | grep -n "$latest_in_series" | cut -d: -f1)
+    else
+      echo "No version found in series $major_minor, using latest tag as reference"
+      # Get the total number of versions
+      local total_versions=$(echo -e "$sorted_versions" | wc -l)
+      # Use the latest version's index + 1 as reference
+      new_version_index=$((total_versions + 1))
+    fi
+    echo "Using reference index: $new_version_index"
+  fi
+
+  # Calculate the target index by subtracting the offset
+  local target_index=$((new_version_index - VERSION_OFFSET))
+
+  # Get the version at the target index
+  OLD_VERSION=$(echo -e "$sorted_versions" | sed -n "${target_index}p")
+  if [[ -z $OLD_VERSION ]]; then
+    echo "Error: Could not find version at offset $VERSION_OFFSET from reference version"
+    exit 1
+  fi
+  echo "--- OLD VERSION: $OLD_VERSION"
 }
 
 get_new_version() {
@@ -151,19 +178,14 @@ get_rw_versions() {
   get_old_version
   get_new_version
 
-  # FIXME(kwannoel): This check does not always hold.
-  # The new/current version may not be up-to-date.
-  # The new version is derived from Cargo.toml, which may not be up-to-date.
-  # The old version are derived from git tags, which are up-to-date.
-  # Then we assert that `$OLD_VERSION` <= `$NEW_VERSION`.
-  #  if version_le "$OLD_VERSION" "$NEW_VERSION"
-  #  then
-  #    echo "OLD_VERSION: $OLD_VERSION"
-  #    echo "NEW_VERSION: $NEW_VERSION"
-  #  else
-  #    echo "ERROR: $OLD_VERSION >= $NEW_VERSION"
-  #    exit 1
-  #  fi
+  if version_le "$OLD_VERSION" "$NEW_VERSION"
+  then
+    echo "OLD_VERSION: $OLD_VERSION"
+    echo "NEW_VERSION: $NEW_VERSION"
+  else
+    echo "ERROR: $OLD_VERSION >= $NEW_VERSION"
+    exit 1
+  fi
 }
 
 # Setup table and materialized view.
@@ -182,7 +204,8 @@ seed_old_cluster() {
   cp -r e2e_test/tpch/* $TEST_DIR/tpch
 
   ./risedev clean-data
-  ./risedev d full-without-monitoring && rm .risingwave/log/*
+  # `ENABLE_PYTHON_UDF` and `ENABLE_JS_UDF` are set for backwards-compartibility
+  ENABLE_PYTHON_UDF=1 ENABLE_JS_UDF=1 ENABLE_UDF=1 ./risedev d full-without-monitoring && rm .risingwave/log/*
 
   check_version "$OLD_VERSION"
 
@@ -233,6 +256,10 @@ seed_old_cluster() {
     sqllogictest -d dev -h localhost -p 4566 "$TEST_DIR/kafka/invalid_options/validate_original.slt"
   fi
 
+  # work around https://github.com/risingwavelabs/risingwave/issues/18650
+  echo "--- wait for a version checkpoint"
+  sleep 60
+
   echo "--- Killing cluster"
   kill_cluster
   echo "--- Killed cluster"
@@ -240,7 +267,7 @@ seed_old_cluster() {
 
 validate_new_cluster() {
   echo "--- Start cluster on latest"
-  ./risedev d full-without-monitoring
+  ENABLE_UDF=1 ./risedev d full-without-monitoring
 
   echo "--- Wait ${RECOVERY_DURATION}s for Recovery on Old Cluster Data"
   sleep $RECOVERY_DURATION

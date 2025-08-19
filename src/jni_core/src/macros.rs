@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -279,40 +279,20 @@ macro_rules! gen_jni_type_sig {
 /// ```
 #[macro_export]
 macro_rules! cast_jvalue {
-    ({ boolean }, $value:expr) => {{
-        $value.z().expect("should be bool")
-    }};
-    ({ byte }, $value:expr) => {{
-        $value.b().expect("should be byte")
-    }};
-    ({ char }, $value:expr) => {{
-        $value.c().expect("should be char")
-    }};
-    ({ double }, $value:expr) => {{
-        $value.d().expect("should be double")
-    }};
-    ({ float }, $value:expr) => {{
-        $value.f().expect("should be float")
-    }};
-    ({ int }, $value:expr) => {{
-        $value.i().expect("should be int")
-    }};
-    ({ long }, $value:expr) => {{
-        $value.j().expect("should be long")
-    }};
-    ({ short }, $value:expr) => {{
-        $value.s().expect("should be short")
-    }};
-    ({ void }, $value:expr) => {{
-        $value.v().expect("should be void")
-    }};
+    ({ boolean }, $value:expr) => {{ $value.z().expect("should be bool") }};
+    ({ byte }, $value:expr) => {{ $value.b().expect("should be byte") }};
+    ({ char }, $value:expr) => {{ $value.c().expect("should be char") }};
+    ({ double }, $value:expr) => {{ $value.d().expect("should be double") }};
+    ({ float }, $value:expr) => {{ $value.f().expect("should be float") }};
+    ({ int }, $value:expr) => {{ $value.i().expect("should be int") }};
+    ({ long }, $value:expr) => {{ $value.j().expect("should be long") }};
+    ({ short }, $value:expr) => {{ $value.s().expect("should be short") }};
+    ({ void }, $value:expr) => {{ $value.v().expect("should be void") }};
     ({ byte[] }, $value:expr) => {{
         let obj = $value.l().expect("should be object");
         unsafe { jni::objects::JByteArray::from_raw(obj.into_raw()) }
     }};
-    ({ $($class:tt)+ }, $value:expr) => {{
-        $value.l().expect("should be object")
-    }};
+    ({ $($class:tt)+ }, $value:expr) => {{ $value.l().expect("should be object") }};
 }
 
 /// Cast a `JValueGen` to a concrete type by the given type
@@ -334,48 +314,27 @@ macro_rules! cast_jvalue {
 /// assert_eq!(cast_jvalue!({ int }, to_jvalue!({ int }, 10)), 10);
 /// assert_eq!(cast_jvalue!({ long }, to_jvalue!({ long }, 10)), 10);
 /// assert_eq!(cast_jvalue!({ short }, to_jvalue!({ short }, 10)), 10);
-/// cast_jvalue!(
-///     { String },
-///     to_jvalue!({ String }, &jni::objects::JObject::null())
-/// );
+/// let obj = jni::objects::JObject::null();
+/// cast_jvalue!({ String }, to_jvalue!({ String }, &obj));
 /// ```
 #[macro_export]
 macro_rules! to_jvalue {
-    ({ boolean $($param_name:ident)? }, $value:expr) => {{
-        jni::objects::JValue::Bool($value as _)
-    }};
-    ({ byte $($param_name:ident)? }, $value:expr) => {{
-        jni::objects::JValue::Byte($value as _)
-    }};
-    ({ char $($param_name:ident)? }, $value:expr) => {{
-        jni::objects::JValue::Char($value as _)
-    }};
-    ({ double $($param_name:ident)? }, $value:expr) => {{
-        jni::objects::JValue::Double($value as _)
-    }};
-    ({ float $($param_name:ident)? }, $value:expr) => {{
-        jni::objects::JValue::Float($value as _)
-    }};
-    ({ int $($param_name:ident)? }, $value:expr) => {{
-        jni::objects::JValue::Int($value as _)
-    }};
-    ({ long $($param_name:ident)? }, $value:expr) => {{
-        jni::objects::JValue::Long($value as _)
-    }};
-    ({ short $($param_name:ident)? }, $value:expr) => {{
-        jni::objects::JValue::Short($value as _)
-    }};
+    ({ boolean $($param_name:ident)? }, $value:expr) => {{ jni::objects::JValue::Bool($value as _) }};
+    ({ byte $($param_name:ident)? }, $value:expr) => {{ jni::objects::JValue::Byte($value as _) }};
+    ({ char $($param_name:ident)? }, $value:expr) => {{ jni::objects::JValue::Char($value as _) }};
+    ({ double $($param_name:ident)? }, $value:expr) => {{ jni::objects::JValue::Double($value as _) }};
+    ({ float $($param_name:ident)? }, $value:expr) => {{ jni::objects::JValue::Float($value as _) }};
+    ({ int $($param_name:ident)? }, $value:expr) => {{ jni::objects::JValue::Int($value as _) }};
+    ({ long $($param_name:ident)? }, $value:expr) => {{ jni::objects::JValue::Long($value as _) }};
+    ({ short $($param_name:ident)? }, $value:expr) => {{ jni::objects::JValue::Short($value as _) }};
     ({ void }, $value:expr) => {{
         compile_error! {concat! {"unlike to pass void value: ", stringify! {$value} }}
     }};
-    ({ $($class:ident)+ $([])? $($param_name:ident)? }, $value:expr) => {{
-        jni::objects::JValue::Object($value as _)
-    }};
+    ({ $($class:ident)+ $([])? $($param_name:ident)? }, $value:expr) => {{ jni::objects::JValue::Object($value as _) }};
 }
 
 /// Generate the jni signature of a given function
 /// ```
-/// #![feature(lazy_cell)]
 /// use risingwave_jni_core::gen_jni_sig;
 /// assert_eq!(gen_jni_sig!(boolean f(int, short, byte[])), "(IS[B)Z");
 /// assert_eq!(
@@ -386,7 +345,7 @@ macro_rules! to_jvalue {
 ///     gen_jni_sig!(boolean f(int, java.lang.String)),
 ///     "(ILjava/lang/String;)Z"
 /// );
-/// assert_eq!(gen_jni_sig!(public static native int vnodeCount()), "()I");
+/// assert_eq!(gen_jni_sig!(public static native int defaultVnodeCount()), "()I");
 /// assert_eq!(
 ///     gen_jni_sig!(long hummockIteratorNew(byte[] readPlan)),
 ///     "([B)J"
@@ -442,11 +401,11 @@ macro_rules! for_all_plain_native_methods {
     ($macro:path $(,$args:tt)*) => {
         $macro! {
             {
-                public static native void tracingSlf4jEvent(String threadName, String name, int level, String string);
+                public static native void tracingSlf4jEvent(String threadName, String name, int level, String message, String stackTrace);
 
                 public static native boolean tracingSlf4jEventEnabled(int level);
 
-                public static native int vnodeCount();
+                public static native int defaultVnodeCount();
 
                 static native long iteratorNewStreamChunk(long pointer);
 
@@ -502,6 +461,8 @@ macro_rules! for_all_plain_native_methods {
                 public static native boolean sendCdcSourceMsgToChannel(long channelPtr, byte[] msg);
 
                 public static native boolean sendCdcSourceErrorToChannel(long channelPtr, String errorMsg);
+
+                public static native void cdcSourceSenderClose(long channelPtr);
 
                 public static native com.risingwave.java.binding.JniSinkWriterStreamRequest
                     recvSinkWriterRequestFromChannel(long channelPtr);
@@ -862,7 +823,7 @@ mod tests {
             (test) => {{
                 for_all_native_methods! {
                     {
-                        public static native int vnodeCount();
+                        public static native int defaultVnodeCount();
                         static native long hummockIteratorNew(byte[] readPlan);
                         public static native byte[] rowGetKey(long pointer);
                     },
@@ -886,7 +847,7 @@ mod tests {
         assert_eq!(
             sig,
             [
-                ("vnodeCount", "()I"),
+                ("defaultVnodeCount", "()I"),
                 ("hummockIteratorNew", "([B)J"),
                 ("rowGetKey", "(J)[B")
             ]
@@ -901,9 +862,9 @@ mod tests {
         // This test shows the signature of all native methods
         let expected = expect_test::expect![[r#"
             [
-                tracingSlf4jEvent                        (Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;)V,
+                tracingSlf4jEvent                        (Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;)V,
                 tracingSlf4jEventEnabled                 (I)Z,
-                vnodeCount                               ()I,
+                defaultVnodeCount                        ()I,
                 iteratorNewStreamChunk                   (J)J,
                 iteratorNext                             (J)Z,
                 iteratorClose                            (J)V,
@@ -931,6 +892,7 @@ mod tests {
                 iteratorGetArrayValue                    (JILjava/lang/Class;)Ljava/lang/Object;,
                 sendCdcSourceMsgToChannel                (J[B)Z,
                 sendCdcSourceErrorToChannel              (JLjava/lang/String;)Z,
+                cdcSourceSenderClose                     (J)V,
                 recvSinkWriterRequestFromChannel         (J)Lcom/risingwave/java/binding/JniSinkWriterStreamRequest;,
                 sendSinkWriterResponseToChannel          (J[B)Z,
                 sendSinkWriterErrorToChannel             (JLjava/lang/String;)Z,

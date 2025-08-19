@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,6 +27,15 @@ use risingwave_frontend_macro::system_catalog;
             i.definition AS indexdef
         FROM rw_catalog.rw_indexes i
         JOIN rw_catalog.rw_tables t ON i.primary_table_id = t.id
+        JOIN rw_catalog.rw_schemas s ON i.schema_id = s.id
+    UNION ALL
+    SELECT s.name AS schemaname,
+            t.name AS tablename,
+            i.name AS indexname,
+            NULL AS tablespace,
+            i.definition AS indexdef
+        FROM rw_catalog.rw_indexes i
+        JOIN rw_catalog.rw_materialized_views t ON i.primary_table_id = t.id
         JOIN rw_catalog.rw_schemas s ON i.schema_id = s.id
     UNION ALL
     SELECT s.name AS schemaname,

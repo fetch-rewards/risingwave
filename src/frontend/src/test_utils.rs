@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use futures_async_stream::for_await;
 use parking_lot::RwLock;
@@ -25,13 +25,17 @@ use pgwire::pg_response::StatementType;
 use pgwire::pg_server::{BoxedError, SessionId, SessionManager, UserAuthenticator};
 use pgwire::types::Row;
 use risingwave_common::catalog::{
-    FunctionId, IndexId, TableId, DEFAULT_DATABASE_NAME, DEFAULT_SCHEMA_NAME, DEFAULT_SUPER_USER,
-    DEFAULT_SUPER_USER_ID, NON_RESERVED_USER_ID, PG_CATALOG_SCHEMA_NAME, RW_CATALOG_SCHEMA_NAME,
+    AlterDatabaseParam, DEFAULT_DATABASE_NAME, DEFAULT_SCHEMA_NAME, DEFAULT_SUPER_USER,
+    DEFAULT_SUPER_USER_ID, FunctionId, IndexId, NON_RESERVED_USER_ID, ObjectId,
+    PG_CATALOG_SCHEMA_NAME, RW_CATALOG_SCHEMA_NAME, TableId,
 };
+use risingwave_common::hash::{VirtualNode, VnodeCount, VnodeCountCompat};
 use risingwave_common::session_config::SessionConfig;
 use risingwave_common::system_param::reader::SystemParamsReader;
-use risingwave_common::util::column_index_mapping::ColIndexMapping;
+use risingwave_common::util::cluster_limit::ClusterLimit;
+use risingwave_common::util::worker_util::DEFAULT_RESOURCE_GROUP;
 use risingwave_hummock_sdk::version::{HummockVersion, HummockVersionDelta};
+use risingwave_hummock_sdk::{HummockVersionId, INVALID_VERSION_ID};
 use risingwave_pb::backup_service::MetaSnapshotMetadata;
 use risingwave_pb::catalog::table::OptionalAssociatedSourceId;
 use risingwave_pb::catalog::{
@@ -41,40 +45,45 @@ use risingwave_pb::catalog::{
 use risingwave_pb::common::WorkerNode;
 use risingwave_pb::ddl_service::alter_owner_request::Object;
 use risingwave_pb::ddl_service::{
-    alter_set_schema_request, create_connection_request, DdlProgress, PbTableJobType,
-    ReplaceTablePlan, TableJobType,
+    DdlProgress, PbTableJobType, ReplaceJobPlan, TableJobType, alter_name_request,
+    alter_set_schema_request, alter_swap_rename_request, create_connection_request,
 };
 use risingwave_pb::hummock::write_limits::WriteLimit;
 use risingwave_pb::hummock::{
     BranchedObject, CompactTaskAssignment, CompactTaskProgress, CompactionGroupInfo,
-    HummockSnapshot,
 };
 use risingwave_pb::meta::cancel_creating_jobs_request::PbJobs;
+use risingwave_pb::meta::list_actor_splits_response::ActorSplit;
 use risingwave_pb::meta::list_actor_states_response::ActorState;
-use risingwave_pb::meta::list_fragment_distribution_response::FragmentDistribution;
+use risingwave_pb::meta::list_iceberg_tables_response::IcebergTable;
 use risingwave_pb::meta::list_object_dependencies_response::PbObjectDependencies;
-use risingwave_pb::meta::list_table_fragment_states_response::TableFragmentState;
+use risingwave_pb::meta::list_rate_limits_response::RateLimitInfo;
+use risingwave_pb::meta::list_streaming_job_states_response::StreamingJobState;
 use risingwave_pb::meta::list_table_fragments_response::TableFragmentInfo;
 use risingwave_pb::meta::{
-    EventLog, PbTableParallelism, PbThrottleTarget, RecoveryStatus, SystemParams,
+    EventLog, FragmentDistribution, PbTableParallelism, PbThrottleTarget, RecoveryStatus,
+    RefreshRequest, RefreshResponse, SystemParams,
 };
+use risingwave_pb::secret::PbSecretRef;
 use risingwave_pb::stream_plan::StreamFragmentGraph;
+use risingwave_pb::user::alter_default_privilege_request::Operation as AlterDefaultPrivilegeOperation;
 use risingwave_pb::user::update_user_request::UpdateField;
 use risingwave_pb::user::{GrantPrivilege, UserInfo};
 use risingwave_rpc_client::error::Result as RpcResult;
 use tempfile::{Builder, NamedTempFile};
 
+use crate::FrontendOpts;
 use crate::catalog::catalog_service::CatalogWriter;
 use crate::catalog::root_catalog::Catalog;
-use crate::catalog::{ConnectionId, DatabaseId, SchemaId, SecretId};
+use crate::catalog::{DatabaseId, SchemaId, SecretId, SinkId};
 use crate::error::{ErrorCode, Result};
 use crate::handler::RwPgResponse;
 use crate::meta_client::FrontendMetaClient;
+use crate::scheduler::HummockSnapshotManagerRef;
 use crate::session::{AuthContext, FrontendEnv, SessionImpl};
+use crate::user::UserId;
 use crate::user::user_manager::UserInfoManager;
 use crate::user::user_service::UserInfoWriter;
-use crate::user::UserId;
-use crate::FrontendOpts;
 
 /// An embedded frontend without starting meta and without starting frontend as a tcp server.
 pub struct LocalFrontend {
@@ -84,6 +93,14 @@ pub struct LocalFrontend {
 
 impl SessionManager for LocalFrontend {
     type Session = SessionImpl;
+
+    fn create_dummy_session(
+        &self,
+        _database_id: u32,
+        _user_name: u32,
+    ) -> std::result::Result<Arc<Self::Session>, BoxedError> {
+        unreachable!()
+    }
 
     fn connect(
         &self,
@@ -172,10 +189,11 @@ impl LocalFrontend {
         res
     }
 
+    /// Creates a new session
     pub fn session_ref(&self) -> Arc<SessionImpl> {
         self.session_user_ref(
-            DEFAULT_DATABASE_NAME.to_string(),
-            DEFAULT_SUPER_USER.to_string(),
+            DEFAULT_DATABASE_NAME.to_owned(),
+            DEFAULT_SUPER_USER.to_owned(),
             DEFAULT_SUPER_USER_ID,
         )
     }
@@ -188,7 +206,7 @@ impl LocalFrontend {
     ) -> Arc<SessionImpl> {
         Arc::new(SessionImpl::new(
             self.env.clone(),
-            Arc::new(AuthContext::new(database, user_name, user_id)),
+            AuthContext::new(database, user_name, user_id),
             UserAuthenticator::None,
             // Local Frontend use a non-sense id.
             (0, 0),
@@ -224,16 +242,27 @@ pub struct MockCatalogWriter {
     id: AtomicU32,
     table_id_to_schema_id: RwLock<HashMap<u32, SchemaId>>,
     schema_id_to_database_id: RwLock<HashMap<u32, DatabaseId>>,
+    hummock_snapshot_manager: HummockSnapshotManagerRef,
 }
 
 #[async_trait::async_trait]
 impl CatalogWriter for MockCatalogWriter {
-    async fn create_database(&self, db_name: &str, owner: UserId) -> Result<()> {
+    async fn create_database(
+        &self,
+        db_name: &str,
+        owner: UserId,
+        resource_group: &str,
+        barrier_interval_ms: Option<u32>,
+        checkpoint_frequency: Option<u64>,
+    ) -> Result<()> {
         let database_id = self.gen_id();
         self.catalog.write().create_database(&PbDatabase {
-            name: db_name.to_string(),
+            name: db_name.to_owned(),
             id: database_id,
             owner,
+            resource_group: resource_group.to_owned(),
+            barrier_interval_ms,
+            checkpoint_frequency,
         });
         self.create_schema(database_id, DEFAULT_SCHEMA_NAME, owner)
             .await?;
@@ -253,7 +282,7 @@ impl CatalogWriter for MockCatalogWriter {
         let id = self.gen_id();
         self.catalog.write().create_schema(&PbSchema {
             id,
-            name: schema_name.to_string(),
+            name: schema_name.to_owned(),
             database_id: db_id,
             owner,
         });
@@ -265,15 +294,32 @@ impl CatalogWriter for MockCatalogWriter {
         &self,
         mut table: PbTable,
         _graph: StreamFragmentGraph,
+        _dependencies: HashSet<ObjectId>,
+        _specific_resource_group: Option<String>,
+        _if_not_exists: bool,
     ) -> Result<()> {
         table.id = self.gen_id();
         table.stream_job_status = PbStreamJobStatus::Created as _;
+        table.maybe_vnode_count = VnodeCount::for_test().to_protobuf();
         self.catalog.write().create_table(&table);
         self.add_table_or_source_id(table.id, table.schema_id, table.database_id);
+        self.hummock_snapshot_manager
+            .add_table_for_test(TableId::new(table.id));
         Ok(())
     }
 
-    async fn create_view(&self, mut view: PbView) -> Result<()> {
+    async fn replace_materialized_view(
+        &self,
+        mut table: PbTable,
+        _graph: StreamFragmentGraph,
+    ) -> Result<()> {
+        table.stream_job_status = PbStreamJobStatus::Created as _;
+        assert_eq!(table.vnode_count(), VirtualNode::COUNT_FOR_TEST);
+        self.catalog.write().update_table(&table);
+        Ok(())
+    }
+
+    async fn create_view(&self, mut view: PbView, _dependencies: HashSet<ObjectId>) -> Result<()> {
         view.id = self.gen_id();
         self.catalog.write().create_view(&view);
         self.add_table_or_source_id(view.id, view.schema_id, view.database_id);
@@ -286,13 +332,16 @@ impl CatalogWriter for MockCatalogWriter {
         mut table: PbTable,
         graph: StreamFragmentGraph,
         _job_type: PbTableJobType,
+        if_not_exists: bool,
+        _dependencies: HashSet<ObjectId>,
     ) -> Result<()> {
         if let Some(source) = source {
             let source_id = self.create_source_inner(source)?;
             table.optional_associated_source_id =
                 Some(OptionalAssociatedSourceId::AssociatedSourceId(source_id));
         }
-        self.create_materialized_view(table, graph).await?;
+        self.create_materialized_view(table, graph, HashSet::new(), None, if_not_exists)
+            .await?;
         Ok(())
     }
 
@@ -301,22 +350,24 @@ impl CatalogWriter for MockCatalogWriter {
         _source: Option<PbSource>,
         mut table: PbTable,
         _graph: StreamFragmentGraph,
-        _mapping: ColIndexMapping,
         _job_type: TableJobType,
     ) -> Result<()> {
         table.stream_job_status = PbStreamJobStatus::Created as _;
+        assert_eq!(table.vnode_count(), VirtualNode::COUNT_FOR_TEST);
         self.catalog.write().update_table(&table);
         Ok(())
     }
 
-    async fn create_source(&self, source: PbSource) -> Result<()> {
-        self.create_source_inner(source).map(|_| ())
+    async fn replace_source(&self, source: PbSource, _graph: StreamFragmentGraph) -> Result<()> {
+        self.catalog.write().update_source(&source);
+        Ok(())
     }
 
-    async fn create_source_with_graph(
+    async fn create_source(
         &self,
         source: PbSource,
-        _graph: StreamFragmentGraph,
+        _graph: Option<StreamFragmentGraph>,
+        _if_not_exists: bool,
     ) -> Result<()> {
         self.create_source_inner(source).map(|_| ())
     }
@@ -325,7 +376,9 @@ impl CatalogWriter for MockCatalogWriter {
         &self,
         sink: PbSink,
         graph: StreamFragmentGraph,
-        _affected_table_change: Option<ReplaceTablePlan>,
+        _affected_table_change: Option<ReplaceJobPlan>,
+        _dependencies: HashSet<ObjectId>,
+        _if_not_exists: bool,
     ) -> Result<()> {
         self.create_sink_inner(sink, graph)
     }
@@ -339,9 +392,11 @@ impl CatalogWriter for MockCatalogWriter {
         mut index: PbIndex,
         mut index_table: PbTable,
         _graph: StreamFragmentGraph,
+        _if_not_exists: bool,
     ) -> Result<()> {
         index_table.id = self.gen_id();
         index_table.stream_job_status = PbStreamJobStatus::Created as _;
+        index_table.maybe_vnode_count = VnodeCount::for_test().to_protobuf();
         self.catalog.write().create_table(&index_table);
         self.add_table_or_index_id(
             index_table.id,
@@ -393,8 +448,8 @@ impl CatalogWriter for MockCatalogWriter {
     ) -> Result<()> {
         if cascade {
             return Err(ErrorCode::NotSupported(
-                "drop cascade in MockCatalogWriter is unsupported".to_string(),
-                "use drop instead".to_string(),
+                "drop cascade in MockCatalogWriter is unsupported".to_owned(),
+                "use drop instead".to_owned(),
             )
             .into());
         }
@@ -427,8 +482,8 @@ impl CatalogWriter for MockCatalogWriter {
     async fn drop_materialized_view(&self, table_id: TableId, cascade: bool) -> Result<()> {
         if cascade {
             return Err(ErrorCode::NotSupported(
-                "drop cascade in MockCatalogWriter is unsupported".to_string(),
-                "use drop instead".to_string(),
+                "drop cascade in MockCatalogWriter is unsupported".to_owned(),
+                "use drop instead".to_owned(),
             )
             .into());
         }
@@ -449,8 +504,8 @@ impl CatalogWriter for MockCatalogWriter {
     async fn drop_source(&self, source_id: u32, cascade: bool) -> Result<()> {
         if cascade {
             return Err(ErrorCode::NotSupported(
-                "drop cascade in MockCatalogWriter is unsupported".to_string(),
-                "use drop instead".to_string(),
+                "drop cascade in MockCatalogWriter is unsupported".to_owned(),
+                "use drop instead".to_owned(),
             )
             .into());
         }
@@ -465,12 +520,12 @@ impl CatalogWriter for MockCatalogWriter {
         &self,
         sink_id: u32,
         cascade: bool,
-        _target_table_change: Option<ReplaceTablePlan>,
+        _target_table_change: Option<ReplaceJobPlan>,
     ) -> Result<()> {
         if cascade {
             return Err(ErrorCode::NotSupported(
-                "drop cascade in MockCatalogWriter is unsupported".to_string(),
-                "use drop instead".to_string(),
+                "drop cascade in MockCatalogWriter is unsupported".to_owned(),
+                "use drop instead".to_owned(),
             )
             .into());
         }
@@ -484,8 +539,8 @@ impl CatalogWriter for MockCatalogWriter {
     async fn drop_subscription(&self, subscription_id: u32, cascade: bool) -> Result<()> {
         if cascade {
             return Err(ErrorCode::NotSupported(
-                "drop cascade in MockCatalogWriter is unsupported".to_string(),
-                "use drop instead".to_string(),
+                "drop cascade in MockCatalogWriter is unsupported".to_owned(),
+                "use drop instead".to_owned(),
             )
             .into());
         }
@@ -499,8 +554,8 @@ impl CatalogWriter for MockCatalogWriter {
     async fn drop_index(&self, index_id: IndexId, cascade: bool) -> Result<()> {
         if cascade {
             return Err(ErrorCode::NotSupported(
-                "drop cascade in MockCatalogWriter is unsupported".to_string(),
-                "use drop instead".to_string(),
+                "drop cascade in MockCatalogWriter is unsupported".to_owned(),
+                "use drop instead".to_owned(),
             )
             .into());
         }
@@ -519,7 +574,7 @@ impl CatalogWriter for MockCatalogWriter {
             schema_catalog.get_index_by_id(&index_id).unwrap().clone()
         };
 
-        let index_table_id = index.index_table.id;
+        let index_table_id = index.index_table().id;
         let (database_id, schema_id) = self.drop_table_or_index_id(index_id.index_id);
         self.catalog
             .write()
@@ -534,7 +589,7 @@ impl CatalogWriter for MockCatalogWriter {
         unreachable!()
     }
 
-    async fn drop_connection(&self, _connection_id: ConnectionId) -> Result<()> {
+    async fn drop_connection(&self, _connection_id: u32, _cascade: bool) -> Result<()> {
         unreachable!()
     }
 
@@ -547,25 +602,31 @@ impl CatalogWriter for MockCatalogWriter {
         Ok(())
     }
 
-    async fn drop_schema(&self, schema_id: u32) -> Result<()> {
+    async fn drop_schema(&self, schema_id: u32, _cascade: bool) -> Result<()> {
         let database_id = self.drop_schema_id(schema_id);
         self.catalog.write().drop_schema(database_id, schema_id);
         Ok(())
     }
 
-    async fn alter_table_name(&self, table_id: u32, table_name: &str) -> Result<()> {
-        self.catalog
-            .write()
-            .alter_table_name_by_id(&table_id.into(), table_name);
-        Ok(())
+    async fn alter_name(
+        &self,
+        object_id: alter_name_request::Object,
+        object_name: &str,
+    ) -> Result<()> {
+        match object_id {
+            alter_name_request::Object::TableId(table_id) => {
+                self.catalog
+                    .write()
+                    .alter_table_name_by_id(&table_id.into(), object_name);
+                Ok(())
+            }
+            _ => {
+                unimplemented!()
+            }
+        }
     }
 
-    async fn alter_source_column(&self, source: PbSource) -> Result<()> {
-        self.catalog.write().update_source(&source);
-        Ok(())
-    }
-
-    async fn alter_source_with_sr(&self, source: PbSource) -> Result<()> {
+    async fn alter_source(&self, source: PbSource) -> Result<()> {
         self.catalog.write().update_source(&source);
         Ok(())
     }
@@ -578,7 +639,7 @@ impl CatalogWriter for MockCatalogWriter {
                         if let Some(table) =
                             schema.get_created_table_by_id(&TableId::from(table_id))
                         {
-                            let mut pb_table = table.to_prost(schema.id(), database.id());
+                            let mut pb_table = table.to_prost();
                             pb_table.owner = owner_id;
                             self.catalog.write().update_table(&pb_table);
                             return Ok(());
@@ -599,13 +660,12 @@ impl CatalogWriter for MockCatalogWriter {
     ) -> Result<()> {
         match object {
             alter_set_schema_request::Object::TableId(table_id) => {
-                let &schema_id = self.table_id_to_schema_id.read().get(&table_id).unwrap();
-                let database_id = self.get_database_id_by_schema(schema_id);
-                let pb_table = {
+                let mut pb_table = {
                     let reader = self.catalog.read();
                     let table = reader.get_any_table_by_id(&table_id.into())?.to_owned();
-                    table.to_prost(new_schema_id, database_id)
+                    table.to_prost()
                 };
+                pb_table.schema_id = new_schema_id;
                 self.catalog.write().update_table(&pb_table);
                 self.table_id_to_schema_id
                     .write()
@@ -616,38 +676,6 @@ impl CatalogWriter for MockCatalogWriter {
         }
     }
 
-    async fn alter_view_name(&self, _view_id: u32, _view_name: &str) -> Result<()> {
-        unreachable!()
-    }
-
-    async fn alter_index_name(&self, _index_id: u32, _index_name: &str) -> Result<()> {
-        unreachable!()
-    }
-
-    async fn alter_sink_name(&self, _sink_id: u32, _sink_name: &str) -> Result<()> {
-        unreachable!()
-    }
-
-    async fn alter_subscription_name(
-        &self,
-        _subscription_id: u32,
-        _subscription_name: &str,
-    ) -> Result<()> {
-        unreachable!()
-    }
-
-    async fn alter_source_name(&self, _source_id: u32, _source_name: &str) -> Result<()> {
-        unreachable!()
-    }
-
-    async fn alter_schema_name(&self, _schema_id: u32, _schema_name: &str) -> Result<()> {
-        unreachable!()
-    }
-
-    async fn alter_database_name(&self, _database_id: u32, _database_name: &str) -> Result<()> {
-        unreachable!()
-    }
-
     async fn alter_parallelism(
         &self,
         _table_id: u32,
@@ -656,30 +684,83 @@ impl CatalogWriter for MockCatalogWriter {
     ) -> Result<()> {
         todo!()
     }
+
+    async fn alter_swap_rename(&self, _object: alter_swap_rename_request::Object) -> Result<()> {
+        todo!()
+    }
+
+    async fn alter_secret(
+        &self,
+        _secret_id: u32,
+        _secret_name: String,
+        _database_id: u32,
+        _schema_id: u32,
+        _owner_id: u32,
+        _payload: Vec<u8>,
+    ) -> Result<()> {
+        unreachable!()
+    }
+
+    async fn alter_resource_group(
+        &self,
+        _table_id: u32,
+        _resource_group: Option<String>,
+        _deferred: bool,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    async fn alter_database_param(
+        &self,
+        database_id: u32,
+        param: AlterDatabaseParam,
+    ) -> Result<()> {
+        let mut pb_database = {
+            let reader = self.catalog.read();
+            let database = reader.get_database_by_id(&database_id)?.to_owned();
+            database.to_prost()
+        };
+        match param {
+            AlterDatabaseParam::BarrierIntervalMs(interval) => {
+                pb_database.barrier_interval_ms = interval;
+            }
+            AlterDatabaseParam::CheckpointFrequency(frequency) => {
+                pb_database.checkpoint_frequency = frequency;
+            }
+        }
+        self.catalog.write().update_database(&pb_database);
+        Ok(())
+    }
 }
 
 impl MockCatalogWriter {
-    pub fn new(catalog: Arc<RwLock<Catalog>>) -> Self {
+    pub fn new(
+        catalog: Arc<RwLock<Catalog>>,
+        hummock_snapshot_manager: HummockSnapshotManagerRef,
+    ) -> Self {
         catalog.write().create_database(&PbDatabase {
             id: 0,
-            name: DEFAULT_DATABASE_NAME.to_string(),
+            name: DEFAULT_DATABASE_NAME.to_owned(),
             owner: DEFAULT_SUPER_USER_ID,
+            resource_group: DEFAULT_RESOURCE_GROUP.to_owned(),
+            barrier_interval_ms: None,
+            checkpoint_frequency: None,
         });
         catalog.write().create_schema(&PbSchema {
             id: 1,
-            name: DEFAULT_SCHEMA_NAME.to_string(),
+            name: DEFAULT_SCHEMA_NAME.to_owned(),
             database_id: 0,
             owner: DEFAULT_SUPER_USER_ID,
         });
         catalog.write().create_schema(&PbSchema {
             id: 2,
-            name: PG_CATALOG_SCHEMA_NAME.to_string(),
+            name: PG_CATALOG_SCHEMA_NAME.to_owned(),
             database_id: 0,
             owner: DEFAULT_SUPER_USER_ID,
         });
         catalog.write().create_schema(&PbSchema {
             id: 3,
-            name: RW_CATALOG_SCHEMA_NAME.to_string(),
+            name: RW_CATALOG_SCHEMA_NAME.to_owned(),
             database_id: 0,
             owner: DEFAULT_SUPER_USER_ID,
         });
@@ -692,6 +773,7 @@ impl MockCatalogWriter {
             id: AtomicU32::new(3),
             table_id_to_schema_id: Default::default(),
             schema_id_to_database_id: RwLock::new(map),
+            hummock_snapshot_manager,
         }
     }
 
@@ -787,6 +869,7 @@ impl MockCatalogWriter {
 
     fn create_sink_inner(&self, mut sink: PbSink, _graph: StreamFragmentGraph) -> Result<()> {
         sink.id = self.gen_id();
+        sink.stream_job_status = PbStreamJobStatus::Created as _;
         self.catalog.write().create_sink(&sink);
         self.add_table_or_sink_id(sink.id, sink.schema_id, sink.database_id);
         Ok(())
@@ -899,13 +982,24 @@ impl UserInfoWriter for MockUserInfoWriter {
         }
         Ok(())
     }
+
+    async fn alter_default_privilege(
+        &self,
+        _users: Vec<UserId>,
+        _database_id: DatabaseId,
+        _schemas: Vec<SchemaId>,
+        _operation: AlterDefaultPrivilegeOperation,
+        _operated_by: UserId,
+    ) -> Result<()> {
+        todo!()
+    }
 }
 
 impl MockUserInfoWriter {
     pub fn new(user_info: Arc<RwLock<UserInfoManager>>) -> Self {
         user_info.write().create_user(UserInfo {
             id: DEFAULT_SUPER_USER_ID,
-            name: DEFAULT_SUPER_USER.to_string(),
+            name: DEFAULT_SUPER_USER.to_owned(),
             is_super: true,
             can_create_db: true,
             can_create_user: true,
@@ -929,25 +1023,8 @@ pub struct MockFrontendMetaClient {}
 impl FrontendMetaClient for MockFrontendMetaClient {
     async fn try_unregister(&self) {}
 
-    async fn pin_snapshot(&self) -> RpcResult<HummockSnapshot> {
-        Ok(HummockSnapshot {
-            committed_epoch: 0,
-            current_epoch: 0,
-        })
-    }
-
-    async fn get_snapshot(&self) -> RpcResult<HummockSnapshot> {
-        Ok(HummockSnapshot {
-            committed_epoch: 0,
-            current_epoch: 0,
-        })
-    }
-
-    async fn flush(&self, _checkpoint: bool) -> RpcResult<HummockSnapshot> {
-        Ok(HummockSnapshot {
-            committed_epoch: 0,
-            current_epoch: 0,
-        })
+    async fn flush(&self, _database_id: DatabaseId) -> RpcResult<HummockVersionId> {
+        Ok(INVALID_VERSION_ID)
     }
 
     async fn wait(&self) -> RpcResult<()> {
@@ -965,7 +1042,7 @@ impl FrontendMetaClient for MockFrontendMetaClient {
         Ok(HashMap::default())
     }
 
-    async fn list_table_fragment_states(&self) -> RpcResult<Vec<TableFragmentState>> {
+    async fn list_streaming_job_states(&self) -> RpcResult<Vec<StreamingJobState>> {
         Ok(vec![])
     }
 
@@ -973,7 +1050,15 @@ impl FrontendMetaClient for MockFrontendMetaClient {
         Ok(vec![])
     }
 
+    async fn list_creating_fragment_distribution(&self) -> RpcResult<Vec<FragmentDistribution>> {
+        Ok(vec![])
+    }
+
     async fn list_actor_states(&self) -> RpcResult<Vec<ActorState>> {
+        Ok(vec![])
+    }
+
+    async fn list_actor_splits(&self) -> RpcResult<Vec<ActorSplit>> {
         Ok(vec![])
     }
 
@@ -981,20 +1066,8 @@ impl FrontendMetaClient for MockFrontendMetaClient {
         Ok(vec![])
     }
 
-    async fn unpin_snapshot(&self) -> RpcResult<()> {
-        Ok(())
-    }
-
-    async fn unpin_snapshot_before(&self, _epoch: u64) -> RpcResult<()> {
-        Ok(())
-    }
-
     async fn list_meta_snapshots(&self) -> RpcResult<Vec<MetaSnapshotMetadata>> {
         Ok(vec![])
-    }
-
-    async fn get_system_params(&self) -> RpcResult<SystemParamsReader> {
-        Ok(SystemParams::default().into())
     }
 
     async fn set_system_param(
@@ -1010,22 +1083,22 @@ impl FrontendMetaClient for MockFrontendMetaClient {
     }
 
     async fn set_session_param(&self, _param: String, _value: Option<String>) -> RpcResult<String> {
-        Ok("".to_string())
+        Ok("".to_owned())
     }
 
-    async fn list_ddl_progress(&self) -> RpcResult<Vec<DdlProgress>> {
+    async fn get_ddl_progress(&self) -> RpcResult<Vec<DdlProgress>> {
         Ok(vec![])
     }
 
-    async fn get_tables(&self, _table_ids: &[u32]) -> RpcResult<HashMap<u32, Table>> {
+    async fn get_tables(
+        &self,
+        _table_ids: &[u32],
+        _include_dropped_tables: bool,
+    ) -> RpcResult<HashMap<u32, Table>> {
         Ok(HashMap::new())
     }
 
     async fn list_hummock_pinned_versions(&self) -> RpcResult<Vec<(u32, u64)>> {
-        unimplemented!()
-    }
-
-    async fn list_hummock_pinned_snapshots(&self) -> RpcResult<Vec<(u32, u64)>> {
         unimplemented!()
     }
 
@@ -1066,7 +1139,7 @@ impl FrontendMetaClient for MockFrontendMetaClient {
     }
 
     async fn list_all_nodes(&self) -> RpcResult<Vec<WorkerNode>> {
-        unimplemented!()
+        Ok(vec![])
     }
 
     async fn list_compact_task_progress(&self) -> RpcResult<Vec<CompactTaskProgress>> {
@@ -1090,13 +1163,63 @@ impl FrontendMetaClient for MockFrontendMetaClient {
         Ok(RecoveryStatus::StatusRunning)
     }
 
-    async fn list_change_log_epochs(
-        &self,
-        _table_id: u32,
-        _min_epoch: u64,
-        _max_count: u32,
-    ) -> RpcResult<Vec<u64>> {
+    async fn get_cluster_limits(&self) -> RpcResult<Vec<ClusterLimit>> {
+        Ok(vec![])
+    }
+
+    async fn list_rate_limits(&self) -> RpcResult<Vec<RateLimitInfo>> {
+        Ok(vec![])
+    }
+
+    async fn get_meta_store_endpoint(&self) -> RpcResult<String> {
         unimplemented!()
+    }
+
+    async fn alter_sink_props(
+        &self,
+        _sink_id: u32,
+        _changed_props: BTreeMap<String, String>,
+        _changed_secret_refs: BTreeMap<String, PbSecretRef>,
+        _connector_conn_ref: Option<u32>,
+    ) -> RpcResult<()> {
+        unimplemented!()
+    }
+
+    async fn alter_source_connector_props(
+        &self,
+        _source_id: u32,
+        _changed_props: BTreeMap<String, String>,
+        _changed_secret_refs: BTreeMap<String, PbSecretRef>,
+        _connector_conn_ref: Option<u32>,
+    ) -> RpcResult<()> {
+        unimplemented!()
+    }
+
+    async fn list_hosted_iceberg_tables(&self) -> RpcResult<Vec<IcebergTable>> {
+        unimplemented!()
+    }
+
+    async fn get_fragment_by_id(
+        &self,
+        _fragment_id: u32,
+    ) -> RpcResult<Option<FragmentDistribution>> {
+        unimplemented!()
+    }
+
+    fn worker_id(&self) -> u32 {
+        0
+    }
+
+    async fn set_sync_log_store_aligned(&self, _job_id: u32, _aligned: bool) -> RpcResult<()> {
+        Ok(())
+    }
+
+    async fn compact_iceberg_table(&self, _sink_id: SinkId) -> RpcResult<u64> {
+        Ok(1)
+    }
+
+    async fn refresh(&self, _request: RefreshRequest) -> RpcResult<RefreshResponse> {
+        Ok(RefreshResponse { status: None })
     }
 }
 

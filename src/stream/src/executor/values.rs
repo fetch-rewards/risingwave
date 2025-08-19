@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ use risingwave_expr::expr::NonStrictExpression;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::executor::prelude::*;
-use crate::task::CreateMviewProgress;
+use crate::task::CreateMviewProgressReporter;
 
 const DEFAULT_CHUNK_SIZE: usize = 1024;
 
@@ -33,7 +33,7 @@ pub struct ValuesExecutor {
     schema: Schema,
     // Receiver of barrier channel.
     barrier_receiver: UnboundedReceiver<Barrier>,
-    progress: CreateMviewProgress,
+    progress: CreateMviewProgressReporter,
 
     rows: vec::IntoIter<Vec<NonStrictExpression>>,
 }
@@ -43,7 +43,7 @@ impl ValuesExecutor {
     pub fn new(
         ctx: ActorContextRef,
         schema: Schema,
-        progress: CreateMviewProgress,
+        progress: CreateMviewProgressReporter,
         rows: Vec<Vec<NonStrictExpression>>,
         barrier_receiver: UnboundedReceiver<Barrier>,
     ) -> Self {
@@ -150,12 +150,14 @@ mod tests {
     use super::ValuesExecutor;
     use crate::executor::test_utils::StreamExecutorTestExt;
     use crate::executor::{ActorContext, AddMutation, Barrier, Execute, Mutation};
-    use crate::task::{CreateMviewProgress, LocalBarrierManager};
+    use crate::task::CreateMviewProgressReporter;
+    use crate::task::barrier_test_utils::LocalBarrierTestEnv;
 
     #[tokio::test]
     async fn test_values() {
-        let barrier_manager = LocalBarrierManager::for_test();
-        let progress = CreateMviewProgress::for_test(barrier_manager);
+        let test_env = LocalBarrierTestEnv::for_test().await;
+        let barrier_manager = test_env.local_barrier_manager.clone();
+        let progress = CreateMviewProgressReporter::for_test(barrier_manager);
         let actor_id = progress.actor_id();
         let (tx, barrier_receiver) = unbounded_channel();
         let value = StructValue::new(vec![Some(1.into()), Some(2.into()), Some(3.into())]);
@@ -173,10 +175,7 @@ mod tests {
                 Some(ScalarImpl::Int64(3)),
             )),
             Box::new(LiteralExpression::new(
-                DataType::new_struct(
-                    vec![DataType::Int32, DataType::Int32, DataType::Int32],
-                    vec![],
-                ),
+                StructType::unnamed(vec![DataType::Int32, DataType::Int32, DataType::Int32]).into(),
                 Some(ScalarImpl::Struct(value)),
             )),
             Box::new(LiteralExpression::new(
@@ -192,10 +191,12 @@ mod tests {
             ActorContext::for_test(actor_id),
             schema,
             progress,
-            vec![exprs
-                .into_iter()
-                .map(NonStrictExpression::for_test)
-                .collect()],
+            vec![
+                exprs
+                    .into_iter()
+                    .map(NonStrictExpression::for_test)
+                    .collect(),
+            ],
             barrier_receiver,
         );
         let mut values_executor = Box::new(values_executor_struct).execute();
@@ -207,6 +208,9 @@ mod tests {
                 added_actors: maplit::hashset! {actor_id},
                 splits: Default::default(),
                 pause: false,
+                subscriptions_to_add: vec![],
+                backfill_nodes_to_pause: Default::default(),
+                actor_cdc_table_snapshot_splits: Default::default(),
             }));
         tx.send(first_message).unwrap();
 

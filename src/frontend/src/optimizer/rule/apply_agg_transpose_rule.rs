@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,14 +13,14 @@
 // limitations under the License.
 
 use risingwave_common::types::DataType;
-use risingwave_expr::aggregate::{AggKind, PbAggKind};
+use risingwave_expr::aggregate::{AggType, PbAggKind};
 use risingwave_pb::plan_common::JoinType;
 
-use super::{ApplyOffsetRewriter, BoxedRule, Rule};
+use super::ApplyOffsetRewriter;
+use super::prelude::*;
 use crate::expr::{ExprImpl, ExprType, FunctionCall, InputRef};
 use crate::optimizer::plan_node::generic::Agg;
 use crate::optimizer::plan_node::{LogicalAgg, LogicalApply, LogicalFilter, LogicalProject};
-use crate::optimizer::PlanRef;
 use crate::utils::{Condition, IndexSet};
 
 /// Transpose `LogicalApply` and `LogicalAgg`.
@@ -45,7 +45,7 @@ use crate::utils::{Condition, IndexSet};
 ///  Domain        Input
 /// ```
 pub struct ApplyAggTransposeRule {}
-impl Rule for ApplyAggTransposeRule {
+impl Rule<Logical> for ApplyAggTransposeRule {
     fn apply(&self, plan: PlanRef) -> Option<PlanRef> {
         let apply: &LogicalApply = plan.as_logical_apply()?;
         let (left, right, on, join_type, correlated_id, correlated_indices, max_one_row) =
@@ -140,21 +140,21 @@ impl Rule for ApplyAggTransposeRule {
                 // convert count(*) to count(1).
                 let pos_of_constant_column = node.schema().len() - 1;
                 agg_calls.iter_mut().for_each(|agg_call| {
-                    match agg_call.agg_kind {
-                        AggKind::Builtin(PbAggKind::Count) if agg_call.inputs.is_empty() => {
+                    match agg_call.agg_type {
+                        AggType::Builtin(PbAggKind::Count) if agg_call.inputs.is_empty() => {
                             let input_ref = InputRef::new(pos_of_constant_column, DataType::Int32);
                             agg_call.inputs.push(input_ref);
                         }
-                        AggKind::Builtin(PbAggKind::ArrayAgg
+                        AggType::Builtin(PbAggKind::ArrayAgg
                         | PbAggKind::JsonbAgg
                         | PbAggKind::JsonbObjectAgg)
-                        | AggKind::UserDefined(_)
-                        | AggKind::WrapScalar(_) => {
+                        | AggType::UserDefined(_)
+                        | AggType::WrapScalar(_) => {
                             let input_ref = InputRef::new(pos_of_constant_column, DataType::Int32);
                             let cond = FunctionCall::new(ExprType::IsNotNull, vec![input_ref.into()]).unwrap();
                             agg_call.filter.conjunctions.push(cond.into());
                         }
-                        AggKind::Builtin(PbAggKind::Count
+                        AggType::Builtin(PbAggKind::Count
                         | PbAggKind::Sum
                         | PbAggKind::Sum0
                         | PbAggKind::Avg
@@ -186,8 +186,8 @@ impl Rule for ApplyAggTransposeRule {
                         => {
                             // no-op when `agg(0 rows) == agg(1 row of nulls)`
                         }
-                        AggKind::Builtin(PbAggKind::Unspecified | PbAggKind::UserDefined | PbAggKind::WrapScalar) => {
-                            panic!("Unexpected aggregate function: {:?}", agg_call.agg_kind)
+                        AggType::Builtin(PbAggKind::Unspecified | PbAggKind::UserDefined | PbAggKind::WrapScalar) => {
+                            panic!("Unexpected aggregate function: {:?}", agg_call.agg_type)
                         }
                     }
                 });

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,13 +14,14 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
+use foyer::{Engine, LargeEngineOptions};
 use moka::future::Cache;
 use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
@@ -129,7 +130,6 @@ impl FoyerCache {
             .with_eviction_config(foyer::LruConfig {
                 high_priority_pool_ratio: 0.8,
             })
-            .with_object_pool_capacity(8 * 1024)
             .build();
         Self {
             inner,
@@ -146,7 +146,6 @@ impl FoyerCache {
                 cmsketch_eps: 0.001,
                 cmsketch_confidence: 0.9,
             })
-            .with_object_pool_capacity(8 * 1024)
             .build();
         Self {
             inner,
@@ -186,8 +185,7 @@ impl FoyerHybridCache {
             .with_eviction_config(foyer::LruConfig {
                 high_priority_pool_ratio: 0.8,
             })
-            .with_object_pool_capacity(8 * 1024)
-            .storage()
+            .storage(Engine::Large(LargeEngineOptions::new()))
             .build()
             .await
             .unwrap();
@@ -207,8 +205,7 @@ impl FoyerHybridCache {
                 cmsketch_eps: 0.001,
                 cmsketch_confidence: 0.9,
             })
-            .with_object_pool_capacity(8 * 1024)
-            .storage()
+            .storage(Engine::Large(LargeEngineOptions::new()))
             .build()
             .await
             .unwrap();

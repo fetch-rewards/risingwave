@@ -12,11 +12,15 @@ CREATE TABLE live_stream_metrics (
   report_timestamp TIMESTAMPTZ,
   country VARCHAR
 )
+INCLUDE partition
+INCLUDE offset
+INCLUDE payload
 WITH
   (
     connector = 'nats',
     server_url = 'nats-server:4222',
     subject = 'live_stream_metrics',
+    allow_create_stream = 'true',
     stream = 'risingwave',
     connect_mode = 'plain'
   ) FORMAT PLAIN ENCODE JSON;

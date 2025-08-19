@@ -7,39 +7,30 @@ keywords = { workspace = true }
 license = { workspace = true }
 repository = { workspace = true }
 
-[package.metadata.cargo-machete]
-ignored = ["workspace-hack"]
-
-[package.metadata.cargo-udeps.ignore]
-normal = ["workspace-hack"]
-
 [dependencies]
 ahash = "0.8"
 anyhow = "1"
-arc-swap = "1"
-arrow-array = { workspace = true }
-arrow-array-deltalake = { workspace = true }
-arrow-array-iceberg = { workspace = true }
-arrow-buffer = { workspace = true }
-arrow-buffer-deltalake = { workspace = true }
-arrow-buffer-iceberg = { workspace = true }
-arrow-cast = { workspace = true }
-arrow-cast-deltalake = { workspace = true }
-arrow-cast-iceberg = { workspace = true }
-arrow-schema = { workspace = true }
-arrow-schema-deltalake = { workspace = true }
-arrow-schema-iceberg = { workspace = true }
+arc-swap = { workspace = true }
+arrow-54-array = { package = "arrow-array", version = "54" }
+arrow-54-buffer = { package = "arrow-buffer", version = "54" }
+arrow-54-cast = { package = "arrow-cast", version = "54" }
+arrow-54-schema = { package = "arrow-schema", version = "54" }
+arrow-55-array = { package = "arrow-array", version = "55" }
+arrow-55-buffer = { package = "arrow-buffer", version = "55" }
+arrow-55-cast = { package = "arrow-cast", version = "55" }
+arrow-55-schema = { package = "arrow-schema", version = "55" }
 async-trait = "0.1"
 auto_enums = { workspace = true }
 auto_impl = "1"
+bitfield-struct = "0.11"
 bitflags = "2"
 byteorder = "1"
 bytes = "1"
-chrono = { version = "0.4", default-features = false, features = [
+chrono = { workspace = true, features = [
     "clock",
     "std",
 ] }
-chrono-tz = { version = "0.9", features = ["case-insensitive"] }
+chrono-tz = { version = "0.10", features = ["case-insensitive"] }
 clap = { workspace = true }
 comfy-table = "7"
 crc32fast = "1"
@@ -52,14 +43,15 @@ ethnum = { version = "1", features = ["serde"] }
 fixedbitset = "0.5"
 foyer = { workspace = true }
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
-governor = { version = "0.6", default-features = false, features = ["std"] }
-hashbrown = "0.14"
+governor = { workspace = true }
+hashbrown = "0.15.2"
 hex = "0.4.3"
-http = "0.2"
-humantime = "2.1"
-hytra = { workspace = true }
+http = "1"
+humantime = "2.2"
 itertools = { workspace = true }
 itoa = "1.0"
+jiff = "0.1.15"
+jni = { workspace = true }
 jsonbb = { workspace = true }
 lru = { workspace = true }
 memcomparable = { version = "0.2", features = ["decimal"] }
@@ -69,18 +61,18 @@ number_prefix = "0.4.0"
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 parking_lot = { workspace = true }
-parse-display = "0.9"
+parse-display = "0.10"
 paste = "1"
-pin-project-lite = "0.2"
+pin-project-lite = { workspace = true }
 postgres-types = { version = "0.2.6", features = [
     "derive",
     "with-chrono-0_4",
     "with-serde_json-1",
 ] }
-prometheus = { version = "0.13" }
+prometheus = { version = "0.14" }
 prost = { workspace = true }
 rand = { workspace = true }
-regex = "1"
+regex = { workspace = true }
 reqwest = { version = "0.12.2", features = ["json"] }
 risingwave-fields-derive = { path = "./fields-derive" }
 risingwave_common_estimate_size = { workspace = true }
@@ -90,23 +82,25 @@ risingwave_common_secret = { path = "./secret" }
 risingwave_error = { workspace = true }
 risingwave_license = { workspace = true }
 risingwave_pb = { workspace = true }
+risingwave_telemetry_event = { workspace = true }
 rust_decimal = { version = "1", features = ["db-postgres", "maths"] }
 rw_iter_util = { workspace = true }
 rw_resource_util = { workspace = true }
 ryu = "1.0"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
-serde_default = "0.1"
+serde_default = "0.2"
 serde_json = "1"
 serde_with = "3"
 smallbitset = "0.7.1"
-speedate = "0.14.0"
+smallvec = { workspace = true }
+speedate = "0.15.0"
 stacker = "0.1"
 static_assertions = "1"
-strum = "0.26"
-strum_macros = "0.26"
-sysinfo = { version = "0.30", default-features = false }
-thiserror = "1"
+strum = "0.27"
+strum_macros = "0.27"
+sysinfo = { version = "0.35", default-features = false, features = ["system"] }
+thiserror = { workspace = true }
 thiserror-ext = { workspace = true }
 tinyvec = { version = "1", features = ["rustc_1_55", "grab_spare_slice"] }
 tokio = { version = "0.2", package = "madsim-tokio", features = [
@@ -124,19 +118,19 @@ tracing = "0.1"
 tracing-futures = { version = "0.2", features = ["futures-03"] }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = "0.3.17"
-twox-hash = "1"
+twox-hash = "2"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(not(madsim))'.dependencies]
-workspace-hack = { path = "../workspace-hack" }
 http-body = "0.4.5"
-tower-layer = "0.3.2"
-tower-service = "0.3.2"
+tower-layer = "0.3.3"
+tower-service = "0.3.3"
+workspace-hack = { path = "../workspace-hack" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-procfs = { version = "0.16", default-features = false }
 libc = "0.2"
+procfs = { version = "0.17", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 darwin-libproc = { git = "https://github.com/risingwavelabs/darwin-libproc.git", rev = "a502be24bd0971463f5bcbfe035a248d8ba503b7" }

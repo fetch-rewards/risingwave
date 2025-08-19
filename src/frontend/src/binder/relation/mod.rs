@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,10 @@
 use std::collections::hash_map::Entry;
 use std::ops::Deref;
 
+use either::Either;
 use itertools::{EitherOrBoth, Itertools};
 use risingwave_common::bail;
-use risingwave_common::catalog::{Field, TableId, DEFAULT_SCHEMA_NAME};
+use risingwave_common::catalog::{Field, TableId};
 use risingwave_sqlparser::ast::{
     AsOf, Expr as ParserExpr, FunctionArg, FunctionArgExpr, Ident, ObjectName, TableAlias,
     TableFactor,
@@ -27,8 +28,8 @@ use thiserror_ext::AsReport;
 
 use super::bind_context::ColumnBinding;
 use super::statement::RewriteExprsRecursive;
-use crate::binder::bind_context::{BindingCte, BindingCteState};
 use crate::binder::Binder;
+use crate::binder::bind_context::{BindingCte, BindingCteState};
 use crate::error::{ErrorCode, Result, RwError};
 use crate::expr::{ExprImpl, InputRef};
 
@@ -92,13 +93,28 @@ impl RewriteExprsRecursive for Relation {
 }
 
 impl Relation {
-    pub fn is_correlated(&self, depth: Depth) -> bool {
+    pub fn is_correlated_by_depth(&self, depth: Depth) -> bool {
         match self {
-            Relation::Subquery(subquery) => subquery.query.is_correlated(depth),
+            Relation::Subquery(subquery) => subquery.query.is_correlated_by_depth(depth),
             Relation::Join(join) | Relation::Apply(join) => {
                 join.cond.has_correlated_input_ref_by_depth(depth)
-                    || join.left.is_correlated(depth)
-                    || join.right.is_correlated(depth)
+                    || join.left.is_correlated_by_depth(depth)
+                    || join.right.is_correlated_by_depth(depth)
+            }
+            _ => false,
+        }
+    }
+
+    pub fn is_correlated_by_correlated_id(&self, correlated_id: CorrelatedId) -> bool {
+        match self {
+            Relation::Subquery(subquery) => {
+                subquery.query.is_correlated_by_correlated_id(correlated_id)
+            }
+            Relation::Join(join) | Relation::Apply(join) => {
+                join.cond
+                    .has_correlated_input_ref_by_correlated_id(correlated_id)
+                    || join.left.is_correlated_by_correlated_id(correlated_id)
+                    || join.right.is_correlated_by_correlated_id(correlated_id)
             }
             _ => false,
         }
@@ -134,6 +150,15 @@ impl Relation {
                 with_ordinality: _,
             } => table_function
                 .collect_correlated_indices_by_depth_and_assign_id(depth + 1, correlated_id),
+            Relation::Share(share) => match &mut share.input {
+                BoundShareInput::Query(query) => match query {
+                    Either::Left(query) => query
+                        .collect_correlated_indices_by_depth_and_assign_id(depth, correlated_id),
+                    Either::Right(_) => vec![],
+                },
+                BoundShareInput::ChangeLog(change_log) => change_log
+                    .collect_correlated_indices_by_depth_and_assign_id(depth, correlated_id),
+            },
             _ => vec![],
         }
     }
@@ -185,10 +210,10 @@ impl Binder {
     /// return (`schema_name`, `name`)
     pub fn resolve_schema_qualified_name(
         db_name: &str,
-        name: ObjectName,
+        name: &ObjectName,
     ) -> std::result::Result<(Option<String>, String), ResolveQualifiedNameError> {
         let formatted_name = name.to_string();
-        let mut identifiers = name.0;
+        let mut identifiers = name.0.clone();
 
         if identifiers.len() > 3 {
             return Err(ResolveQualifiedNameError::new(
@@ -212,6 +237,52 @@ impl Binder {
         }
 
         Ok((schema_name, name))
+    }
+
+    /// check whether the name is a cross-database reference
+    pub fn validate_cross_db_reference(
+        db_name: &str,
+        name: &ObjectName,
+    ) -> std::result::Result<(), ResolveQualifiedNameError> {
+        let formatted_name = name.to_string();
+        let identifiers = &name.0;
+        if identifiers.len() > 3 {
+            return Err(ResolveQualifiedNameError::new(
+                formatted_name,
+                ResolveQualifiedNameErrorKind::QualifiedNameTooLong,
+            ));
+        }
+
+        if identifiers.len() == 3 && identifiers[0].real_value() != db_name {
+            return Err(ResolveQualifiedNameError::new(
+                formatted_name,
+                ResolveQualifiedNameErrorKind::NotCurrentDatabase,
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// return (`database_name`, `schema_name`, `name`)
+    pub fn resolve_db_schema_qualified_name(
+        name: &ObjectName,
+    ) -> std::result::Result<(Option<String>, Option<String>, String), ResolveQualifiedNameError>
+    {
+        let formatted_name = name.to_string();
+        let mut identifiers = name.0.clone();
+
+        if identifiers.len() > 3 {
+            return Err(ResolveQualifiedNameError::new(
+                formatted_name,
+                ResolveQualifiedNameErrorKind::QualifiedNameTooLong,
+            ));
+        }
+
+        let name = identifiers.pop().unwrap().real_value();
+        let schema_name = identifiers.pop().map(|ident| ident.real_value());
+        let database_name = identifiers.pop().map(|ident| ident.real_value());
+
+        Ok((database_name, schema_name, name))
     }
 
     /// return first name in identifiers, must have only one name.
@@ -274,11 +345,12 @@ impl Binder {
         &mut self,
         columns: impl IntoIterator<Item = (bool, Field)>, // bool indicates if the field is hidden
         table_name: String,
-        alias: Option<TableAlias>,
+        alias: Option<&TableAlias>,
     ) -> Result<()> {
+        const EMPTY: [Ident; 0] = [];
         let (table_name, column_aliases) = match alias {
-            None => (table_name, vec![]),
-            Some(TableAlias { name, columns }) => (name.real_value(), columns),
+            None => (table_name, &EMPTY[..]),
+            Some(TableAlias { name, columns }) => (name.real_value(), columns.as_slice()),
         };
 
         let num_col_aliases = column_aliases.len();
@@ -286,15 +358,15 @@ impl Binder {
         let begin = self.context.columns.len();
         // Column aliases can be less than columns, but not more.
         // It also needs to skip hidden columns.
-        let mut alias_iter = column_aliases.into_iter().fuse();
+        let mut alias_iter = column_aliases.iter().fuse();
         let mut index = 0;
         columns.into_iter().for_each(|(is_hidden, mut field)| {
             let name = match is_hidden {
-                true => field.name.to_string(),
+                true => field.name.clone(),
                 false => alias_iter
                     .next()
                     .map(|t| t.real_value())
-                    .unwrap_or_else(|| field.name.to_string()),
+                    .unwrap_or_else(|| field.name.clone()),
             };
             field.name.clone_from(&name);
             self.context.columns.push(ColumnBinding::new(
@@ -338,17 +410,33 @@ impl Binder {
     /// - a logical view
     pub fn bind_relation_by_name(
         &mut self,
-        name: ObjectName,
-        alias: Option<TableAlias>,
-        as_of: Option<AsOf>,
+        name: &ObjectName,
+        alias: Option<&TableAlias>,
+        as_of: Option<&AsOf>,
+        allow_cross_db: bool,
     ) -> Result<Relation> {
-        let (schema_name, table_name) = Self::resolve_schema_qualified_name(&self.db_name, name)?;
+        let (db_name, schema_name, table_name) = if allow_cross_db {
+            Self::resolve_db_schema_qualified_name(name)?
+        } else {
+            let (schema_name, table_name) =
+                Self::resolve_schema_qualified_name(&self.db_name, name)?;
+            (None, schema_name, table_name)
+        };
 
         if schema_name.is_none()
             // the `table_name` here is the name of the currently binding cte.
             && let Some(item) = self.context.cte_to_relation.get(&table_name)
         {
             // Handles CTE
+
+            if as_of.is_some() {
+                return Err(ErrorCode::BindError(
+                    "Right table of a temporal join should not be a CTE. \
+                 It should be a table, index, or materialized view"
+                        .to_owned(),
+                )
+                .into());
+            }
 
             let BindingCte {
                 share_id,
@@ -360,24 +448,24 @@ impl Binder {
             debug_assert_eq!(original_alias.name.real_value(), table_name);
 
             if let Some(from_alias) = alias {
-                original_alias.name = from_alias.name;
+                original_alias.name = from_alias.name.clone();
                 original_alias.columns = original_alias
                     .columns
                     .into_iter()
-                    .zip_longest(from_alias.columns)
+                    .zip_longest(from_alias.columns.iter().cloned())
                     .map(EitherOrBoth::into_right)
                     .collect();
             }
 
             match cte_state {
                 BindingCteState::Init => {
-                    Err(ErrorCode::BindError("Base term of recursive CTE not found, consider writing it to left side of the `UNION ALL` operator".to_string()).into())
+                    Err(ErrorCode::BindError("Base term of recursive CTE not found, consider writing it to left side of the `UNION ALL` operator".to_owned()).into())
                 }
                 BindingCteState::BaseResolved { base } => {
                     self.bind_table_to_context(
                         base.schema().fields.iter().map(|f| (false, f.clone())),
-                        table_name.clone(),
-                        Some(original_alias),
+                        table_name,
+                        Some(&original_alias),
                     )?;
                     Ok(Relation::BackCteRef(Box::new(BoundBackCteRef { share_id, base })))
                 }
@@ -385,8 +473,8 @@ impl Binder {
                     let input = BoundShareInput::Query(query);
                     self.bind_table_to_context(
                         input.fields()?,
-                        table_name.clone(),
-                        Some(original_alias),
+                        table_name,
+                        Some(&original_alias),
                     )?;
                     // we could always share the cte,
                     // no matter it's recursive or not.
@@ -396,34 +484,41 @@ impl Binder {
                     let input = BoundShareInput::ChangeLog(table);
                     self.bind_table_to_context(
                         input.fields()?,
-                        table_name.clone(),
-                        Some(original_alias),
+                        table_name,
+                        Some(&original_alias),
                     )?;
                     Ok(Relation::Share(Box::new(BoundShare { share_id, input })))
                 },
             }
         } else {
-            self.bind_relation_by_name_inner(schema_name.as_deref(), &table_name, alias, as_of)
+            self.bind_catalog_relation_by_name(
+                db_name.as_deref(),
+                schema_name.as_deref(),
+                &table_name,
+                alias,
+                as_of,
+                false,
+            )
         }
     }
 
     // Bind a relation provided a function arg.
     fn bind_relation_by_function_arg(
         &mut self,
-        arg: Option<FunctionArg>,
+        arg: Option<&FunctionArg>,
         err_msg: &str,
     ) -> Result<(Relation, ObjectName)> {
         let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))) = arg else {
-            return Err(ErrorCode::BindError(err_msg.to_string()).into());
+            return Err(ErrorCode::BindError(err_msg.to_owned()).into());
         };
         let table_name = match expr {
-            ParserExpr::Identifier(ident) => Ok::<_, RwError>(ObjectName(vec![ident])),
-            ParserExpr::CompoundIdentifier(idents) => Ok(ObjectName(idents)),
-            _ => Err(ErrorCode::BindError(err_msg.to_string()).into()),
+            ParserExpr::Identifier(ident) => Ok::<_, RwError>(ObjectName(vec![ident.clone()])),
+            ParserExpr::CompoundIdentifier(idents) => Ok(ObjectName(idents.clone())),
+            _ => Err(ErrorCode::BindError(err_msg.to_owned()).into()),
         }?;
 
         Ok((
-            self.bind_relation_by_name(table_name.clone(), None, None)?,
+            self.bind_relation_by_name(&table_name, None, None, true)?,
             table_name,
         ))
     }
@@ -431,7 +526,7 @@ impl Binder {
     // Bind column provided a function arg.
     fn bind_column_by_function_args(
         &mut self,
-        arg: Option<FunctionArg>,
+        arg: Option<&FunctionArg>,
         err_msg: &str,
     ) -> Result<Box<InputRef>> {
         if let Some(time_col_arg) = arg
@@ -440,21 +535,20 @@ impl Binder {
         {
             Ok(time_col)
         } else {
-            Err(ErrorCode::BindError(err_msg.to_string()).into())
+            Err(ErrorCode::BindError(err_msg.to_owned()).into())
         }
     }
 
     /// `rw_table(table_id[,schema_name])` which queries internal table
     fn bind_internal_table(
         &mut self,
-        args: Vec<FunctionArg>,
-        alias: Option<TableAlias>,
+        args: &[FunctionArg],
+        alias: Option<&TableAlias>,
     ) -> Result<Relation> {
         if args.is_empty() || args.len() > 2 {
-            return Err(ErrorCode::BindError(
-                "usage: rw_table(table_id[,schema_name])".to_string(),
-            )
-            .into());
+            return Err(
+                ErrorCode::BindError("usage: rw_table(table_id[,schema_name])".to_owned()).into(),
+            );
         }
 
         let table_id: TableId = args[0]
@@ -468,18 +562,16 @@ impl Binder {
             })?
             .into();
 
-        let schema = args
-            .get(1)
-            .map_or(DEFAULT_SCHEMA_NAME.to_string(), |arg| arg.to_string());
+        let schema = args.get(1).map(|arg| arg.to_string());
 
         let table_name = self.catalog.get_table_name_by_id(table_id)?;
-        self.bind_relation_by_name_inner(Some(&schema), &table_name, alias, None)
+        self.bind_catalog_relation_by_name(None, schema.as_deref(), &table_name, alias, None, false)
     }
 
-    pub(super) fn bind_table_factor(&mut self, table_factor: TableFactor) -> Result<Relation> {
+    pub(super) fn bind_table_factor(&mut self, table_factor: &TableFactor) -> Result<Relation> {
         match table_factor {
             TableFactor::Table { name, alias, as_of } => {
-                self.bind_relation_by_name(name, alias, as_of)
+                self.bind_relation_by_name(name, alias.as_ref(), as_of.as_ref(), true)
             }
             TableFactor::TableFunction {
                 name,
@@ -488,7 +580,7 @@ impl Binder {
                 with_ordinality,
             } => {
                 self.try_mark_lateral_as_visible();
-                let result = self.bind_table_function(name, alias, args, with_ordinality);
+                let result = self.bind_table_function(name, alias.as_ref(), args, *with_ordinality);
                 self.try_mark_lateral_as_invisible();
                 result
             }
@@ -497,12 +589,13 @@ impl Binder {
                 subquery,
                 alias,
             } => {
-                if lateral {
+                if *lateral {
                     // If we detect a lateral, we mark the lateral context as visible.
                     self.try_mark_lateral_as_visible();
 
                     // Bind lateral subquery here.
-                    let bound_subquery = self.bind_subquery_relation(*subquery, alias, true)?;
+                    let bound_subquery =
+                        self.bind_subquery_relation(subquery, alias.as_ref(), true)?;
 
                     // Mark the lateral context as invisible once again.
                     self.try_mark_lateral_as_invisible();
@@ -510,14 +603,15 @@ impl Binder {
                 } else {
                     // Non-lateral subqueries to not have access to the join-tree context.
                     self.push_lateral_context();
-                    let bound_subquery = self.bind_subquery_relation(*subquery, alias, false)?;
+                    let bound_subquery =
+                        self.bind_subquery_relation(subquery, alias.as_ref(), false)?;
                     self.pop_and_merge_lateral_context()?;
                     Ok(Relation::Subquery(Box::new(bound_subquery)))
                 }
             }
             TableFactor::NestedJoin(table_with_joins) => {
                 self.push_lateral_context();
-                let bound_join = self.bind_table_with_joins(*table_with_joins)?;
+                let bound_join = self.bind_table_with_joins(table_with_joins)?;
                 self.pop_and_merge_lateral_context()?;
                 Ok(bound_join)
             }

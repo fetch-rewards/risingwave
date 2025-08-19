@@ -2,7 +2,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -11,17 +11,18 @@
 // limitations under the License.
 
 //! This module defines
-//! 1) a list of constants for every keyword that
+//! 1. a list of constants for every keyword that
 //!    can appear in [crate::tokenizer::Word::keyword]:
-//!    pub const KEYWORD = "KEYWORD"
-//! 2) an `ALL_KEYWORDS` array with every keyword in it
-//!     This is not a list of *reserved* keywords: some of these can be
-//!     parsed as identifiers if the parser decides so. This means that
-//!     new keywords can be added here without affecting the parse result.
 //!
-//!     As a matter of fact, most of these keywords are not used at all
-//!     and could be removed.
-//! 3) a `RESERVED_FOR_TABLE_ALIAS` array with keywords reserved in a
+//!    pub const KEYWORD = "KEYWORD"
+//! 2. an `ALL_KEYWORDS` array with every keyword in it
+//!    This is not a list of *reserved* keywords: some of these can be
+//!    parsed as identifiers if the parser decides so. This means that
+//!    new keywords can be added here without affecting the parse result.
+//!
+//!    As a matter of fact, most of these keywords are not used at all
+//!    and could be removed.
+//! 3. a `RESERVED_FOR_TABLE_ALIAS` array with keywords reserved in a
 //!    "table alias" context.
 
 use core::fmt;
@@ -88,13 +89,14 @@ define_keywords!(
     AS,
     ASC,
     ASENSITIVE,
+    ASOF,
     ASYMMETRIC,
-    ASYNC,
     AT,
     ATOMIC,
     AUTHORIZATION,
     AUTO,
     AVG,
+    BACKFILL,
     BASE64,
     BEGIN,
     BEGIN_FRAME,
@@ -146,6 +148,7 @@ define_keywords!(
     CONNECT,
     CONNECTION,
     CONNECTIONS,
+    CONNECTOR,
     CONSTRAINT,
     CONTAINS,
     CONVERT,
@@ -174,6 +177,7 @@ define_keywords!(
     CURRENT_TRANSFORM_GROUP_FOR_TYPE,
     CURRENT_USER,
     CURSOR,
+    CURSORS,
     CYCLE,
     DATA,
     DATABASE,
@@ -201,8 +205,10 @@ define_keywords!(
     DISTRIBUTED,
     DISTSQL,
     DO,
+    DOT,
     DOUBLE,
     DROP,
+    DURATION_SECS,
     DYNAMIC,
     EACH,
     ELEMENT,
@@ -214,6 +220,7 @@ define_keywords!(
     END_EXEC = "END-EXEC",
     END_FRAME,
     END_PARTITION,
+    ENGINE,
     EQUALS,
     ERROR,
     ESCAPE,
@@ -241,6 +248,8 @@ define_keywords!(
     FOR,
     FOREIGN,
     FORMAT,
+    FRAGMENT,
+    FRAGMENTS,
     FRAME_ROW,
     FREE,
     FREEZE,
@@ -250,7 +259,6 @@ define_keywords!(
     FUNCTIONS,
     FUSION,
     GAP,
-    GENERATOR,
     GET,
     GLOBAL,
     GRANT,
@@ -313,6 +321,7 @@ define_keywords!(
     LOGICAL,
     LOGIN,
     LOWER,
+    MAP,
     MATCH,
     MATERIALIZED,
     MAX,
@@ -343,6 +352,7 @@ define_keywords!(
     NOSCAN,
     NOSUPERUSER,
     NOT,
+    NOTHING,
     NOTNULL,
     NTH_VALUE,
     NTILE,
@@ -388,6 +398,7 @@ define_keywords!(
     PERIOD,
     PHYSICAL,
     PLACING,
+    PLAN,
     PORTION,
     POSITION,
     POSITION_REGEX,
@@ -428,6 +439,8 @@ define_keywords!(
     REPAIR,
     REPEATABLE,
     REPLACE,
+    RESET,
+    RESOURCE_GROUP,
     RESTRICT,
     RESULT,
     RETURN,
@@ -499,6 +512,7 @@ define_keywords!(
     SUCCEEDS,
     SUM,
     SUPERUSER,
+    SWAP,
     SYMMETRIC,
     SYNC,
     SYSTEM,
@@ -546,9 +560,12 @@ define_keywords!(
     UPDATE,
     UPPER,
     USAGE,
+    USE,
     USER,
     USING,
     UUID,
+    VACUUM,
+    VALIDATE,
     VALUE,
     VALUES,
     VALUE_OF,
@@ -577,7 +594,9 @@ define_keywords!(
     WITHOUT,
     WORK,
     WRITE,
+    XML,
     XOR,
+    YAML,
     YEAR,
     ZONE
 );
@@ -613,6 +632,7 @@ pub const RESERVED_FOR_TABLE_ALIAS: &[Keyword] = &[
     Keyword::LEFT,
     Keyword::RIGHT,
     Keyword::NATURAL,
+    Keyword::ASOF,
     Keyword::USING,
     Keyword::CLUSTER,
     // for MSSQL-specific OUTER APPLY (seems reserved in most dialects)
@@ -620,6 +640,7 @@ pub const RESERVED_FOR_TABLE_ALIAS: &[Keyword] = &[
     Keyword::SET,
     Keyword::RETURNING,
     Keyword::EMIT,
+    Keyword::WINDOW,
 ];
 
 /// Can't be used as a column alias, so that `SELECT <expr> alias`

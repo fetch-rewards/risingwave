@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,10 +14,10 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 #[cfg(all(debug_assertions, not(any(madsim, test, feature = "test"))))]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 use prometheus::local::{LocalHistogram, LocalIntCounter};
 use risingwave_common::catalog::TableId;
@@ -223,17 +223,17 @@ impl Drop for StoreLocalStatistic {
 }
 
 struct LocalStoreMetrics {
-    cache_data_block_total: LabelGuardedLocalIntCounter<2>,
-    cache_data_block_miss: LabelGuardedLocalIntCounter<2>,
-    cache_meta_block_total: LabelGuardedLocalIntCounter<2>,
-    cache_meta_block_miss: LabelGuardedLocalIntCounter<2>,
-    cache_data_prefetch_count: LabelGuardedLocalIntCounter<2>,
-    cache_data_prefetch_block_count: LabelGuardedLocalIntCounter<2>,
+    cache_data_block_total: LabelGuardedLocalIntCounter,
+    cache_data_block_miss: LabelGuardedLocalIntCounter,
+    cache_meta_block_total: LabelGuardedLocalIntCounter,
+    cache_meta_block_miss: LabelGuardedLocalIntCounter,
+    cache_data_prefetch_count: LabelGuardedLocalIntCounter,
+    cache_data_prefetch_block_count: LabelGuardedLocalIntCounter,
     remote_io_time: LocalHistogram,
-    processed_key_count: LabelGuardedLocalIntCounter<2>,
-    skip_multi_version_key_count: LabelGuardedLocalIntCounter<2>,
-    skip_delete_key_count: LabelGuardedLocalIntCounter<2>,
-    total_key_count: LabelGuardedLocalIntCounter<2>,
+    processed_key_count: LabelGuardedLocalIntCounter,
+    skip_multi_version_key_count: LabelGuardedLocalIntCounter,
+    skip_delete_key_count: LabelGuardedLocalIntCounter,
+    total_key_count: LabelGuardedLocalIntCounter,
     get_shared_buffer_hit_counts: LocalIntCounter,
     staging_imm_iter_count: LocalHistogram,
     staging_sst_iter_count: LocalHistogram,
@@ -256,30 +256,30 @@ impl LocalStoreMetrics {
     pub fn new(metrics: &HummockStateStoreMetrics, table_id_label: &str) -> Self {
         let cache_data_block_total = metrics
             .sst_store_block_request_counts
-            .with_label_values(&[table_id_label, "data_total"])
+            .with_guarded_label_values(&[table_id_label, "data_total"])
             .local();
 
         let cache_data_block_miss = metrics
             .sst_store_block_request_counts
-            .with_label_values(&[table_id_label, "data_miss"])
+            .with_guarded_label_values(&[table_id_label, "data_miss"])
             .local();
 
         let cache_meta_block_total = metrics
             .sst_store_block_request_counts
-            .with_label_values(&[table_id_label, "meta_total"])
+            .with_guarded_label_values(&[table_id_label, "meta_total"])
             .local();
         let cache_data_prefetch_count = metrics
             .sst_store_block_request_counts
-            .with_label_values(&[table_id_label, "prefetch_count"])
+            .with_guarded_label_values(&[table_id_label, "prefetch_count"])
             .local();
         let cache_data_prefetch_block_count = metrics
             .sst_store_block_request_counts
-            .with_label_values(&[table_id_label, "prefetch_data_count"])
+            .with_guarded_label_values(&[table_id_label, "prefetch_data_count"])
             .local();
 
         let cache_meta_block_miss = metrics
             .sst_store_block_request_counts
-            .with_label_values(&[table_id_label, "meta_miss"])
+            .with_guarded_label_values(&[table_id_label, "meta_miss"])
             .local();
 
         let remote_io_time = metrics
@@ -289,22 +289,22 @@ impl LocalStoreMetrics {
 
         let processed_key_count = metrics
             .iter_scan_key_counts
-            .with_label_values(&[table_id_label, "processed"])
+            .with_guarded_label_values(&[table_id_label, "processed"])
             .local();
 
         let skip_multi_version_key_count = metrics
             .iter_scan_key_counts
-            .with_label_values(&[table_id_label, "skip_multi_version"])
+            .with_guarded_label_values(&[table_id_label, "skip_multi_version"])
             .local();
 
         let skip_delete_key_count = metrics
             .iter_scan_key_counts
-            .with_label_values(&[table_id_label, "skip_delete"])
+            .with_guarded_label_values(&[table_id_label, "skip_delete"])
             .local();
 
         let total_key_count = metrics
             .iter_scan_key_counts
-            .with_label_values(&[table_id_label, "total"])
+            .with_guarded_label_values(&[table_id_label, "total"])
             .local();
 
         let get_shared_buffer_hit_counts = metrics
@@ -470,14 +470,14 @@ add_local_metrics_count!(
 macro_rules! define_bloom_filter_metrics {
     ($($x:ident),*) => (
         struct BloomFilterLocalMetrics {
-            $($x: LabelGuardedLocalIntCounter<2>,)*
+            $($x: LabelGuardedLocalIntCounter,)*
         }
 
         impl BloomFilterLocalMetrics {
             pub fn new(metrics: &HummockStateStoreMetrics, table_id_label: &str, oper_type: &str) -> Self {
                 // checks SST bloom filters
                 Self {
-                    $($x: metrics.$x.with_label_values(&[table_id_label, oper_type]).local(),)*
+                    $($x: metrics.$x.with_guarded_label_values(&[table_id_label, oper_type]).local(),)*
                 }
             }
 

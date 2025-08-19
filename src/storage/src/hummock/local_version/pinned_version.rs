@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,13 +14,17 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::iter::empty;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use auto_enums::auto_enum;
+use parking_lot::RwLock;
 use risingwave_common::catalog::TableId;
+use risingwave_hummock_sdk::change_log::TableChangeLogCommon;
 use risingwave_hummock_sdk::level::{Level, Levels};
-use risingwave_hummock_sdk::version::HummockVersion;
+use risingwave_hummock_sdk::sstable_info::SstableInfo;
+use risingwave_hummock_sdk::version::{HummockVersion, LocalHummockVersion};
 use risingwave_hummock_sdk::{CompactionGroupId, HummockVersionId, INVALID_VERSION_ID};
 use risingwave_rpc_client::HummockMetaClient;
 use thiserror_ext::AsReport;
@@ -73,9 +77,17 @@ impl Drop for PinnedVersionGuard {
 
 #[derive(Clone)]
 pub struct PinnedVersion {
-    version: Arc<HummockVersion>,
-    compaction_group_index: Arc<HashMap<TableId, CompactionGroupId>>,
+    version: Arc<LocalHummockVersion>,
     guard: Arc<PinnedVersionGuard>,
+    table_change_log: Arc<RwLock<HashMap<TableId, TableChangeLogCommon<SstableInfo>>>>,
+}
+
+impl Deref for PinnedVersion {
+    type Target = LocalHummockVersion;
+
+    fn deref(&self) -> &Self::Target {
+        &self.version
+    }
 }
 
 impl PinnedVersion {
@@ -84,40 +96,61 @@ impl PinnedVersion {
         pinned_version_manager_tx: UnboundedSender<PinVersionAction>,
     ) -> Self {
         let version_id = version.id;
-        let compaction_group_index = version.state_table_info.build_table_compaction_group_id();
-
+        let (local_version, table_id_to_change_logs) = version.split_change_log();
         PinnedVersion {
-            version: Arc::new(version),
-            compaction_group_index: Arc::new(compaction_group_index),
             guard: Arc::new(PinnedVersionGuard::new(
                 version_id,
                 pinned_version_manager_tx,
             )),
+            table_change_log: Arc::new(RwLock::new(table_id_to_change_logs)),
+            version: Arc::new(local_version),
         }
     }
 
-    pub(crate) fn compaction_group_index(&self) -> Arc<HashMap<TableId, CompactionGroupId>> {
-        self.compaction_group_index.clone()
-    }
-
-    pub fn new_pin_version(&self, version: HummockVersion) -> Self {
+    pub fn new_pin_version(&self, version: HummockVersion) -> Option<Self> {
         assert!(
             version.id >= self.version.id,
             "pinning a older version {}. Current is {}",
             version.id,
             self.version.id
         );
+        if version.id == self.version.id {
+            return None;
+        }
         let version_id = version.id;
-        let compaction_group_index = version.state_table_info.build_table_compaction_group_id();
-
-        PinnedVersion {
-            version: Arc::new(version),
-            compaction_group_index: Arc::new(compaction_group_index),
+        let (local_version, table_id_to_change_logs) = version.split_change_log();
+        Some(PinnedVersion {
             guard: Arc::new(PinnedVersionGuard::new(
                 version_id,
                 self.guard.pinned_version_manager_tx.clone(),
             )),
+            table_change_log: Arc::new(RwLock::new(table_id_to_change_logs)),
+            version: Arc::new(local_version),
+        })
+    }
+
+    /// Create a new `PinnedVersion` with the given `LocalHummockVersion`. Referring to the usage in the `hummock_event_handler`.
+    pub fn new_with_local_version(&self, version: LocalHummockVersion) -> Option<Self> {
+        assert!(
+            version.id >= self.version.id,
+            "pinning a older version {}. Current is {}",
+            version.id,
+            self.version.id
+        );
+        if version.id == self.version.id {
+            return None;
         }
+
+        let version_id = version.id;
+
+        Some(PinnedVersion {
+            guard: Arc::new(PinnedVersionGuard::new(
+                version_id,
+                self.guard.pinned_version_manager_tx.clone(),
+            )),
+            table_change_log: self.table_change_log.clone(),
+            version: Arc::new(version),
+        })
     }
 
     pub fn id(&self) -> HummockVersionId {
@@ -129,7 +162,16 @@ impl PinnedVersion {
     }
 
     fn levels_by_compaction_groups_id(&self, compaction_group_id: CompactionGroupId) -> &Levels {
-        self.version.levels.get(&compaction_group_id).unwrap()
+        self.version
+            .levels
+            .get(&compaction_group_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "levels for compaction group {} not found in version {}",
+                    compaction_group_id,
+                    self.id()
+                )
+            })
     }
 
     pub fn levels(&self, table_id: TableId) -> impl Iterator<Item = &Level> {
@@ -149,13 +191,17 @@ impl PinnedVersion {
         }
     }
 
-    pub fn max_committed_epoch(&self) -> u64 {
-        self.version.max_committed_epoch
+    pub fn table_change_log_read_lock(
+        &self,
+    ) -> parking_lot::RwLockReadGuard<'_, HashMap<TableId, TableChangeLogCommon<SstableInfo>>> {
+        self.table_change_log.read()
     }
 
-    /// ret value can't be used as `HummockVersion`. it must be modified with delta
-    pub fn version(&self) -> &HummockVersion {
-        &self.version
+    pub fn table_change_log_write_lock(
+        &self,
+    ) -> parking_lot::RwLockWriteGuard<'_, HashMap<TableId, TableChangeLogCommon<SstableInfo>>>
+    {
+        self.table_change_log.write()
     }
 }
 
@@ -176,7 +222,7 @@ pub(crate) async fn start_pinned_version_worker(
     min_execute_interval_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut need_unpin = false;
 
-    let mut version_ids_in_use: BTreeMap<u64, (usize, Instant)> = BTreeMap::new();
+    let mut version_ids_in_use: BTreeMap<HummockVersionId, (usize, Instant)> = BTreeMap::new();
     let max_version_pinning_duration_sec = Duration::from_secs(max_version_pinning_duration_sec);
     // For each run in the loop, accumulate versions to unpin and call unpin RPC once.
     loop {

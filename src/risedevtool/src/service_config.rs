@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -37,6 +37,7 @@ pub struct ComputeNodeConfig {
     pub provide_aws_s3: Option<Vec<AwsS3Config>>,
     pub provide_tempo: Option<Vec<TempoConfig>>,
     pub user_managed: bool,
+    pub resource_group: String,
 
     pub total_memory_bytes: usize,
     pub parallelism: usize,
@@ -48,10 +49,10 @@ pub struct ComputeNodeConfig {
 #[serde(deny_unknown_fields)]
 pub enum MetaBackend {
     Memory,
-    Etcd,
     Sqlite,
     Postgres,
     Mysql,
+    Env,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -72,7 +73,6 @@ pub struct MetaNodeConfig {
     pub user_managed: bool,
 
     pub meta_backend: MetaBackend,
-    pub provide_etcd_backend: Option<Vec<EtcdConfig>>,
     pub provide_sqlite_backend: Option<Vec<SqliteConfig>>,
     pub provide_postgres_backend: Option<Vec<PostgresConfig>>,
     pub provide_mysql_backend: Option<Vec<MySqlConfig>>,
@@ -86,7 +86,6 @@ pub struct MetaNodeConfig {
     pub provide_aws_s3: Option<Vec<AwsS3Config>>,
     pub provide_minio: Option<Vec<MinioConfig>>,
     pub provide_opendal: Option<Vec<OpendalConfig>>,
-    pub enable_in_memory_kv_state_backend: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -131,6 +130,8 @@ pub struct CompactorConfig {
 
     pub user_managed: bool,
     pub compaction_worker_threads_number: Option<usize>,
+
+    pub compactor_mode: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -159,28 +160,6 @@ pub struct MinioConfig {
     // For rate limiting minio in a test environment.
     pub api_requests_max: usize,
     pub api_requests_deadline: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-#[serde(deny_unknown_fields)]
-pub struct EtcdConfig {
-    #[serde(rename = "use")]
-    phantom_use: Option<String>,
-    pub id: String,
-
-    // TODO: only one node etcd is supported.
-    pub address: String,
-    #[serde(with = "string")]
-    pub port: u16,
-    pub listen_address: String,
-
-    pub peer_port: u16,
-    pub unsafe_no_fsync: bool,
-
-    pub exporter_port: u16,
-
-    pub provide_etcd: Option<Vec<EtcdConfig>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -217,8 +196,6 @@ pub struct PrometheusConfig {
     pub provide_meta_node: Option<Vec<MetaNodeConfig>>,
     pub provide_minio: Option<Vec<MinioConfig>>,
     pub provide_compactor: Option<Vec<CompactorConfig>>,
-    pub provide_etcd: Option<Vec<EtcdConfig>>,
-    pub provide_redpanda: Option<Vec<RedPandaConfig>>,
     pub provide_frontend: Option<Vec<FrontendConfig>>,
 }
 
@@ -339,15 +316,18 @@ pub struct PubsubConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[serde(deny_unknown_fields)]
-pub struct RedPandaConfig {
+pub struct PulsarConfig {
     #[serde(rename = "use")]
     phantom_use: Option<String>,
     pub id: String,
-    pub internal_port: u16,
-    pub outside_port: u16,
+
     pub address: String,
-    pub cpus: usize,
-    pub memory: String,
+    pub broker_port: u16,
+    pub http_port: u16,
+
+    pub user_managed: bool,
+    pub image: String,
+    pub persist_data: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -410,6 +390,49 @@ pub struct PostgresConfig {
     pub image: String,
     pub user_managed: bool,
     pub persist_data: bool,
+
+    // Inject latency into any network calls to the postgres service.
+    pub latency_ms: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields)]
+pub struct SqlServerConfig {
+    #[serde(rename = "use")]
+    phantom_use: Option<String>,
+    pub id: String,
+
+    pub port: u16,
+    pub address: String,
+
+    pub user: String,
+    pub password: String,
+    pub database: String,
+
+    pub image: String,
+    pub user_managed: bool,
+    pub persist_data: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields)]
+pub struct LakekeeperConfig {
+    #[serde(rename = "use")]
+    phantom_use: Option<String>,
+    pub id: String,
+
+    pub port: u16,
+    pub address: String,
+
+    pub user_managed: bool,
+    pub persist_data: bool,
+
+    pub catalog_backend: String,
+    pub encryption_key: String,
+    pub provide_postgres_backend: Option<Vec<PostgresConfig>>,
+    pub provide_minio: Option<Vec<MinioConfig>>,
 }
 
 /// All service configuration
@@ -420,7 +443,6 @@ pub enum ServiceConfig {
     Frontend(FrontendConfig),
     Compactor(CompactorConfig),
     Minio(MinioConfig),
-    Etcd(EtcdConfig),
     Sqlite(SqliteConfig),
     Prometheus(PrometheusConfig),
     Grafana(GrafanaConfig),
@@ -430,10 +452,26 @@ pub enum ServiceConfig {
     Kafka(KafkaConfig),
     SchemaRegistry(SchemaRegistryConfig),
     Pubsub(PubsubConfig),
+    Pulsar(PulsarConfig),
     Redis(RedisConfig),
-    RedPanda(RedPandaConfig),
     MySql(MySqlConfig),
     Postgres(PostgresConfig),
+    SqlServer(SqlServerConfig),
+    Lakekeeper(LakekeeperConfig),
+}
+
+#[derive(PartialEq, Eq, Hash, Debug)]
+pub enum TaskGroup {
+    RisingWave,
+    Observability,
+    Kafka,
+    Pubsub,
+    Pulsar,
+    MySql,
+    Postgres,
+    SqlServer,
+    Redis,
+    Lakekeeper,
 }
 
 impl ServiceConfig {
@@ -444,7 +482,6 @@ impl ServiceConfig {
             Self::Frontend(c) => &c.id,
             Self::Compactor(c) => &c.id,
             Self::Minio(c) => &c.id,
-            Self::Etcd(c) => &c.id,
             Self::Sqlite(c) => &c.id,
             Self::Prometheus(c) => &c.id,
             Self::Grafana(c) => &c.id,
@@ -452,12 +489,14 @@ impl ServiceConfig {
             Self::AwsS3(c) => &c.id,
             Self::Kafka(c) => &c.id,
             Self::Pubsub(c) => &c.id,
+            Self::Pulsar(c) => &c.id,
             Self::Redis(c) => &c.id,
-            Self::RedPanda(c) => &c.id,
             Self::Opendal(c) => &c.id,
             Self::MySql(c) => &c.id,
             Self::Postgres(c) => &c.id,
+            Self::SqlServer(c) => &c.id,
             Self::SchemaRegistry(c) => &c.id,
+            Self::Lakekeeper(c) => &c.id,
         }
     }
 
@@ -469,7 +508,6 @@ impl ServiceConfig {
             Self::Frontend(c) => Some(c.port),
             Self::Compactor(c) => Some(c.port),
             Self::Minio(c) => Some(c.port),
-            Self::Etcd(c) => Some(c.port),
             Self::Sqlite(_) => None,
             Self::Prometheus(c) => Some(c.port),
             Self::Grafana(c) => Some(c.port),
@@ -477,12 +515,14 @@ impl ServiceConfig {
             Self::AwsS3(_) => None,
             Self::Kafka(c) => Some(c.port),
             Self::Pubsub(c) => Some(c.port),
+            Self::Pulsar(c) => Some(c.http_port),
             Self::Redis(c) => Some(c.port),
-            Self::RedPanda(_c) => None,
             Self::Opendal(_) => None,
             Self::MySql(c) => Some(c.port),
             Self::Postgres(c) => Some(c.port),
+            Self::SqlServer(c) => Some(c.port),
             Self::SchemaRegistry(c) => Some(c.port),
+            Self::Lakekeeper(c) => Some(c.port),
         }
     }
 
@@ -493,7 +533,6 @@ impl ServiceConfig {
             Self::Frontend(c) => c.user_managed,
             Self::Compactor(c) => c.user_managed,
             Self::Minio(_c) => false,
-            Self::Etcd(_c) => false,
             Self::Sqlite(_c) => false,
             Self::Prometheus(_c) => false,
             Self::Grafana(_c) => false,
@@ -501,12 +540,50 @@ impl ServiceConfig {
             Self::AwsS3(_c) => false,
             Self::Kafka(c) => c.user_managed,
             Self::Pubsub(_c) => false,
+            Self::Pulsar(c) => c.user_managed,
             Self::Redis(_c) => false,
-            Self::RedPanda(_c) => false,
             Self::Opendal(_c) => false,
             Self::MySql(c) => c.user_managed,
             Self::Postgres(c) => c.user_managed,
+            Self::SqlServer(c) => c.user_managed,
             Self::SchemaRegistry(c) => c.user_managed,
+            Self::Lakekeeper(c) => c.user_managed,
+        }
+    }
+
+    pub fn task_group(&self) -> TaskGroup {
+        use TaskGroup::*;
+        match self {
+            ServiceConfig::ComputeNode(_)
+            | ServiceConfig::MetaNode(_)
+            | ServiceConfig::Frontend(_)
+            | ServiceConfig::Compactor(_)
+            | ServiceConfig::Minio(_)
+            | ServiceConfig::Sqlite(_) => RisingWave,
+            ServiceConfig::Prometheus(_) | ServiceConfig::Grafana(_) | ServiceConfig::Tempo(_) => {
+                Observability
+            }
+            ServiceConfig::Opendal(_) | ServiceConfig::AwsS3(_) => RisingWave,
+            ServiceConfig::Kafka(_) | ServiceConfig::SchemaRegistry(_) => Kafka,
+            ServiceConfig::Pubsub(_) => Pubsub,
+            ServiceConfig::Pulsar(_) => Pulsar,
+            ServiceConfig::Redis(_) => Redis,
+            ServiceConfig::MySql(my_sql_config) => {
+                if matches!(my_sql_config.application, Application::Metastore) {
+                    RisingWave
+                } else {
+                    MySql
+                }
+            }
+            ServiceConfig::Postgres(postgres_config) => {
+                if matches!(postgres_config.application, Application::Metastore) {
+                    RisingWave
+                } else {
+                    Postgres
+                }
+            }
+            ServiceConfig::SqlServer(_) => SqlServer,
+            ServiceConfig::Lakekeeper(_) => Lakekeeper,
         }
     }
 }
@@ -515,7 +592,7 @@ mod string {
     use std::fmt::Display;
     use std::str::FromStr;
 
-    use serde::{de, Deserialize, Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer, de};
 
     pub fn serialize<T, S>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
     where

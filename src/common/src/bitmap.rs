@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -40,8 +40,9 @@ use std::iter::{self, TrustedLen};
 use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, Not, Range, RangeInclusive};
 
 use risingwave_common_estimate_size::EstimateSize;
-use risingwave_pb::common::buffer::CompressionType;
 use risingwave_pb::common::PbBuffer;
+use risingwave_pb::common::buffer::CompressionType;
+use rw_iter_util::ZipEqFast;
 
 #[derive(Default, Debug, Clone, EstimateSize)]
 pub struct BitmapBuilder {
@@ -325,7 +326,7 @@ impl Bitmap {
 
     /// Returns the length of vector to store `num_bits` bits.
     fn vec_len(num_bits: usize) -> usize {
-        (num_bits + BITS - 1) / BITS
+        num_bits.div_ceil(BITS)
     }
 
     /// Returns the number of valid bits in the bitmap,
@@ -346,9 +347,11 @@ impl Bitmap {
     ///
     /// Index must be in range.
     pub unsafe fn is_set_unchecked(&self, idx: usize) -> bool {
-        match &self.bits {
-            None => self.count_ones != 0,
-            Some(bits) => bits.get_unchecked(idx / BITS) & (1 << (idx % BITS)) != 0,
+        unsafe {
+            match &self.bits {
+                None => self.count_ones != 0,
+                Some(bits) => bits.get_unchecked(idx / BITS) & (1 << (idx % BITS)) != 0,
+            }
         }
     }
 
@@ -468,14 +471,14 @@ impl From<usize> for Bitmap {
     }
 }
 
-impl<'a, 'b> BitAnd<&'b Bitmap> for &'a Bitmap {
+impl<'b> BitAnd<&'b Bitmap> for &Bitmap {
     type Output = Bitmap;
 
     fn bitand(self, rhs: &'b Bitmap) -> Bitmap {
         assert_eq!(self.num_bits, rhs.num_bits);
         let (lbits, rbits) = match (&self.bits, &rhs.bits) {
             _ if self.count_ones == 0 || rhs.count_ones == 0 => {
-                return Bitmap::zeros(self.num_bits)
+                return Bitmap::zeros(self.num_bits);
             }
             (_, None) => return self.clone(),
             (None, _) => return rhs.clone(),
@@ -488,7 +491,7 @@ impl<'a, 'b> BitAnd<&'b Bitmap> for &'a Bitmap {
     }
 }
 
-impl<'a> BitAnd<Bitmap> for &'a Bitmap {
+impl BitAnd<Bitmap> for &Bitmap {
     type Output = Bitmap;
 
     fn bitand(self, rhs: Bitmap) -> Self::Output {
@@ -524,7 +527,7 @@ impl BitAndAssign<Bitmap> for Bitmap {
     }
 }
 
-impl<'a, 'b> BitOr<&'b Bitmap> for &'a Bitmap {
+impl<'b> BitOr<&'b Bitmap> for &Bitmap {
     type Output = Bitmap;
 
     fn bitor(self, rhs: &'b Bitmap) -> Bitmap {
@@ -544,7 +547,7 @@ impl<'a, 'b> BitOr<&'b Bitmap> for &'a Bitmap {
     }
 }
 
-impl<'a> BitOr<Bitmap> for &'a Bitmap {
+impl BitOr<Bitmap> for &Bitmap {
     type Output = Bitmap;
 
     fn bitor(self, rhs: Bitmap) -> Self::Output {
@@ -599,7 +602,7 @@ impl BitXor for &Bitmap {
     }
 }
 
-impl<'a> Not for &'a Bitmap {
+impl Not for &Bitmap {
     type Output = Bitmap;
 
     fn not(self) -> Self::Output {
@@ -653,7 +656,7 @@ impl FromIterator<Option<bool>> for Bitmap {
 
 impl Bitmap {
     pub fn to_protobuf(&self) -> PbBuffer {
-        let body_len = (self.num_bits + 7) / 8 + 1;
+        let body_len = self.num_bits.div_ceil(8) + 1;
         let mut body = Vec::with_capacity(body_len);
         body.push((self.num_bits % 8) as u8);
         match &self.bits {
@@ -666,7 +669,10 @@ impl Bitmap {
             }
             Some(bits) => {
                 body.extend_from_slice(unsafe {
-                    std::slice::from_raw_parts(bits.as_ptr() as *const u8, (self.num_bits + 7) / 8)
+                    std::slice::from_raw_parts(
+                        bits.as_ptr() as *const u8,
+                        self.num_bits.div_ceil(8),
+                    )
                 });
             }
         }
@@ -685,6 +691,12 @@ impl From<&PbBuffer> for Bitmap {
     }
 }
 
+impl From<PbBuffer> for Bitmap {
+    fn from(buf: PbBuffer) -> Self {
+        Self::from(&buf)
+    }
+}
+
 /// Bitmap iterator.
 pub struct BitmapIter<'a> {
     bits: Option<&'a [usize]>,
@@ -694,7 +706,7 @@ pub struct BitmapIter<'a> {
     all_ones: bool,
 }
 
-impl<'a> BitmapIter<'a> {
+impl BitmapIter<'_> {
     fn next_always_load_usize(&mut self) -> Option<bool> {
         if self.idx >= self.num_bits {
             return None;
@@ -718,7 +730,7 @@ impl<'a> BitmapIter<'a> {
     }
 }
 
-impl<'a> iter::Iterator for BitmapIter<'a> {
+impl iter::Iterator for BitmapIter<'_> {
     type Item = bool;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -772,7 +784,7 @@ pub enum BitmapOnesIter<'a> {
     },
 }
 
-impl<'a> iter::Iterator for BitmapOnesIter<'a> {
+impl iter::Iterator for BitmapOnesIter<'_> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -819,6 +831,15 @@ impl<'a> iter::Iterator for BitmapOnesIter<'a> {
         }
     }
 }
+
+pub trait FilterByBitmap: ExactSizeIterator + Sized {
+    fn filter_by_bitmap(self, bitmap: &Bitmap) -> impl Iterator<Item = Self::Item> {
+        self.zip_eq_fast(bitmap.iter())
+            .filter_map(|(item, bit)| bit.then_some(item))
+    }
+}
+
+impl<T> FilterByBitmap for T where T: ExactSizeIterator {}
 
 #[cfg(test)]
 mod tests {

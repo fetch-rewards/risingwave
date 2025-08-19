@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -156,6 +156,14 @@ public class SourceValidateHandler {
                 ensurePropNotBlank(props, DbzConnectorConfig.MongoDb.MONGO_COLLECTION_NAME);
                 var validator = new MongoDbValidator(props);
                 validator.validateDbConfig();
+                break;
+            case SQL_SERVER:
+                ensureRequiredProps(props, isCdcSourceJob);
+                ensurePropNotBlank(props, DbzConnectorConfig.SQL_SERVER_SCHEMA_NAME);
+                try (var sqlServerValidator =
+                        new SqlServerValidator(props, tableSchema, isCdcSourceJob)) {
+                    sqlServerValidator.validateAll();
+                }
                 break;
             default:
                 LOG.warn("Unknown source type");

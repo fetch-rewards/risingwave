@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,16 +14,17 @@
 
 use std::str::FromStr;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use futures_async_stream::try_stream;
 use itertools::Itertools;
 use prost::Message;
 use risingwave_common::bail;
+use risingwave_common::global_jvm::JVM;
 use risingwave_common::metrics::GLOBAL_ERROR_METRICS;
 use risingwave_common::util::addr::HostAddr;
-use risingwave_jni_core::jvm_runtime::{execute_with_jni_env, JVM};
-use risingwave_jni_core::{call_static_method, JniReceiverType, JniSenderType};
+use risingwave_jni_core::jvm_runtime::execute_with_jni_env;
+use risingwave_jni_core::{JniReceiverType, OwnedPointer, call_static_method};
 use risingwave_pb::connector_service::{GetEventStreamRequest, GetEventStreamResponse};
 use thiserror_ext::AsReport;
 use tokio::sync::mpsc;
@@ -33,8 +34,8 @@ use crate::parser::ParserConfig;
 use crate::source::base::SourceMessage;
 use crate::source::cdc::{CdcProperties, CdcSourceType, CdcSourceTypeTrait, DebeziumCdcSplit};
 use crate::source::{
-    into_chunk_stream, BoxChunkSourceStream, Column, SourceContextRef, SplitId, SplitMetaData,
-    SplitReader,
+    BoxSourceChunkStream, Column, SourceContextRef, SplitId, SplitMetaData, SplitReader,
+    into_chunk_stream,
 };
 
 pub struct CdcSplitReader<T: CdcSourceTypeTrait> {
@@ -86,8 +87,8 @@ impl<T: CdcSourceTypeTrait> SplitReader for CdcSplitReader<T> {
             citus_server_addr = Some(server_addr.clone());
             let host_addr =
                 HostAddr::from_str(server_addr).context("invalid server address for cdc split")?;
-            properties.insert("hostname".to_string(), host_addr.host);
-            properties.insert("port".to_string(), host_addr.port.to_string());
+            properties.insert("hostname".to_owned(), host_addr.host);
+            properties.insert("port".to_owned(), host_addr.port.to_string());
             // rewrite table name with suffix to capture all shards in the split
             let mut table_name = properties
                 .remove("table.name")
@@ -98,7 +99,7 @@ impl<T: CdcSourceTypeTrait> SplitReader for CdcSplitReader<T> {
 
         let source_id = split.split_id() as u64;
         let source_type = conn_props.get_source_type_pb();
-        let (mut tx, mut rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let (tx, mut rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
         let jvm = JVM.get_or_init()?;
         let get_event_stream_request = GetEventStreamRequest {
@@ -129,12 +130,16 @@ impl<T: CdcSourceTypeTrait> SplitReader for CdcSplitReader<T> {
                     }
                 };
 
+                // `runJniDbzSourceThread` will take ownership of `tx`, and release it later in
+                // `Java_com_risingwave_java_binding_Binding_cdcSourceSenderClose` via ref cleaner.
+                let tx: OwnedPointer<_> = tx.into();
+
                 let result = call_static_method!(
                     env,
                     {com.risingwave.connector.source.core.JniDbzSourceHandler},
                     {void runJniDbzSourceThread(byte[] getEventStreamRequestBytes, long channelPtr)},
                     &get_event_stream_request_bytes,
-                    &mut tx as *mut JniSenderType<GetEventStreamResponse>
+                    tx.into_pointer()
                 );
 
                 match result {
@@ -161,13 +166,18 @@ impl<T: CdcSourceTypeTrait> SplitReader for CdcSplitReader<T> {
                 }
             };
             if !inited {
-                bail!("failed to start cdc connector");
+                bail!(
+                    "failed to start cdc connector.\nHINT: increase `cdc_source_wait_streaming_start_timeout` session variable to a large value and retry."
+                );
             }
         }
         tracing::info!(?source_id, "cdc connector started");
 
         let instance = match T::source_type() {
-            CdcSourceType::Mysql | CdcSourceType::Postgres | CdcSourceType::Mongodb => Self {
+            CdcSourceType::Mysql
+            | CdcSourceType::Postgres
+            | CdcSourceType::Mongodb
+            | CdcSourceType::SqlServer => Self {
                 source_id: split.split_id() as u64,
                 start_offset: split.start_offset().clone(),
                 server_addr: None,
@@ -196,7 +206,7 @@ impl<T: CdcSourceTypeTrait> SplitReader for CdcSplitReader<T> {
         Ok(instance)
     }
 
-    fn into_stream(self) -> BoxChunkSourceStream {
+    fn into_stream(self) -> BoxSourceChunkStream {
         let parser_config = self.parser_config.clone();
         let source_context = self.source_ctx.clone();
         into_chunk_stream(self.into_data_stream(), parser_config, source_context)
@@ -206,19 +216,13 @@ impl<T: CdcSourceTypeTrait> SplitReader for CdcSplitReader<T> {
 impl<T: CdcSourceTypeTrait> CdcSplitReader<T> {
     #[try_stream(ok = Vec<SourceMessage>, error = ConnectorError)]
     async fn into_data_stream(self) {
-        let source_type = T::source_type();
         let mut rx = self.rx;
         let source_id = self.source_id.to_string();
-        let metrics = self.source_ctx.metrics.clone();
 
         while let Some(result) = rx.recv().await {
             match result {
                 Ok(GetEventStreamResponse { events, .. }) => {
                     tracing::trace!("receive {} cdc events ", events.len());
-                    metrics
-                        .connector_source_rows_received
-                        .with_guarded_label_values(&[source_type.as_str_name(), &source_id])
-                        .inc_by(events.len() as u64);
                     let msgs = events.into_iter().map(SourceMessage::from).collect_vec();
                     yield msgs;
                 }

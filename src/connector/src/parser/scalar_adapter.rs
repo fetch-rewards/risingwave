@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ use bytes::BytesMut;
 use pg_bigdecimal::PgNumeric;
 use risingwave_common::types::{DataType, Decimal, Int256, ListValue, ScalarImpl, ScalarRefImpl};
 use thiserror_ext::AsReport;
-use tokio_postgres::types::{to_sql_checked, FromSql, IsNull, Kind, ToSql, Type};
+use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
 use crate::error::ConnectorResult;
 
@@ -312,6 +312,22 @@ impl ScalarAdapter {
                 None
             }
         }
+    }
+}
+
+pub fn validate_pg_type_to_rw_type(pg_type: &DataType, rw_type: &DataType) -> bool {
+    if pg_type == rw_type {
+        return true;
+    }
+    match rw_type {
+        DataType::Varchar => matches!(pg_type, DataType::Decimal | DataType::Int256),
+        DataType::List(box DataType::Varchar) => {
+            matches!(
+                pg_type,
+                DataType::List(box (DataType::Decimal | DataType::Int256))
+            )
+        }
+        _ => false,
     }
 }
 

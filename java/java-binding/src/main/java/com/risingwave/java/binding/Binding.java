@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,11 +29,15 @@ public class Binding {
     static void ensureInitialized() {}
 
     public static native void tracingSlf4jEvent(
-            String threadName, String name, int level, String message);
+            String threadName, String name, int level, String message, String stackTrace);
 
     public static native boolean tracingSlf4jEventEnabled(int level);
 
-    public static native int vnodeCount();
+    /**
+     * Used to get the default number of vnodes for a table, if its `maybeVnodeCount` field is not
+     * set.
+     */
+    public static native int defaultVnodeCount();
 
     static native long iteratorNewStreamChunk(long pointer);
 
@@ -89,6 +93,8 @@ public class Binding {
     public static native boolean sendCdcSourceMsgToChannel(long channelPtr, byte[] msg);
 
     public static native boolean sendCdcSourceErrorToChannel(long channelPtr, String errorMsg);
+
+    public static native void cdcSourceSenderClose(long channelPtr);
 
     public static native com.risingwave.java.binding.JniSinkWriterStreamRequest
             recvSinkWriterRequestFromChannel(long channelPtr);

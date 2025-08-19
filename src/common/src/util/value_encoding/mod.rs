@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,15 +13,16 @@
 // limitations under the License.
 
 //! Value encoding is an encoding format which converts the data into a binary form (not
-//! memcomparable).
+//! memcomparable, i.e., Key encoding).
+
 use bytes::{Buf, BufMut};
 use chrono::{Datelike, Timelike};
-use either::{for_both, Either};
+use either::{Either, for_both};
 use enum_as_inner::EnumAsInner;
 use risingwave_pb::data::PbDatum;
 
 use crate::array::ArrayImpl;
-use crate::row::{Row, RowDeserializer as BasicDeserializer};
+use crate::row::Row;
 use crate::types::*;
 
 pub mod error;
@@ -29,6 +30,9 @@ use error::ValueEncodingError;
 
 use self::column_aware_row_encoding::ColumnAwareSerde;
 pub mod column_aware_row_encoding;
+
+pub use crate::row::RowDeserializer as BasicDeserializer;
+use crate::vector::{decode_vector_payload, encode_vector_payload};
 
 pub type Result<T> = std::result::Result<T, ValueEncodingError>;
 
@@ -226,6 +230,8 @@ fn serialize_scalar(value: ScalarRefImpl<'_>, buf: &mut impl BufMut) {
         ScalarRefImpl::Jsonb(v) => serialize_str(&v.value_serialize(), buf),
         ScalarRefImpl::Struct(s) => serialize_struct(s, buf),
         ScalarRefImpl::List(v) => serialize_list(v, buf),
+        ScalarRefImpl::Map(m) => serialize_list(m.into_inner(), buf),
+        ScalarRefImpl::Vector(v) => serialize_vector(v, buf),
     }
 }
 
@@ -251,6 +257,8 @@ fn estimate_serialize_scalar_size(value: ScalarRefImpl<'_>) -> usize {
         ScalarRefImpl::Jsonb(v) => v.capacity(),
         ScalarRefImpl::Struct(s) => estimate_serialize_struct_size(s),
         ScalarRefImpl::List(v) => estimate_serialize_list_size(v),
+        ScalarRefImpl::Map(v) => estimate_serialize_list_size(v.into_inner()),
+        ScalarRefImpl::Vector(v) => estimate_serialize_vector_size(v),
     }
 }
 
@@ -273,6 +281,14 @@ fn serialize_list(value: ListRef<'_>, buf: &mut impl BufMut) {
 }
 fn estimate_serialize_list_size(list: ListRef<'_>) -> usize {
     4 + list.estimate_serialize_size_inner()
+}
+
+fn serialize_vector(value: VectorRef<'_>, buf: &mut impl BufMut) {
+    let elems = value.into_slice();
+    encode_vector_payload(elems, buf);
+}
+fn estimate_serialize_vector_size(v: VectorRef<'_>) -> usize {
+    size_of_val(v.into_slice())
 }
 
 fn serialize_str(bytes: &[u8], buf: &mut impl BufMut) {
@@ -353,7 +369,13 @@ fn deserialize_value(ty: &DataType, data: &mut impl Buf) -> Result<ScalarImpl> {
         ),
         DataType::Struct(struct_def) => deserialize_struct(struct_def, data)?,
         DataType::Bytea => ScalarImpl::Bytea(deserialize_bytea(data).into()),
+        DataType::Vector(dimension) => deserialize_vector(*dimension, data)?,
         DataType::List(item_type) => deserialize_list(item_type, data)?,
+        DataType::Map(map_type) => {
+            // FIXME: clone type everytime here is inefficient
+            let list = deserialize_list(&map_type.clone().into_struct(), data)?.into_list();
+            ScalarImpl::Map(MapValue::from_entries(list))
+        }
     })
 }
 
@@ -373,6 +395,14 @@ fn deserialize_list(item_type: &DataType, data: &mut impl Buf) -> Result<ScalarI
         builder.append(inner_deserialize_datum(data, item_type)?);
     }
     Ok(ScalarImpl::List(ListValue::new(builder.finish())))
+}
+
+fn deserialize_vector(dimension: usize, data: &mut impl Buf) -> Result<ScalarImpl> {
+    let payload = decode_vector_payload(dimension, data);
+    Ok(VectorVal {
+        inner: F32::from_inner_vec(payload).into_boxed_slice(),
+    }
+    .to_scalar_value())
 }
 
 fn deserialize_str(data: &mut impl Buf) -> Result<Box<str>> {

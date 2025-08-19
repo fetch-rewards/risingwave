@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,11 +16,12 @@ use risingwave_common::util::sort_util::{ColumnOrder, OrderType};
 
 use super::utils::impl_distill_by_unit;
 use super::{
-    gen_filter_and_pushdown, generic, BatchLimit, ColPrunable, ExprRewritable, Logical, PlanBase,
-    PlanRef, PlanTreeNodeUnary, PredicatePushdown, ToBatch, ToStream,
+    BatchLimit, ColPrunable, ExprRewritable, Logical, LogicalPlanRef as PlanRef, PlanBase,
+    PlanTreeNodeUnary, PredicatePushdown, ToBatch, ToStream, gen_filter_and_pushdown, generic,
 };
 use crate::error::Result;
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
+use crate::optimizer::plan_node::generic::Limit;
 use crate::optimizer::plan_node::{
     ColumnPruningContext, LogicalTopN, PredicatePushdownContext, RewriteStreamContext,
     ToStreamContext,
@@ -55,7 +56,7 @@ impl LogicalLimit {
     }
 }
 
-impl PlanTreeNodeUnary for LogicalLimit {
+impl PlanTreeNodeUnary<Logical> for LogicalLimit {
     fn input(&self) -> PlanRef {
         self.core.input.clone()
     }
@@ -66,7 +67,6 @@ impl PlanTreeNodeUnary for LogicalLimit {
         Self::new(core)
     }
 
-    #[must_use]
     fn rewrite_with_input(
         &self,
         input: PlanRef,
@@ -75,7 +75,7 @@ impl PlanTreeNodeUnary for LogicalLimit {
         (self.clone_with_input(input), input_col_change)
     }
 }
-impl_plan_tree_node_for_unary! {LogicalLimit}
+impl_plan_tree_node_for_unary! { Logical, LogicalLimit}
 impl_distill_by_unit!(LogicalLimit, core, "LogicalLimit");
 
 impl ColPrunable for LogicalLimit {
@@ -85,7 +85,7 @@ impl ColPrunable for LogicalLimit {
     }
 }
 
-impl ExprRewritable for LogicalLimit {}
+impl ExprRewritable<Logical> for LogicalLimit {}
 
 impl ExprVisitable for LogicalLimit {}
 
@@ -101,16 +101,18 @@ impl PredicatePushdown for LogicalLimit {
 }
 
 impl ToBatch for LogicalLimit {
-    fn to_batch(&self) -> Result<PlanRef> {
+    fn to_batch(&self) -> Result<crate::optimizer::plan_node::BatchPlanRef> {
         let new_input = self.input().to_batch()?;
-        let mut new_logical = self.core.clone();
-        new_logical.input = new_input;
-        Ok(BatchLimit::new(new_logical).into())
+        let core = Limit::new(new_input, self.core.limit, self.core.offset);
+        Ok(BatchLimit::new(core).into())
     }
 }
 
 impl ToStream for LogicalLimit {
-    fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<PlanRef> {
+    fn to_stream(
+        &self,
+        ctx: &mut ToStreamContext,
+    ) -> Result<crate::optimizer::plan_node::StreamPlanRef> {
         // use the first column as an order to provide determinism for streaming queries.
         let order = Order::new(vec![ColumnOrder::new(0, OrderType::ascending())]);
         let topn = LogicalTopN::new(

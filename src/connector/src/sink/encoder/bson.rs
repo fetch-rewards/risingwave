@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -117,7 +117,7 @@ fn datum_to_bson(field: &Field, datum: DatumRef<'_>) -> Bson {
         (DataType::Int256, ScalarRefImpl::Int256(v)) => Bson::String(v.to_string()),
         (DataType::Float32, ScalarRefImpl::Float32(v)) => Bson::Double(v.into_inner() as f64),
         (DataType::Float64, ScalarRefImpl::Float64(v)) => Bson::Double(v.into_inner()),
-        (DataType::Varchar, ScalarRefImpl::Utf8(v)) => Bson::String(v.to_string()),
+        (DataType::Varchar, ScalarRefImpl::Utf8(v)) => Bson::String(v.to_owned()),
         (DataType::Boolean, ScalarRefImpl::Bool(v)) => Bson::Boolean(v),
         (DataType::Decimal, ScalarRefImpl::Decimal(v)) => {
             let decimal_str = v.to_string();
@@ -188,6 +188,7 @@ fn datum_to_bson(field: &Field, datum: DatumRef<'_>) -> Bson {
             subtype: BinarySubtype::Generic,
             bytes: v.into(),
         }),
+        // TODO(map): support map
         _ => {
             if let Ok(suppressed_count) = LOG_SUPPERSSER.check() {
                 tracing::warn!(

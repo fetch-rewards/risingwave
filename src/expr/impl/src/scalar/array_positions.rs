@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 use risingwave_common::array::{I32Array, ListRef, ListValue};
 use risingwave_common::types::ScalarRefImpl;
-use risingwave_expr::{function, ExprError, Result};
+use risingwave_expr::{ExprError, Result, function};
 
 /// Returns the subscript of the first occurrence of the second argument in the array, or `NULL` if
 /// it's not present.
@@ -66,7 +66,10 @@ use risingwave_expr::{function, ExprError, Result};
 /// 2
 /// ```
 #[function("array_position(anyarray, any) -> int4")]
-fn array_position(array: ListRef<'_>, element: Option<ScalarRefImpl<'_>>) -> Result<Option<i32>> {
+pub(super) fn array_position(
+    array: ListRef<'_>,
+    element: Option<ScalarRefImpl<'_>>,
+) -> Result<Option<i32>> {
     array_position_common(array, element, 0)
 }
 
@@ -104,7 +107,7 @@ fn array_position_start(
             return Err(ExprError::InvalidParam {
                 name: "start",
                 reason: "initial position must not be null".into(),
-            })
+            });
         }
         Some(start) => (start.max(1) - 1) as usize,
     };

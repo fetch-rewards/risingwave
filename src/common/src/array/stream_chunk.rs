@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -89,9 +89,17 @@ impl Op {
             Op::UpdateDelete => 4,
         }
     }
-}
 
-pub type Ops<'a> = &'a [Op];
+    pub fn to_varchar(self) -> String {
+        match self {
+            Op::Insert => "Insert",
+            Op::Delete => "Delete",
+            Op::UpdateInsert => "UpdateInsert",
+            Op::UpdateDelete => "UpdateDelete",
+        }
+        .to_owned()
+    }
+}
 
 /// `StreamChunk` is used to pass data over the streaming pathway.
 #[derive(Clone, PartialEq)]
@@ -150,6 +158,10 @@ impl StreamChunk {
         }
 
         builder.take().expect("chunk should not be empty")
+    }
+
+    pub fn empty(data_types: &[DataType]) -> Self {
+        StreamChunkBuilder::build_empty(data_types.to_vec())
     }
 
     /// Get the reference of the underlying data chunk.
@@ -246,17 +258,17 @@ impl StreamChunk {
     }
 
     /// Returns a table-like text representation of the `StreamChunk`.
-    pub fn to_pretty(&self) -> impl Display {
+    pub fn to_pretty(&self) -> impl Display + use<> {
         self.to_pretty_inner(None)
     }
 
     /// Returns a table-like text representation of the `StreamChunk` with a header of column names
     /// from the given `schema`.
-    pub fn to_pretty_with_schema(&self, schema: &Schema) -> impl Display {
+    pub fn to_pretty_with_schema(&self, schema: &Schema) -> impl Display + use<> {
         self.to_pretty_inner(Some(schema))
     }
 
-    fn to_pretty_inner(&self, schema: Option<&Schema>) -> impl Display {
+    fn to_pretty_inner(&self, schema: Option<&Schema>) -> impl Display + use<> {
         use comfy_table::{Cell, CellAlignment, Table};
 
         if self.cardinality() == 0 {
@@ -350,6 +362,11 @@ impl StreamChunk {
             ops: self.ops.clone(),
             data: self.data.with_visibility(vis),
         }
+    }
+
+    // Compute the required permits of this chunk for rate limiting.
+    pub fn compute_rate_limit_chunk_permits(&self) -> u64 {
+        self.capacity() as _
     }
 }
 
@@ -586,8 +603,8 @@ impl StreamChunk {
     ///
     /// # Example
     /// ```
-    /// use risingwave_common::array::stream_chunk::StreamChunkTestExt as _;
     /// use risingwave_common::array::StreamChunk;
+    /// use risingwave_common::array::stream_chunk::StreamChunkTestExt as _;
     /// let chunk = StreamChunk::from_pretty(
     ///     "  I I I I      // type chars
     ///     U- 2 5 . .      // '.' means NULL
@@ -733,7 +750,7 @@ impl StreamChunk {
             let mut rng = SmallRng::from_seed([0; 32]);
             let mut ops = vec![];
             for _ in 0..chunk_size {
-                ops.push(if rng.gen_bool(inserts_percent) {
+                ops.push(if rng.random_bool(inserts_percent) {
                     Op::Insert
                 } else {
                     Op::Delete

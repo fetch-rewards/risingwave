@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,11 +19,11 @@ use std::sync::{Arc, LazyLock};
 use anyhow::anyhow;
 use futures_async_stream::try_stream;
 use futures_util::AsyncReadExt;
+use opendal::Operator;
 use opendal::layers::RetryLayer;
 use opendal::services::{Fs, Memory};
-use opendal::Operator;
-use prost::Message;
 use risingwave_common::array::DataChunk;
+use risingwave_pb::Message;
 use risingwave_pb::data::DataChunk as PbDataChunk;
 use thiserror_ext::AsReport;
 use tokio::sync::Mutex;
@@ -56,20 +56,18 @@ impl SpillOp {
         assert!(path.ends_with('/'));
 
         let spill_dir =
-            std::env::var(RW_BATCH_SPILL_DIR_ENV).unwrap_or_else(|_| DEFAULT_SPILL_DIR.to_string());
+            std::env::var(RW_BATCH_SPILL_DIR_ENV).unwrap_or_else(|_| DEFAULT_SPILL_DIR.to_owned());
         let root = format!("/{}/{}/{}/", spill_dir, RW_MANAGED_SPILL_DIR, path);
 
         let op = match spill_backend {
             SpillBackend::Disk => {
-                let mut builder = Fs::default();
-                builder.root(&root);
+                let builder = Fs::default().root(&root);
                 Operator::new(builder)?
                     .layer(RetryLayer::default())
                     .finish()
             }
             SpillBackend::Memory => {
-                let mut builder = Memory::default();
-                builder.root(&root);
+                let builder = Memory::default().root(&root);
                 Operator::new(builder)?
                     .layer(RetryLayer::default())
                     .finish()
@@ -83,11 +81,10 @@ impl SpillOp {
         let _guard = LOCK.lock().await;
 
         let spill_dir =
-            std::env::var(RW_BATCH_SPILL_DIR_ENV).unwrap_or_else(|_| DEFAULT_SPILL_DIR.to_string());
+            std::env::var(RW_BATCH_SPILL_DIR_ENV).unwrap_or_else(|_| DEFAULT_SPILL_DIR.to_owned());
         let root = format!("/{}/{}/", spill_dir, RW_MANAGED_SPILL_DIR);
 
-        let mut builder = Fs::default();
-        builder.root(&root);
+        let builder = Fs::default().root(&root);
 
         let op: Operator = Operator::new(builder)?
             .layer(RetryLayer::default())

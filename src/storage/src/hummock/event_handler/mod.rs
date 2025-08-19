@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,15 +15,16 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use itertools::Itertools;
 use parking_lot::{RwLock, RwLockReadGuard};
 use risingwave_common::bitmap::Bitmap;
 use risingwave_common::catalog::TableId;
-use risingwave_hummock_sdk::HummockEpoch;
+use risingwave_hummock_sdk::{HummockEpoch, HummockRawObjectId};
 use thiserror_ext::AsReport;
 use tokio::sync::oneshot;
 
-use crate::hummock::shared_buffer::shared_buffer_batch::{SharedBufferBatch, SharedBufferBatchId};
 use crate::hummock::HummockResult;
+use crate::hummock::shared_buffer::shared_buffer_batch::{SharedBufferBatch, SharedBufferBatchId};
 use crate::mem_table::ImmutableMemtable;
 use crate::store::SealCurrentEpochOptions;
 
@@ -32,6 +33,7 @@ pub mod refiller;
 pub mod uploader;
 
 pub use hummock_event_handler::HummockEventHandler;
+use risingwave_hummock_sdk::vector_index::VectorIndexAdd;
 use risingwave_hummock_sdk::version::{HummockVersion, HummockVersionDelta};
 
 use super::store::version::HummockReadVersion;
@@ -59,19 +61,18 @@ pub enum HummockEvent {
     /// task on this epoch. Previous concurrent flush task join handle will be returned by the join
     /// handle sender.
     SyncEpoch {
-        new_sync_epoch: HummockEpoch,
         sync_result_sender: oneshot::Sender<HummockResult<SyncedData>>,
-        table_ids: HashSet<TableId>,
+        sync_table_epochs: Vec<(HummockEpoch, HashSet<TableId>)>,
     },
 
     /// Clear shared buffer and reset all states
-    Clear(oneshot::Sender<()>, u64),
+    Clear(oneshot::Sender<()>, Option<HashSet<TableId>>),
 
     Shutdown,
 
     ImmToUploader {
         instance_id: SharedBufferBatchId,
-        imm: ImmutableMemtable,
+        imms: Vec<ImmutableMemtable>,
     },
 
     StartEpoch {
@@ -105,22 +106,42 @@ pub enum HummockEvent {
     DestroyReadVersion {
         instance_id: LocalInstanceId,
     },
+
+    RegisterVectorWriter {
+        table_id: TableId,
+        init_epoch: HummockEpoch,
+    },
+
+    VectorWriterSealEpoch {
+        table_id: TableId,
+        next_epoch: HummockEpoch,
+        add: Option<VectorIndexAdd>,
+    },
+
+    DropVectorWriter {
+        table_id: TableId,
+    },
+
+    GetMinUncommittedObjectId {
+        result_tx: oneshot::Sender<Option<HummockRawObjectId>>,
+    },
 }
 
 impl HummockEvent {
     fn to_debug_string(&self) -> String {
         match self {
-            HummockEvent::BufferMayFlush => "BufferMayFlush".to_string(),
+            HummockEvent::BufferMayFlush => "BufferMayFlush".to_owned(),
 
             HummockEvent::SyncEpoch {
-                new_sync_epoch,
                 sync_result_sender: _,
-                table_ids,
-            } => format!("AwaitSyncEpoch epoch {} {:?}", new_sync_epoch, table_ids),
+                sync_table_epochs,
+            } => format!("AwaitSyncEpoch epoch {:?}", sync_table_epochs),
 
-            HummockEvent::Clear(_, prev_epoch) => format!("Clear {:?}", prev_epoch),
+            HummockEvent::Clear(_, table_ids) => {
+                format!("Clear {:?}", table_ids)
+            }
 
-            HummockEvent::Shutdown => "Shutdown".to_string(),
+            HummockEvent::Shutdown => "Shutdown".to_owned(),
 
             HummockEvent::StartEpoch { epoch, table_ids } => {
                 format!("StartEpoch {} {:?}", epoch, table_ids)
@@ -133,8 +154,12 @@ impl HummockEvent {
                 format!("InitEpoch {} {}", instance_id, init_epoch)
             }
 
-            HummockEvent::ImmToUploader { instance_id, imm } => {
-                format!("ImmToUploader {} {}", instance_id, imm.batch_id())
+            HummockEvent::ImmToUploader { instance_id, imms } => {
+                format!(
+                    "ImmToUploader {} {:?}",
+                    instance_id,
+                    imms.iter().map(|imm| imm.batch_id()).collect_vec()
+                )
             }
 
             HummockEvent::LocalSealEpoch {
@@ -163,7 +188,13 @@ impl HummockEvent {
             }
 
             #[cfg(any(test, feature = "test"))]
-            HummockEvent::FlushEvent(_) => "FlushEvent".to_string(),
+            HummockEvent::FlushEvent(_) => "FlushEvent".to_owned(),
+            HummockEvent::GetMinUncommittedObjectId { .. } => {
+                "GetMinUncommittedObjectId".to_owned()
+            }
+            HummockEvent::RegisterVectorWriter { .. } => "RegisterVectorWriter".to_owned(),
+            HummockEvent::VectorWriterSealEpoch { .. } => "VectorWriterSealEpoch".to_owned(),
+            HummockEvent::DropVectorWriter { .. } => "DropVectorWriter".to_owned(),
         }
     }
 }

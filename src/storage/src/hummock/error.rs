@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ use thiserror_ext::AsReport;
 use tokio::sync::oneshot::error::RecvError;
 
 // TODO(error-handling): should prefer use error types than strings.
-#[derive(Error, thiserror_ext::ReportDebug, thiserror_ext::Box)]
+#[derive(Error, thiserror_ext::ReportDebug, thiserror_ext::Arc)]
 #[thiserror_ext(newtype(name = HummockError, backtrace))]
 pub enum HummockErrorInner {
     #[error("Magic number mismatch: expected {expected}, found: {found}")]
@@ -46,6 +46,8 @@ pub enum HummockErrorInner {
     SharedBufferError(String),
     #[error("Wait epoch error: {0}")]
     WaitEpoch(String),
+    #[error("Next epoch error: {0}")]
+    NextEpoch(String),
     #[error("Barrier read is unavailable for now. Likely the cluster is recovering")]
     ReadCurrentEpoch,
     #[error("Expired Epoch: watermark {safe_epoch}, epoch {epoch}")]
@@ -107,6 +109,10 @@ impl HummockError {
 
     pub fn wait_epoch(error: impl ToString) -> HummockError {
         HummockErrorInner::WaitEpoch(error.to_string()).into()
+    }
+
+    pub fn next_epoch(error: impl ToString) -> HummockError {
+        HummockErrorInner::NextEpoch(error.to_string()).into()
     }
 
     pub fn read_current_epoch() -> HummockError {

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ use std::sync::LazyLock;
 
 use base64::Engine;
 use itertools::Itertools;
-use num_bigint::{BigInt, Sign};
+use num_bigint::BigInt;
 use risingwave_common::array::{ListValue, StructValue};
 use risingwave_common::cast::{i64_to_timestamp, i64_to_timestamptz, str_to_bytea};
 use risingwave_common::log::LogSuppresser;
@@ -25,18 +25,17 @@ use risingwave_common::types::{
     DataType, Date, Decimal, Int256, Interval, JsonbVal, ScalarImpl, Time, Timestamp, Timestamptz,
     ToOwnedDatum,
 };
-use risingwave_common::util::iter_util::ZipEqFast;
-use risingwave_connector_codec::decoder::utils::extract_decimal;
+use risingwave_connector_codec::decoder::utils::scaled_bigint_to_rust_decimal;
+use simd_json::base::ValueAsObject;
 use simd_json::prelude::{
-    TypedValue, ValueAsContainer, ValueAsScalar, ValueObjectAccess, ValueTryAsScalar,
+    TypedValue, ValueAsArray, ValueAsScalar, ValueObjectAccess, ValueTryAsScalar,
 };
 use simd_json::{BorrowedValue, ValueType};
 use thiserror_ext::AsReport;
 
 use super::{Access, AccessError, AccessResult};
-use crate::parser::common::json_object_get_case_insensitive;
 use crate::parser::DatumCow;
-use crate::schema::{bail_invalid_option_error, InvalidOptionError};
+use crate::schema::{InvalidOptionError, bail_invalid_option_error};
 
 #[derive(Clone, Debug)]
 pub enum ByteaHandling {
@@ -88,6 +87,12 @@ impl TimestamptzHandling {
 }
 
 #[derive(Clone, Debug)]
+pub enum TimestampHandling {
+    Milli,
+    GuessNumberUnit,
+}
+
+#[derive(Clone, Debug)]
 pub enum JsonValueHandling {
     AsValue,
     AsString,
@@ -136,6 +141,7 @@ pub enum StructHandling {
 pub struct JsonParseOptions {
     pub bytea_handling: ByteaHandling,
     pub time_handling: TimeHandling,
+    pub timestamp_handling: TimestampHandling,
     pub timestamptz_handling: TimestamptzHandling,
     pub json_value_handling: JsonValueHandling,
     pub numeric_handling: NumericHandling,
@@ -155,6 +161,7 @@ impl JsonParseOptions {
     pub const CANAL: JsonParseOptions = JsonParseOptions {
         bytea_handling: ByteaHandling::Standard,
         time_handling: TimeHandling::Micro,
+        timestamp_handling: TimestampHandling::GuessNumberUnit, // backward-compatible
         timestamptz_handling: TimestamptzHandling::GuessNumberUnit, // backward-compatible
         json_value_handling: JsonValueHandling::AsValue,
         numeric_handling: NumericHandling::Relax {
@@ -171,6 +178,7 @@ impl JsonParseOptions {
     pub const DEFAULT: JsonParseOptions = JsonParseOptions {
         bytea_handling: ByteaHandling::Standard,
         time_handling: TimeHandling::Micro,
+        timestamp_handling: TimestampHandling::GuessNumberUnit, // backward-compatible
         timestamptz_handling: TimestamptzHandling::GuessNumberUnit, // backward-compatible
         json_value_handling: JsonValueHandling::AsValue,
         numeric_handling: NumericHandling::Relax {
@@ -182,10 +190,15 @@ impl JsonParseOptions {
         ignoring_keycase: true,
     };
 
-    pub fn new_for_debezium(timestamptz_handling: TimestamptzHandling) -> Self {
+    pub fn new_for_debezium(
+        timestamptz_handling: TimestamptzHandling,
+        timestamp_handling: TimestampHandling,
+        time_handling: TimeHandling,
+    ) -> Self {
         Self {
             bytea_handling: ByteaHandling::Base64,
-            time_handling: TimeHandling::Micro,
+            time_handling,
+            timestamp_handling,
             timestamptz_handling,
             json_value_handling: JsonValueHandling::AsString,
             numeric_handling: NumericHandling::Relax {
@@ -410,11 +423,8 @@ impl JsonParseOptions {
                     .as_str()
                     .unwrap()
                     .as_bytes();
-                let decimal = BigInt::from_signed_bytes_be(value);
-                let negative = decimal.sign() == Sign::Minus;
-                let (lo, mid, hi) = extract_decimal(decimal.to_bytes_be().1)?;
-                let decimal =
-                    rust_decimal::Decimal::from_parts(lo, mid, hi, negative, scale as u32);
+                let unscaled = BigInt::from_signed_bytes_be(value);
+                let decimal = scaled_bigint_to_rust_decimal(unscaled, scale as _)?;
                 ScalarImpl::Decimal(Decimal::Normalized(decimal))
             }
             // ---- Date -----
@@ -432,7 +442,7 @@ impl JsonParseOptions {
                 .into(),
             // ---- Varchar -----
             (DataType::Varchar, ValueType::String) => {
-                return Ok(DatumCow::Borrowed(Some(value.as_str().unwrap().into())))
+                return Ok(DatumCow::Borrowed(Some(value.as_str().unwrap().into())));
             }
             (
                 DataType::Varchar,
@@ -487,9 +497,18 @@ impl JsonParseOptions {
             (
                 DataType::Timestamp,
                 ValueType::I64 | ValueType::I128 | ValueType::U64 | ValueType::U128,
-            ) => i64_to_timestamp(value.as_i64().unwrap())
-                .map_err(|_| create_error())?
-                .into(),
+            ) => {
+                match self.timestamp_handling {
+                    // Only when user configures debezium.time.precision.mode = 'connect',
+                    // the Milli branch will be executed
+                    TimestampHandling::Milli => Timestamp::with_millis(value.as_i64().unwrap())
+                        .map_err(|_| create_error())?
+                        .into(),
+                    TimestampHandling::GuessNumberUnit => i64_to_timestamp(value.as_i64().unwrap())
+                        .map_err(|_| create_error())?
+                        .into(),
+                }
+            }
             // ---- Timestamptz -----
             (DataType::Timestamptz, ValueType::String) => match self.timestamptz_handling {
                 TimestamptzHandling::UtcWithoutSuffix => value
@@ -535,10 +554,7 @@ impl JsonParseOptions {
                 // Collecting into a Result<Vec<_>> doesn't reserve the capacity in advance, so we `Vec::with_capacity` instead.
                 // https://github.com/rust-lang/rust/issues/48994
                 let mut fields = Vec::with_capacity(struct_type_info.len());
-                for (field_name, field_type) in struct_type_info
-                    .names()
-                    .zip_eq_fast(struct_type_info.types())
-                {
+                for (field_name, field_type) in struct_type_info.iter() {
                     let field_value = json_object_get_case_insensitive(value, field_name)
                             .unwrap_or_else(|| {
                                 let error = AccessError::Undefined {
@@ -646,6 +662,7 @@ impl<'a> JsonAccess<'a> {
 impl Access for JsonAccess<'_> {
     fn access<'a>(&'a self, path: &[&str], type_expected: &DataType) -> AccessResult<DatumCow<'a>> {
         let mut value = &self.value;
+
         for (idx, &key) in path.iter().enumerate() {
             if let Some(sub_value) = if self.options.ignoring_keycase {
                 json_object_get_case_insensitive(value, key)
@@ -655,7 +672,7 @@ impl Access for JsonAccess<'_> {
                 value = sub_value;
             } else {
                 Err(AccessError::Undefined {
-                    name: key.to_string(),
+                    name: key.to_owned(),
                     path: path.iter().take(idx).join("."),
                 })?;
             }
@@ -663,4 +680,24 @@ impl Access for JsonAccess<'_> {
 
         self.options.parse(value, type_expected)
     }
+}
+
+/// Get a value from a json object by key, case insensitive.
+///
+/// Returns `None` if the given json value is not an object, or the key is not found.
+fn json_object_get_case_insensitive<'b>(
+    v: &'b simd_json::BorrowedValue<'b>,
+    key: &str,
+) -> Option<&'b simd_json::BorrowedValue<'b>> {
+    let obj = v.as_object()?;
+    let value = obj.get(key);
+    if value.is_some() {
+        return value; // fast path
+    }
+    for (k, v) in obj {
+        if k.eq_ignore_ascii_case(key) {
+            return Some(v);
+        }
+    }
+    None
 }

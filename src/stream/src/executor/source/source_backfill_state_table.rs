@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 use std::ops::Bound;
 
-use futures::{pin_mut, StreamExt};
+use futures::{StreamExt, pin_mut};
 use risingwave_common::row;
 use risingwave_common::row::{OwnedRow, Row};
 use risingwave_common::types::{ScalarImpl, ScalarRef, ScalarRefImpl};
@@ -23,13 +23,12 @@ use risingwave_connector::source::SplitId;
 use risingwave_pb::catalog::PbTable;
 use risingwave_storage::StateStore;
 
-use super::source_backfill_executor::{BackfillState, BackfillStates};
+use super::source_backfill_executor::{BackfillStateWithProgress, BackfillStates};
 use crate::common::table::state_table::StateTable;
-use crate::executor::error::StreamExecutorError;
 use crate::executor::StreamExecutorResult;
 
 pub struct BackfillStateTableHandler<S: StateStore> {
-    pub state_store: StateTable<S>,
+    state_store: StateTable<S>,
 }
 
 impl<S: StateStore> BackfillStateTableHandler<S> {
@@ -40,8 +39,8 @@ impl<S: StateStore> BackfillStateTableHandler<S> {
         }
     }
 
-    pub fn init_epoch(&mut self, epoch: EpochPair) {
-        self.state_store.init_epoch(epoch);
+    pub async fn init_epoch(&mut self, epoch: EpochPair) -> StreamExecutorResult<()> {
+        self.state_store.init_epoch(epoch).await
     }
 
     fn string_to_scalar(rhs: impl Into<String>) -> ScalarImpl {
@@ -52,11 +51,10 @@ impl<S: StateStore> BackfillStateTableHandler<S> {
         self.state_store
             .get_row(row::once(Some(Self::string_to_scalar(key.as_ref()))))
             .await
-            .map_err(StreamExecutorError::from)
     }
 
     /// XXX: we might get stale data for other actors' writes, but it's fine?
-    pub async fn scan(&self) -> StreamExecutorResult<Vec<BackfillState>> {
+    pub async fn scan_may_stale(&self) -> StreamExecutorResult<Vec<BackfillStateWithProgress>> {
         let sub_range: &(Bound<OwnedRow>, Bound<OwnedRow>) = &(Bound::Unbounded, Bound::Unbounded);
 
         let state_table_iter = self
@@ -70,16 +68,21 @@ impl<S: StateStore> BackfillStateTableHandler<S> {
             let row = item?.into_owned_row();
             let state = match row.datum_at(1) {
                 Some(ScalarRefImpl::Jsonb(jsonb_ref)) => {
-                    BackfillState::restore_from_json(jsonb_ref.to_owned_scalar())?
+                    BackfillStateWithProgress::restore_from_json(jsonb_ref.to_owned_scalar())?
                 }
                 _ => unreachable!(),
             };
             ret.push(state);
         }
+        tracing::trace!("scan SourceBackfill state table: {:?}", ret);
         Ok(ret)
     }
 
-    async fn set(&mut self, key: SplitId, state: BackfillState) -> StreamExecutorResult<()> {
+    async fn set(
+        &mut self,
+        key: SplitId,
+        state: BackfillStateWithProgress,
+    ) -> StreamExecutorResult<()> {
         let row = [
             Some(Self::string_to_scalar(key.as_ref())),
             Some(ScalarImpl::Jsonb(state.encode_to_json())),
@@ -122,16 +125,51 @@ impl<S: StateStore> BackfillStateTableHandler<S> {
         Ok(())
     }
 
-    pub async fn try_recover_from_state_store(
-        &mut self,
+    pub(super) fn state_store(&self) -> &StateTable<S> {
+        &self.state_store
+    }
+
+    pub(super) async fn commit(&mut self, epoch: EpochPair) -> StreamExecutorResult<()> {
+        self.state_store
+            .commit_assert_no_update_vnode_bitmap(epoch)
+            .await?;
+        Ok(())
+    }
+
+    /// When calling `try_recover_from_state_store`, we may read the state written by other source parallelisms in
+    /// the previous `epoch`. Therefore, we need to explicitly create a `BackfillStateTableCommittedReader` to do
+    /// `try_recover_from_state_store`. Before returning the reader, we will do `try_wait_committed_epoch` to ensure
+    /// that we are able to read all data committed in `epoch`.
+    ///
+    /// Note that, we need to ensure that the barrier of `epoch` must have been yielded before creating the committed reader,
+    /// and otherwise the `try_wait_committed_epoch` will block the barrier of `epoch`, and cause deadlock.
+    pub(super) async fn new_committed_reader(
+        &self,
+        epoch: EpochPair,
+    ) -> StreamExecutorResult<BackfillStateTableCommittedReader<'_, S>> {
+        self.state_store
+            .try_wait_committed_epoch(epoch.prev)
+            .await?;
+        Ok(BackfillStateTableCommittedReader { handle: self })
+    }
+}
+
+pub(super) struct BackfillStateTableCommittedReader<'a, S: StateStore> {
+    handle: &'a BackfillStateTableHandler<S>,
+}
+
+impl<S: StateStore> BackfillStateTableCommittedReader<'_, S> {
+    pub(super) async fn try_recover_from_state_store(
+        &self,
         split_id: &SplitId,
-    ) -> StreamExecutorResult<Option<BackfillState>> {
+    ) -> StreamExecutorResult<Option<BackfillStateWithProgress>> {
         Ok(self
+            .handle
             .get(split_id)
             .await?
             .map(|row| match row.datum_at(1) {
                 Some(ScalarRefImpl::Jsonb(jsonb_ref)) => {
-                    BackfillState::restore_from_json(jsonb_ref.to_owned_scalar())
+                    BackfillStateWithProgress::restore_from_json(jsonb_ref.to_owned_scalar())
                 }
                 _ => unreachable!(),
             })

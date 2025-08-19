@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ use risingwave_common::types::{DataType, ToText};
 
 use super::RowEncoder;
 
+/// Encode with [`ToText`]. Only used to encode key.
 pub struct TextEncoder {
     pub schema: Schema,
     // the column must contain only one element
@@ -54,7 +55,7 @@ impl RowEncoder for TextEncoder {
                 result = if let Some(scalar_impl) = datum {
                     scalar_impl.into_bool().to_string()
                 } else {
-                    "NULL".to_string()
+                    "NULL".to_owned()
                 }
             } else {
                 result = datum.to_text_with_type(data_type);

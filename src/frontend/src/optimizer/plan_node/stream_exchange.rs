@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,13 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::assert_matches::assert_matches;
+
 use pretty_xmlish::{Pretty, XmlNode};
 use risingwave_pb::stream_plan::stream_node::NodeBody;
-use risingwave_pb::stream_plan::{DispatchStrategy, DispatcherType, ExchangeNode};
+use risingwave_pb::stream_plan::{
+    DispatchStrategy, DispatcherType, ExchangeNode, PbDispatchOutputMapping,
+};
 
 use super::stream::prelude::*;
-use super::utils::{childless_record, plan_node_name, Distill};
-use super::{ExprRewritable, PlanBase, PlanRef, PlanTreeNodeUnary, StreamNode};
+use super::utils::{Distill, childless_record, plan_node_name};
+use super::{ExprRewritable, PlanBase, PlanTreeNodeUnary, StreamNode, StreamPlanRef as PlanRef};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::property::{
     Distribution, DistributionDisplay, MonotonicityMap, RequiredDist,
@@ -36,6 +40,12 @@ pub struct StreamExchange {
 
 impl StreamExchange {
     pub fn new(input: PlanRef, dist: Distribution) -> Self {
+        assert_matches!(
+            dist,
+            Distribution::HashShard(_) | Distribution::Single | Distribution::Broadcast,
+            "exchange can not be used to enforce such distribution"
+        );
+
         let columns_monotonicity = if input.distribution().satisfies(&RequiredDist::single()) {
             // If the input is a singleton, the monotonicity will be preserved during shuffle
             // since we use ordered channel/buffer when exchanging data.
@@ -43,13 +53,14 @@ impl StreamExchange {
         } else {
             MonotonicityMap::new()
         };
+        assert!(!input.schema().is_empty());
         let base = PlanBase::new_stream(
             input.ctx(),
             input.schema().clone(),
             input.stream_key().map(|v| v.to_vec()),
             input.functional_dependency().clone(),
             dist,
-            input.append_only(), // append-only property won't change
+            input.stream_kind(), // stream kind property won't change
             input.emit_on_window_close(),
             input.watermark_columns().clone(),
             columns_monotonicity,
@@ -69,7 +80,7 @@ impl StreamExchange {
             input.stream_key().map(|v| v.to_vec()),
             input.functional_dependency().clone(),
             input.distribution().clone(),
-            input.append_only(), // append-only property won't change
+            input.stream_kind(), // stream kind property won't change
             input.emit_on_window_close(),
             input.watermark_columns().clone(),
             input.columns_monotonicity().clone(),
@@ -102,7 +113,7 @@ impl Distill for StreamExchange {
     }
 }
 
-impl PlanTreeNodeUnary for StreamExchange {
+impl PlanTreeNodeUnary<Stream> for StreamExchange {
     fn input(&self) -> PlanRef {
         self.input.clone()
     }
@@ -115,16 +126,18 @@ impl PlanTreeNodeUnary for StreamExchange {
         }
     }
 }
-impl_plan_tree_node_for_unary! {StreamExchange}
+impl_plan_tree_node_for_unary! { Stream, StreamExchange}
 
 impl StreamNode for StreamExchange {
     fn to_stream_prost_body(&self, _state: &mut BuildFragmentGraphState) -> NodeBody {
-        NodeBody::Exchange(ExchangeNode {
+        let output_mapping = PbDispatchOutputMapping::identical(self.schema().len()).into();
+
+        NodeBody::Exchange(Box::new(ExchangeNode {
             strategy: if self.no_shuffle {
                 Some(DispatchStrategy {
                     r#type: DispatcherType::NoShuffle as i32,
                     dist_key_indices: vec![],
-                    output_indices: (0..self.schema().len() as u32).collect(),
+                    output_mapping,
                 })
             } else {
                 Some(DispatchStrategy {
@@ -140,13 +153,13 @@ impl StreamNode for StreamExchange {
                         }
                         _ => vec![],
                     },
-                    output_indices: (0..self.schema().len() as u32).collect(),
+                    output_mapping,
                 })
             },
-        })
+        }))
     }
 }
 
-impl ExprRewritable for StreamExchange {}
+impl ExprRewritable<Stream> for StreamExchange {}
 
 impl ExprVisitable for StreamExchange {}

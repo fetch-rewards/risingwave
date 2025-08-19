@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,6 +25,9 @@ use tonic::metadata::{MetadataMap, MetadataValue};
 /// The key of the metadata field that contains the serialized error.
 const ERROR_KEY: &str = "risingwave-error-bin";
 
+/// The key of the metadata field that contains the call name.
+pub const CALL_KEY: &str = "risingwave-grpc-call";
+
 /// The service name that the error is from. Used to provide better error message.
 // TODO: also make it a field of `Extra`?
 type ServiceName = Cow<'static, str>;
@@ -49,6 +52,9 @@ impl std::error::Error for ServerError {
     }
 
     fn provide<'a>(&'a self, request: &mut std::error::Request<'a>) {
+        // Provide self so that `ErrorIsFromTonicServerImpl` can work.
+        request.provide_ref(self);
+        // Provide extra fields.
         self.extra.provide(request);
     }
 }
@@ -104,11 +110,29 @@ where
     }
 }
 
+#[easy_ext::ext(ErrorIsFromTonicServerImpl)]
+impl<T> T
+where
+    T: ?Sized + std::error::Error,
+{
+    /// Returns whether the error is from the implementation of a tonic server, i.e., created
+    /// with [`ToTonicStatus::to_status`].
+    ///
+    /// This does not count errors initiated from the library, typically connection issues.
+    /// As a result, this function can be used to decide whether an error should be retried.
+    pub fn is_from_tonic_server_impl(&self) -> bool {
+        std::error::request_ref::<ServerError>(self).is_some()
+    }
+}
+
 /// A wrapper of [`tonic::Status`] that provides better error message and extracts
 /// the source chain from the `details` field.
 #[derive(Debug)]
 pub struct TonicStatusWrapper {
     inner: tonic::Status,
+
+    /// The call name (path) of the gRPC request.
+    call: Option<String>,
 
     /// Optional service name from the client side.
     ///
@@ -130,20 +154,27 @@ impl TonicStatusWrapper {
     /// Create a new [`TonicStatusWrapper`] from the given [`tonic::Status`] and extract
     /// the source chain from its `details` field.
     pub fn new(mut status: tonic::Status) -> Self {
-        if status.source().is_none() {
-            if let Some(value) = status.metadata().get_bin(ERROR_KEY) {
-                if let Some(e) = value.to_bytes().ok().and_then(|serialized| {
-                    bincode::deserialize::<ServerError>(serialized.as_ref()).ok()
-                }) {
-                    status.set_source(Arc::new(e));
-                } else {
-                    tracing::warn!("failed to deserialize error from gRPC metadata");
-                }
+        if status.source().is_none()
+            && let Some(value) = status.metadata().get_bin(ERROR_KEY)
+        {
+            if let Some(e) = value.to_bytes().ok().and_then(|serialized| {
+                bincode::deserialize::<ServerError>(serialized.as_ref()).ok()
+            }) {
+                status.set_source(Arc::new(e));
+            } else {
+                tracing::warn!("failed to deserialize error from gRPC metadata");
             }
         }
 
+        let call = status
+            .metadata()
+            .get(CALL_KEY)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+
         Self {
             inner: status,
+            call,
             client_side_service_name: None,
         }
     }
@@ -177,6 +208,9 @@ impl std::fmt::Display for TonicStatusWrapper {
             .or(self.client_side_service_name.as_ref())
         {
             write!(f, " to {} service", service_name)?;
+        }
+        if let Some(call) = &self.call {
+            write!(f, " (call `{}`)", call)?;
         }
         write!(f, " failed: {}: ", self.inner.code())?;
 
@@ -244,7 +278,7 @@ mod tests {
         };
 
         let server_status = original.to_status(tonic::Code::Internal, "test");
-        let body = server_status.to_http();
+        let body = server_status.into_http();
         let client_status = tonic::Status::from_header_map(body.headers()).unwrap();
 
         let wrapper = TonicStatusWrapper::new(client_status);

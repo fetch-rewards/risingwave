@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -76,4 +76,24 @@ macro_rules! impl_from_status {
     };
 }
 
-impl_from_status!(stream, batch, meta, compute, compactor, connector);
+impl_from_status!(stream, batch, meta, compute, compactor, connector, frontend);
+
+impl RpcError {
+    /// Returns `true` if the error is a connection error. Typically used to determine if
+    /// the error is transient and can be retried.
+    pub fn is_connection_error(&self) -> bool {
+        match self {
+            RpcError::TransportError(_) => true,
+            RpcError::GrpcStatus(status) => matches!(
+                status.inner().code(),
+                tonic::Code::Unavailable // server not started
+                 | tonic::Code::Unknown // could be transport error
+                 | tonic::Code::Unimplemented // meta leader service not started
+            ),
+            RpcError::MetaAddressParse(_) => false,
+            RpcError::Internal(anyhow) => anyhow
+                .downcast_ref::<Self>() // this skips all contexts attached to the error
+                .is_some_and(Self::is_connection_error),
+        }
+    }
+}

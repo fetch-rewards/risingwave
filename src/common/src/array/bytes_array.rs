@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,8 +16,8 @@ use std::iter;
 use std::mem::size_of;
 
 use risingwave_common_estimate_size::EstimateSize;
-use risingwave_pb::common::buffer::CompressionType;
 use risingwave_pb::common::Buffer;
+use risingwave_pb::common::buffer::CompressionType;
 use risingwave_pb::data::{ArrayType, PbArray};
 
 use super::{Array, ArrayBuilder, DataType};
@@ -38,9 +38,11 @@ impl Array for BytesArray {
     type RefItem<'a> = &'a [u8];
 
     unsafe fn raw_value_at_unchecked(&self, idx: usize) -> &[u8] {
-        let begin = *self.offset.get_unchecked(idx) as usize;
-        let end = *self.offset.get_unchecked(idx + 1) as usize;
-        self.data.get_unchecked(begin..end)
+        unsafe {
+            let begin = *self.offset.get_unchecked(idx) as usize;
+            let end = *self.offset.get_unchecked(idx + 1) as usize;
+            self.data.get_unchecked(begin..end)
+        }
     }
 
     fn len(&self) -> usize {
@@ -271,7 +273,7 @@ pub struct PartialBytesWriter<'a> {
     builder: &'a mut BytesArrayBuilder,
 }
 
-impl<'a> PartialBytesWriter<'a> {
+impl PartialBytesWriter<'_> {
     /// `write_ref` will append partial dirty data to `builder`.
     /// `PartialBytesWriter::write_ref` is different from `BytesWriter::write_ref`
     /// in that it allows us to call it multiple times.
@@ -287,7 +289,7 @@ impl<'a> PartialBytesWriter<'a> {
     }
 }
 
-impl<'a> Drop for PartialBytesWriter<'a> {
+impl Drop for PartialBytesWriter<'_> {
     fn drop(&mut self) {
         // If `finish` is not called, we should rollback the data.
         self.builder.rollback_partial();

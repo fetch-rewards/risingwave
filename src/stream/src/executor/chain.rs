@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::executor::prelude::*;
-use crate::task::CreateMviewProgress;
+use crate::task::CreateMviewProgressReporter;
 
 /// [`ChainExecutor`] is an executor that enables synchronization between the existing stream and
 /// newly appended executors. Currently, [`ChainExecutor`] is mainly used to implement MV on MV
@@ -24,7 +24,7 @@ pub struct ChainExecutor {
 
     upstream: Executor,
 
-    progress: CreateMviewProgress,
+    progress: CreateMviewProgressReporter,
 
     actor_id: ActorId,
 
@@ -36,7 +36,7 @@ impl ChainExecutor {
     pub fn new(
         snapshot: Executor,
         upstream: Executor,
-        progress: CreateMviewProgress,
+        progress: CreateMviewProgressReporter,
         upstream_only: bool,
     ) -> Self {
         Self {
@@ -105,8 +105,8 @@ impl Execute for ChainExecutor {
 mod test {
 
     use futures::StreamExt;
-    use risingwave_common::array::stream_chunk::StreamChunkTestExt;
     use risingwave_common::array::StreamChunk;
+    use risingwave_common::array::stream_chunk::StreamChunkTestExt;
     use risingwave_common::catalog::{Field, Schema};
     use risingwave_common::types::DataType;
     use risingwave_common::util::epoch::test_epoch;
@@ -115,12 +115,14 @@ mod test {
     use super::ChainExecutor;
     use crate::executor::test_utils::MockSource;
     use crate::executor::{AddMutation, Barrier, Execute, Message, Mutation, PkIndices};
-    use crate::task::{CreateMviewProgress, LocalBarrierManager};
+    use crate::task::CreateMviewProgressReporter;
+    use crate::task::barrier_test_utils::LocalBarrierTestEnv;
 
     #[tokio::test]
     async fn test_basic() {
-        let barrier_manager = LocalBarrierManager::for_test();
-        let progress = CreateMviewProgress::for_test(barrier_manager);
+        let test_env = LocalBarrierTestEnv::for_test().await;
+        let barrier_manager = test_env.local_barrier_manager.clone();
+        let progress = CreateMviewProgressReporter::for_test(barrier_manager);
         let actor_id = progress.actor_id();
 
         let schema = Schema::new(vec![Field::unnamed(DataType::Int64)]);
@@ -143,6 +145,9 @@ mod test {
                     added_actors: maplit::hashset! { actor_id },
                     splits: Default::default(),
                     pause: false,
+                    subscriptions_to_add: vec![],
+                    backfill_nodes_to_pause: Default::default(),
+                    actor_cdc_table_snapshot_splits: Default::default(),
                 }),
             )),
             Message::Chunk(StreamChunk::from_pretty("I\n + 3")),

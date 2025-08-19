@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,16 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::env;
-use std::path::Path;
 use std::process::Command;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use itertools::Itertools;
 
 use super::{ExecuteContext, Task};
 use crate::util::{get_program_args, get_program_env_cmd, get_program_name};
-use crate::{add_tempo_endpoint, FrontendConfig};
+use crate::{FrontendConfig, add_tempo_endpoint};
 
 pub struct FrontendService {
     config: FrontendConfig,
@@ -30,16 +28,6 @@ pub struct FrontendService {
 impl FrontendService {
     pub fn new(config: FrontendConfig) -> Result<Self> {
         Ok(Self { config })
-    }
-
-    fn frontend(&self) -> Result<Command> {
-        let prefix_bin = env::var("PREFIX_BIN")?;
-
-        Ok(Command::new(
-            Path::new(&prefix_bin)
-                .join("risingwave")
-                .join("frontend-node"),
-        ))
     }
 
     /// Apply command args according to config
@@ -85,15 +73,8 @@ impl Task for FrontendService {
         ctx.service(self);
         ctx.pb.set_message("starting...");
 
-        let mut cmd = self.frontend()?;
+        let mut cmd = ctx.risingwave_cmd("frontend-node")?;
 
-        if crate::util::is_enable_backtrace() {
-            cmd.env("RUST_BACKTRACE", "1");
-        }
-
-        let prefix_config = env::var("PREFIX_CONFIG")?;
-        cmd.arg("--config-path")
-            .arg(Path::new(&prefix_config).join("risingwave.toml"));
         Self::apply_command_args(&mut cmd, &self.config)?;
 
         if !self.config.user_managed {

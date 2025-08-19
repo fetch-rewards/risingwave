@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,16 +16,16 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
-use foyer::HybridCacheBuilder;
+use anyhow::{Result, anyhow, bail};
+use foyer::{CacheBuilder, Engine, HybridCacheBuilder, LargeEngineOptions};
 use risingwave_common::config::{MetricLevel, ObjectStoreConfig};
 use risingwave_object_store::object::build_remote_object_store;
 use risingwave_rpc_client::MetaClient;
 use risingwave_storage::hummock::hummock_meta_client::MonitoredHummockMetaClient;
 use risingwave_storage::hummock::{HummockStorage, SstableStore, SstableStoreConfig};
 use risingwave_storage::monitor::{
-    global_hummock_state_store_metrics, CompactorMetrics, HummockMetrics, HummockStateStoreMetrics,
-    MonitoredStateStore, MonitoredStorageMetrics, ObjectStoreMetrics,
+    CompactorMetrics, HummockMetrics, HummockStateStoreMetrics, MonitoredStateStore,
+    MonitoredStorageMetrics, ObjectStoreMetrics, global_hummock_state_store_metrics,
 };
 use risingwave_storage::opts::StorageOpts;
 use risingwave_storage::{StateStore, StateStoreImpl};
@@ -79,8 +79,8 @@ impl HummockServiceOpts {
                     - or directly use `./risedev d for-ctl` to start the cluster.
                     * use `./risedev ctl` to use risectl.
 
-                    For `./risedev apply-compose-deploy` users,
-                    * `RW_HUMMOCK_URL` will be printed out when deploying. Please copy the bash exports to your console.
+                    For production use cases,
+                    * please set `RW_HUMMOCK_URL` to the same address specified for the meta node.
                 ";
                 bail!(MESSAGE);
             }
@@ -116,11 +116,8 @@ impl HummockServiceOpts {
         &mut self,
         meta_client: &MetaClient,
     ) -> Result<(MonitoredStateStore<HummockStorage>, Metrics)> {
-        let (heartbeat_handle, heartbeat_shutdown_sender) = MetaClient::start_heartbeat_loop(
-            meta_client.clone(),
-            Duration::from_millis(1000),
-            vec![],
-        );
+        let (heartbeat_handle, heartbeat_shutdown_sender) =
+            MetaClient::start_heartbeat_loop(meta_client.clone(), Duration::from_millis(1000));
         self.heartbeat_handle = Some(heartbeat_handle);
         self.heartbeat_shutdown_sender = Some(heartbeat_shutdown_sender);
 
@@ -182,13 +179,13 @@ impl HummockServiceOpts {
         let meta_cache = HybridCacheBuilder::new()
             .memory(opts.meta_cache_capacity_mb * (1 << 20))
             .with_shards(opts.meta_cache_shard_num)
-            .storage()
+            .storage(Engine::Large(LargeEngineOptions::new()))
             .build()
             .await?;
         let block_cache = HybridCacheBuilder::new()
             .memory(opts.block_cache_capacity_mb * (1 << 20))
             .with_shards(opts.block_cache_shard_num)
-            .storage()
+            .storage(Engine::Large(LargeEngineOptions::new()))
             .build()
             .await?;
 
@@ -204,6 +201,8 @@ impl HummockServiceOpts {
             use_new_object_prefix_strategy,
             meta_cache,
             block_cache,
+            vector_meta_cache: CacheBuilder::new(1 << 10).build(),
+            vector_block_cache: CacheBuilder::new(1 << 10).build(),
         })))
     }
 }

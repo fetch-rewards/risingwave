@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
 
 //! Local execution for batch query.
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -41,7 +41,7 @@ use risingwave_pb::batch_plan::{
     ExchangeInfo, ExchangeSource, LocalExecutePlan, PbTaskId, PlanFragment, PlanNode as PbPlanNode,
     TaskOutputId,
 };
-use risingwave_pb::common::WorkerNode;
+use risingwave_pb::common::{BatchQueryEpoch, WorkerNode};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
@@ -49,46 +49,39 @@ use tracing::debug;
 use super::plan_fragmenter::{PartitionInfo, QueryStage, QueryStageRef};
 use crate::catalog::{FragmentId, TableId};
 use crate::error::RwError;
-use crate::optimizer::plan_node::PlanNodeType;
+use crate::optimizer::plan_node::BatchPlanNodeType;
 use crate::scheduler::plan_fragmenter::{ExecutionPlanNode, Query, StageId};
 use crate::scheduler::task_context::FrontendBatchTaskContext;
-use crate::scheduler::{ReadSnapshot, SchedulerError, SchedulerResult};
+use crate::scheduler::{SchedulerError, SchedulerResult};
 use crate::session::{FrontendEnv, SessionImpl};
 
 // TODO(error-handling): use a concrete error type.
 pub type LocalQueryStream = ReceiverStream<Result<DataChunk, BoxedError>>;
 pub struct LocalQueryExecution {
-    sql: String,
     query: Query,
     front_env: FrontendEnv,
-    // The snapshot will be released when LocalQueryExecution is dropped.
-    // TODO
-    snapshot: ReadSnapshot,
+    batch_query_epoch: BatchQueryEpoch,
     session: Arc<SessionImpl>,
     worker_node_manager: WorkerNodeSelector,
     timeout: Option<Duration>,
 }
 
 impl LocalQueryExecution {
-    pub fn new<S: Into<String>>(
+    pub fn new(
         query: Query,
         front_env: FrontendEnv,
-        sql: S,
-        snapshot: ReadSnapshot,
+        support_barrier_read: bool,
+        batch_query_epoch: BatchQueryEpoch,
         session: Arc<SessionImpl>,
         timeout: Option<Duration>,
     ) -> Self {
-        let sql = sql.into();
-        let worker_node_manager = WorkerNodeSelector::new(
-            front_env.worker_node_manager_ref(),
-            snapshot.support_barrier_read(),
-        );
+        let worker_node_manager =
+            WorkerNodeSelector::new(front_env.worker_node_manager_ref(), support_barrier_read);
 
         Self {
-            sql,
             query,
             front_env,
-            snapshot,
+            batch_query_epoch,
             session,
             worker_node_manager,
             timeout,
@@ -101,10 +94,11 @@ impl LocalQueryExecution {
 
     #[try_stream(ok = DataChunk, error = RwError)]
     pub async fn run_inner(self) {
-        debug!(%self.query.query_id, self.sql, "Starting to run query");
-
-        let context = FrontendBatchTaskContext::new(self.session.clone());
-
+        debug!(
+            query_id = %self.query.query_id,
+            "Starting to run query"
+        );
+        let context = FrontendBatchTaskContext::create(self.session.clone());
         let task_id = TaskId {
             query_id: self.query.query_id.id.clone(),
             stage_id: 0,
@@ -118,10 +112,14 @@ impl LocalQueryExecution {
             &plan_node,
             &task_id,
             context,
-            self.snapshot.batch_query_epoch(),
+            self.batch_query_epoch,
             self.shutdown_rx().clone(),
         );
         let executor = executor.build().await?;
+        // The following loop can be slow.
+        // Release potential large object in Query and PlanNode early.
+        drop(plan_node);
+        drop(self);
 
         #[for_await]
         for chunk in executor.execute() {
@@ -133,7 +131,7 @@ impl LocalQueryExecution {
         let span = tracing::info_span!(
             "local_execute",
             query_id = self.query.query_id.id,
-            epoch = ?self.snapshot.batch_query_epoch(),
+            epoch = ?self.batch_query_epoch,
         );
         Box::pin(self.run_inner().instrument(span))
     }
@@ -146,9 +144,10 @@ impl LocalQueryExecution {
         let catalog_reader = self.front_env.catalog_reader().clone();
         let user_info_reader = self.front_env.user_info_reader().clone();
         let auth_context = self.session.auth_context().clone();
-        let db_name = self.session.database().to_string();
+        let db_name = self.session.database();
         let search_path = self.session.config().search_path();
         let time_zone = self.session.config().timezone();
+        let strict_mode = self.session.config().batch_expr_strict_mode();
         let timeout = self.timeout;
         let meta_client = self.front_env.meta_client_ref();
 
@@ -159,7 +158,7 @@ impl LocalQueryExecution {
                 // append a query cancelled error if the query is cancelled.
                 if r.is_err() && shutdown_rx.is_cancelled() {
                     r = Err(Box::new(SchedulerError::QueryCancelled(
-                        "Cancelled by user".to_string(),
+                        "Cancelled by user".to_owned(),
                     )) as BoxedError);
                 }
                 if sender1.send(r).await.is_err() {
@@ -169,7 +168,7 @@ impl LocalQueryExecution {
             }
         };
 
-        use risingwave_expr::expr_context::TIME_ZONE;
+        use risingwave_expr::expr_context::*;
 
         use crate::expr::function_impl::context::{
             AUTH_CONTEXT, CATALOG_READER, DB_NAME, META_CLIENT, SEARCH_PATH, USER_INFO_READER,
@@ -182,6 +181,7 @@ impl LocalQueryExecution {
         let exec = async move { SEARCH_PATH::scope(search_path, exec).await }.boxed();
         let exec = async move { AUTH_CONTEXT::scope(auth_context, exec).await }.boxed();
         let exec = async move { TIME_ZONE::scope(time_zone, exec).await }.boxed();
+        let exec = async move { STRICT_MODE::scope(strict_mode, exec).await }.boxed();
         let exec = async move { META_CLIENT::scope(meta_client, exec).await }.boxed();
 
         if let Some(timeout) = timeout {
@@ -283,12 +283,14 @@ impl LocalQueryExecution {
             next_executor_id.fetch_add(1, Ordering::Relaxed)
         );
         match execution_plan_node.plan_node_type {
-            PlanNodeType::BatchExchange => {
+            BatchPlanNodeType::BatchExchange => {
                 let exchange_source_stage_id = execution_plan_node
                     .source_stage_id
                     .expect("We expect stage id for Exchange Operator");
                 let Some(second_stages) = second_stages.as_mut() else {
-                    bail!("Unexpected exchange detected. We are either converting a single stage plan or converting the second stage of the plan.")
+                    bail!(
+                        "Unexpected exchange detected. We are either converting a single stage plan or converting the second stage of the plan."
+                    )
                 };
                 let second_stage = second_stages.remove(&exchange_source_stage_id).expect(
                     "We expect child stage fragment for Exchange Operator running in the frontend",
@@ -339,7 +341,7 @@ impl LocalQueryExecution {
                         };
                         let local_execute_plan = LocalExecutePlan {
                             plan: Some(second_stage_plan_fragment),
-                            epoch: Some(self.snapshot.batch_query_epoch()),
+                            epoch: Some(self.batch_query_epoch),
                             tracing_context: tracing_context.clone(),
                         };
                         let exchange_source = ExchangeSource {
@@ -383,7 +385,7 @@ impl LocalQueryExecution {
                         };
                         let local_execute_plan = LocalExecutePlan {
                             plan: Some(second_stage_plan_fragment),
-                            epoch: Some(self.snapshot.batch_query_epoch()),
+                            epoch: Some(self.batch_query_epoch),
                             tracing_context: tracing_context.clone(),
                         };
                         // NOTE: select a random work node here.
@@ -422,7 +424,7 @@ impl LocalQueryExecution {
                         };
                         let local_execute_plan = LocalExecutePlan {
                             plan: Some(second_stage_plan_fragment),
-                            epoch: Some(self.snapshot.batch_query_epoch()),
+                            epoch: Some(self.batch_query_epoch),
                             tracing_context: tracing_context.clone(),
                         };
                         // NOTE: select a random work node here.
@@ -458,7 +460,7 @@ impl LocalQueryExecution {
 
                     let local_execute_plan = LocalExecutePlan {
                         plan: Some(second_stage_plan_fragment),
-                        epoch: Some(self.snapshot.batch_query_epoch()),
+                        epoch: Some(self.batch_query_epoch),
                         tracing_context,
                     };
 
@@ -466,20 +468,17 @@ impl LocalQueryExecution {
                     *sources = workers
                         .iter()
                         .enumerate()
-                        .map(|(idx, worker_node)| {
-                            let exchange_source = ExchangeSource {
-                                task_output_id: Some(TaskOutputId {
-                                    task_id: Some(PbTaskId {
-                                        task_id: idx as u64,
-                                        stage_id: exchange_source_stage_id,
-                                        query_id: self.query.query_id.id.clone(),
-                                    }),
-                                    output_id: 0,
+                        .map(|(idx, worker_node)| ExchangeSource {
+                            task_output_id: Some(TaskOutputId {
+                                task_id: Some(PbTaskId {
+                                    task_id: idx as u64,
+                                    stage_id: exchange_source_stage_id,
+                                    query_id: self.query.query_id.id.clone(),
                                 }),
-                                host: Some(worker_node.host.as_ref().unwrap().clone()),
-                                local_execute_plan: Some(Plan(local_execute_plan.clone())),
-                            };
-                            exchange_source
+                                output_id: 0,
+                            }),
+                            host: Some(worker_node.host.as_ref().unwrap().clone()),
+                            local_execute_plan: Some(Plan(local_execute_plan.clone())),
                         })
                         .collect();
                 }
@@ -492,15 +491,15 @@ impl LocalQueryExecution {
                     node_body: Some(node_body),
                 })
             }
-            PlanNodeType::BatchSeqScan => {
+            BatchPlanNodeType::BatchSeqScan => {
                 let mut node_body = execution_plan_node.node.clone();
                 match &mut node_body {
-                    NodeBody::RowSeqScan(ref mut scan_node) => {
+                    NodeBody::RowSeqScan(scan_node) => {
                         if let Some(partition) = partition {
                             let partition = partition
                                 .into_table()
                                 .expect("PartitionInfo should be TablePartitionInfo here");
-                            scan_node.vnode_bitmap = Some(partition.vnode_bitmap);
+                            scan_node.vnode_bitmap = Some(partition.vnode_bitmap.to_protobuf());
                             scan_node.scan_ranges = partition.scan_ranges;
                         }
                     }
@@ -514,15 +513,15 @@ impl LocalQueryExecution {
                     node_body: Some(node_body),
                 })
             }
-            PlanNodeType::BatchLogSeqScan => {
+            BatchPlanNodeType::BatchLogSeqScan => {
                 let mut node_body = execution_plan_node.node.clone();
                 match &mut node_body {
-                    NodeBody::LogRowSeqScan(ref mut scan_node) => {
+                    NodeBody::LogRowSeqScan(scan_node) => {
                         if let Some(partition) = partition {
                             let partition = partition
                                 .into_table()
                                 .expect("PartitionInfo should be TablePartitionInfo here");
-                            scan_node.vnode_bitmap = Some(partition.vnode_bitmap);
+                            scan_node.vnode_bitmap = Some(partition.vnode_bitmap.to_protobuf());
                         }
                     }
                     _ => unreachable!(),
@@ -534,10 +533,10 @@ impl LocalQueryExecution {
                     node_body: Some(node_body),
                 })
             }
-            PlanNodeType::BatchFileScan => {
+            BatchPlanNodeType::BatchFileScan => {
                 let mut node_body = execution_plan_node.node.clone();
                 match &mut node_body {
-                    NodeBody::FileScan(ref mut file_scan_node) => {
+                    NodeBody::FileScan(file_scan_node) => {
                         if let Some(partition) = partition {
                             let partition = partition
                                 .into_file()
@@ -554,12 +553,10 @@ impl LocalQueryExecution {
                     node_body: Some(node_body),
                 })
             }
-            PlanNodeType::BatchSource
-            | PlanNodeType::BatchKafkaScan
-            | PlanNodeType::BatchIcebergScan => {
+            BatchPlanNodeType::BatchSource | BatchPlanNodeType::BatchKafkaScan => {
                 let mut node_body = execution_plan_node.node.clone();
                 match &mut node_body {
-                    NodeBody::Source(ref mut source_node) => {
+                    NodeBody::Source(source_node) => {
                         if let Some(partition) = partition {
                             let partition = partition
                                 .into_source()
@@ -579,7 +576,30 @@ impl LocalQueryExecution {
                     node_body: Some(node_body),
                 })
             }
-            PlanNodeType::BatchLookupJoin => {
+            BatchPlanNodeType::BatchIcebergScan => {
+                let mut node_body = execution_plan_node.node.clone();
+                match &mut node_body {
+                    NodeBody::IcebergScan(iceberg_scan_node) => {
+                        if let Some(partition) = partition {
+                            let partition = partition
+                                .into_source()
+                                .expect("PartitionInfo should be SourcePartitionInfo here");
+                            iceberg_scan_node.split = partition
+                                .into_iter()
+                                .map(|split| split.encode_to_bytes().into())
+                                .collect_vec();
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+
+                Ok(PbPlanNode {
+                    children: vec![],
+                    identity,
+                    node_body: Some(node_body),
+                })
+            }
+            BatchPlanNodeType::BatchLookupJoin => {
                 let mut node_body = execution_plan_node.node.clone();
                 match &mut node_body {
                     NodeBody::LocalLookupJoin(node) => {
@@ -594,7 +614,7 @@ impl LocalQueryExecution {
                         // TODO: should we use `pb::WorkerSlotMapping` here?
                         node.inner_side_vnode_mapping =
                             mapping.to_expanded().into_iter().map(u64::from).collect();
-                        node.worker_nodes = self.worker_node_manager.manager.list_worker_nodes();
+                        node.worker_nodes = self.worker_node_manager.manager.list_compute_nodes();
                     }
                     _ => unreachable!(),
                 }

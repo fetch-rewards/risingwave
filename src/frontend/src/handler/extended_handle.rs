@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ use risingwave_common::types::DataType;
 use risingwave_sqlparser::ast::{CreateSink, Query, Statement};
 
 use super::query::BoundResult;
-use super::{handle, query, HandlerArgs, RwPgResponse};
+use super::{HandlerArgs, RwPgResponse, fetch_cursor, handle, query};
 use crate::error::Result;
 use crate::session::SessionImpl;
 
@@ -94,7 +94,7 @@ impl std::fmt::Display for PortalResult {
     }
 }
 
-pub fn handle_parse(
+pub async fn handle_parse(
     session: Arc<SessionImpl>,
     statement: Statement,
     specific_param_types: Vec<Option<DataType>>,
@@ -107,6 +107,12 @@ pub fn handle_parse(
         | Statement::Insert { .. }
         | Statement::Delete { .. }
         | Statement::Update { .. } => {
+            query::handle_parse(handler_args, statement, specific_param_types)
+        }
+        Statement::FetchCursor { .. } => {
+            fetch_cursor::handle_parse(handler_args, statement, specific_param_types).await
+        }
+        Statement::DeclareCursor { .. } => {
             query::handle_parse(handler_args, statement, specific_param_types)
         }
         Statement::CreateView {
@@ -163,6 +169,7 @@ pub fn handle_bind(
                 bound,
                 param_types,
                 dependent_relations,
+                dependent_udfs,
                 ..
             } = bound_result;
 
@@ -173,6 +180,7 @@ pub fn handle_bind(
                 param_types,
                 parsed_params: Some(parsed_params),
                 dependent_relations,
+                dependent_udfs,
                 bound: new_bound,
             };
             Ok(Portal::Portal(PortalResult {
@@ -198,8 +206,11 @@ pub async fn handle_execute(session: Arc<SessionImpl>, portal: Portal) -> Result
             let _guard = session.txn_begin_implicit(); // TODO(bugen): is this behavior correct?
             let sql: Arc<str> = Arc::from(portal.statement.to_string());
             let handler_args = HandlerArgs::new(session, &portal.statement, sql)?;
-
-            query::handle_execute(handler_args, portal).await
+            if let Statement::FetchCursor { .. } = &portal.statement {
+                fetch_cursor::handle_fetch_cursor_execute(handler_args, portal).await
+            } else {
+                query::handle_execute(handler_args, portal).await
+            }
         }
         Portal::PureStatement(stmt) => {
             let sql: Arc<str> = Arc::from(stmt.to_string());

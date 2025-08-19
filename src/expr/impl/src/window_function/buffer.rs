@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@ pub(super) struct WindowBuffer<W: WindowImpl> {
     buffer: VecDeque<Entry<W::Key, W::Value>>,
     curr_idx: usize,
     left_idx: usize,       // inclusive, note this can be > `curr_idx`
-    right_excl_idx: usize, // exclusive, note this can be <= `curr_idx`
+    right_excl_idx: usize, // exclusive, note this can be <= `curr_idx` and even <= `left_idx`
     curr_delta: Option<Vec<(Op, W::Value)>>,
 }
 
@@ -103,7 +103,7 @@ impl<W: WindowImpl> WindowBuffer<W> {
     }
 
     fn curr_window_outer(&self) -> Range<usize> {
-        self.left_idx..self.right_excl_idx
+        self.left_idx..std::cmp::max(self.right_excl_idx, self.left_idx)
     }
 
     fn curr_window_exclusion(&self) -> Range<usize> {
@@ -121,8 +121,8 @@ impl<W: WindowImpl> WindowBuffer<W> {
     }
 
     /// Iterate over values in the current window.
-    pub fn curr_window_values(&self) -> impl Iterator<Item = &W::Value> {
-        assert!(self.left_idx <= self.right_excl_idx);
+    pub fn curr_window_values(&self) -> impl DoubleEndedIterator<Item = &W::Value> {
+        assert!(self.left_idx <= self.buffer.len()); // `left_idx` can be the same as `buffer.len()` when the buffer is empty
         assert!(self.right_excl_idx <= self.buffer.len());
 
         let (left, right) = self.curr_window_ranges();
@@ -167,7 +167,11 @@ impl<W: WindowImpl> WindowBuffer<W> {
             self.maintain_delta(old_outer, self.curr_window_outer());
         }
 
-        let min_needed_idx = std::cmp::min(self.left_idx, self.curr_idx);
+        let min_needed_idx = [self.left_idx, self.curr_idx, self.right_excl_idx]
+            .iter()
+            .min()
+            .copied()
+            .unwrap();
         self.curr_idx -= min_needed_idx;
         self.left_idx -= min_needed_idx;
         self.right_excl_idx -= min_needed_idx;
@@ -518,9 +522,7 @@ impl<V: Clone> WindowImpl for SessionWindow<V> {
             // same session. Otherwise, we can safely say it's saturated.
             self.latest_session
                 .as_ref()
-                .map_or(false, |LatestSession { start_idx, .. }| {
-                    window.left_idx < *start_idx
-                })
+                .is_some_and(|LatestSession { start_idx, .. }| window.left_idx < *start_idx)
         }
     }
 
@@ -557,9 +559,9 @@ impl<V: Clone> WindowImpl for SessionWindow<V> {
                 )
                 .expect("no reason to fail here");
 
-                if let Some(LatestSession {
+                if let Some(&mut LatestSession {
                     ref start_idx,
-                    minimal_next_start,
+                    ref mut minimal_next_start,
                 }) = self.latest_session.as_mut()
                 {
                     if &appended_key.order_key >= minimal_next_start {
@@ -934,11 +936,13 @@ mod tests {
         );
 
         buffer.append(1, "hello");
-        assert!(buffer
-            .curr_window_values()
-            .cloned()
-            .collect_vec()
-            .is_empty());
+        assert!(
+            buffer
+                .curr_window_values()
+                .cloned()
+                .collect_vec()
+                .is_empty()
+        );
         buffer.append(2, "world");
         let _ = buffer.slide();
         assert_eq!(
@@ -970,7 +974,7 @@ mod tests {
 
         let key = |key: i64| -> StateKey {
             StateKey {
-                order_key: memcmp_encoding::encode_value(&Some(ScalarImpl::from(key)), order_type)
+                order_key: memcmp_encoding::encode_value(Some(ScalarImpl::from(key)), order_type)
                     .unwrap(),
                 pk: OwnedRow::empty().into(),
             }
@@ -1050,10 +1054,12 @@ mod tests {
         let removed_keys = buffer.slide().map(|(k, _)| k).collect_vec();
         assert_eq!(removed_keys, vec![key(15), key(16)]);
         assert!(buffer.curr_key().is_none());
-        assert!(buffer
-            .curr_window_values()
-            .cloned()
-            .collect_vec()
-            .is_empty());
+        assert!(
+            buffer
+                .curr_window_values()
+                .cloned()
+                .collect_vec()
+                .is_empty()
+        );
     }
 }

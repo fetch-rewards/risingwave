@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,9 +17,9 @@ use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
 use parking_lot::Mutex;
+use prometheus::Registry;
 use prometheus::core::{Collector, Desc};
 use prometheus::proto::{Gauge, LabelPair, Metric, MetricFamily};
-use prometheus::Registry;
 use rw_iter_util::ZipEqFast;
 
 use crate::monitor::GLOBAL_METRICS_REGISTRY;
@@ -67,13 +67,13 @@ impl<const N: usize> ErrorMetric<N> {
             }
 
             let mut metric = Metric::new();
-            metric.set_label(label_pairs.into());
+            metric.set_label(label_pairs);
             let mut gauge = Gauge::default();
             gauge.set_value(count as f64);
             metric.set_gauge(gauge);
             metrics.push(metric);
         }
-        m.set_metric(metrics.into());
+        m.set_metric(metrics);
         m
     }
 }

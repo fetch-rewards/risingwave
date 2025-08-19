@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,14 +14,15 @@
 
 use pgwire::pg_response::{PgResponse, StatementType};
 use risingwave_common::bail;
-use risingwave_pb::meta::PbThrottleTarget;
+use risingwave_pb::meta::ThrottleTarget as PbThrottleTarget;
 use risingwave_sqlparser::ast::ObjectName;
 
 use super::{HandlerArgs, RwPgResponse};
+use crate::Binder;
 use crate::catalog::root_catalog::SchemaPath;
 use crate::catalog::table_catalog::TableType;
 use crate::error::{ErrorCode, Result};
-use crate::Binder;
+use crate::session::SessionImpl;
 
 pub async fn handle_alter_streaming_rate_limit(
     handler_args: HandlerArgs,
@@ -29,12 +30,12 @@ pub async fn handle_alter_streaming_rate_limit(
     table_name: ObjectName,
     rate_limit: i32,
 ) -> Result<RwPgResponse> {
-    let session = handler_args.session;
-    let db_name = session.database();
+    let session = handler_args.clone().session;
+    let db_name = &session.database();
     let (schema_name, real_table_name) =
-        Binder::resolve_schema_qualified_name(db_name, table_name.clone())?;
+        Binder::resolve_schema_qualified_name(db_name, &table_name)?;
     let search_path = session.config().search_path();
-    let user_name = &session.auth_context().user_name;
+    let user_name = &session.user_name();
 
     let schema_path = SchemaPath::new(schema_name.as_deref(), &search_path, user_name);
 
@@ -42,7 +43,7 @@ pub async fn handle_alter_streaming_rate_limit(
         PbThrottleTarget::Mv => {
             let reader = session.env().catalog_reader().read_guard();
             let (table, schema_name) =
-                reader.get_created_table_by_name(db_name, schema_path, &real_table_name)?;
+                reader.get_any_table_by_name(db_name, schema_path, &real_table_name)?;
             if table.table_type != TableType::MaterializedView {
                 return Err(ErrorCode::InvalidInputSyntax(format!(
                     "\"{table_name}\" is not a materialized view",
@@ -72,9 +73,51 @@ pub async fn handle_alter_streaming_rate_limit(
             };
             (StatementType::ALTER_SOURCE, source_id)
         }
+        PbThrottleTarget::CdcTable => {
+            let reader = session.env().catalog_reader().read_guard();
+            let (table, schema_name) =
+                reader.get_any_table_by_name(db_name, schema_path, &real_table_name)?;
+            if table.table_type != TableType::Table {
+                return Err(ErrorCode::InvalidInputSyntax(format!("\"{table_name}\" ",)).into());
+            }
+            session.check_privilege_for_drop_alter(schema_name, &**table)?;
+            (StatementType::ALTER_TABLE, table.id.table_id)
+        }
+        PbThrottleTarget::TableDml => {
+            let reader = session.env().catalog_reader().read_guard();
+            let (table, schema_name) =
+                reader.get_created_table_by_name(db_name, schema_path, &real_table_name)?;
+            if table.table_type != TableType::Table {
+                return Err(ErrorCode::InvalidInputSyntax(format!(
+                    "\"{table_name}\" is not a table",
+                ))
+                .into());
+            }
+            session.check_privilege_for_drop_alter(schema_name, &**table)?;
+            (StatementType::ALTER_TABLE, table.id.table_id)
+        }
+        PbThrottleTarget::Sink => {
+            let reader = session.env().catalog_reader().read_guard();
+            let (table, schema_name) =
+                reader.get_any_sink_by_name(db_name, schema_path, &real_table_name)?;
+            if table.target_table.is_some() {
+                bail!("ALTER SINK_RATE_LIMIT is not for sink into table")
+            }
+            session.check_privilege_for_drop_alter(schema_name, &**table)?;
+            (StatementType::ALTER_SINK, table.id.sink_id)
+        }
         _ => bail!("Unsupported throttle target: {:?}", kind),
     };
+    handle_alter_streaming_rate_limit_by_id(&session, kind, id, rate_limit, stmt_type).await
+}
 
+pub async fn handle_alter_streaming_rate_limit_by_id(
+    session: &SessionImpl,
+    kind: PbThrottleTarget,
+    id: u32,
+    rate_limit: i32,
+    stmt_type: StatementType,
+) -> Result<RwPgResponse> {
     let meta_client = session.env().meta_client();
 
     let rate_limit = if rate_limit < 0 {

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,21 +15,23 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::{Deref, DerefMut};
 
+use parking_lot::Mutex;
 use risingwave_common::catalog::TableId;
 use risingwave_hummock_sdk::change_log::ChangeLogDelta;
 use risingwave_hummock_sdk::compaction_group::StaticCompactionGroupId;
 use risingwave_hummock_sdk::sstable_info::SstableInfo;
 use risingwave_hummock_sdk::table_watermark::TableWatermarks;
-use risingwave_hummock_sdk::version::{
-    GroupDelta, HummockVersion, HummockVersionDelta, IntraLevelDelta,
-};
-use risingwave_hummock_sdk::{CompactionGroupId, HummockEpoch, HummockVersionId, LocalSstableInfo};
+use risingwave_hummock_sdk::vector_index::VectorIndexDelta;
+use risingwave_hummock_sdk::version::{GroupDelta, HummockVersion, HummockVersionDelta};
+use risingwave_hummock_sdk::{CompactionGroupId, FrontendHummockVersionDelta, HummockVersionId};
 use risingwave_pb::hummock::{
-    CompactionConfig, CompatibilityVersion, GroupConstruct, HummockVersionStats,
+    CompatibilityVersion, GroupConstruct, HummockVersionDeltas, HummockVersionStats,
     StateTableInfoDelta,
 };
 use risingwave_pb::meta::subscribe_response::{Info, Operation};
 
+use super::TableCommittedEpochNotifiers;
+use crate::hummock::model::CompactionGroup;
 use crate::manager::NotificationManager;
 use crate::model::{
     InMemValTransaction, MetadataModelResult, Transactional, ValTransaction, VarTransaction,
@@ -42,21 +44,18 @@ fn trigger_delta_log_stats(metrics: &MetaMetrics, total_number: usize) {
 
 fn trigger_version_stat(metrics: &MetaMetrics, current_version: &HummockVersion) {
     metrics
-        .max_committed_epoch
-        .set(current_version.max_committed_epoch as i64);
-    metrics
         .version_size
         .set(current_version.estimated_encode_len() as i64);
     metrics
-        .safe_epoch
-        .set(current_version.visible_table_safe_epoch() as i64);
-    metrics.current_version_id.set(current_version.id as i64);
+        .current_version_id
+        .set(current_version.id.to_u64() as i64);
 }
 
 pub(super) struct HummockVersionTransaction<'a> {
     orig_version: &'a mut HummockVersion,
     orig_deltas: &'a mut BTreeMap<HummockVersionId, HummockVersionDelta>,
     notification_manager: &'a NotificationManager,
+    table_committed_epoch_notifiers: Option<&'a Mutex<TableCommittedEpochNotifiers>>,
     meta_metrics: &'a MetaMetrics,
 
     pre_applied_version: Option<(HummockVersion, Vec<HummockVersionDelta>)>,
@@ -68,6 +67,7 @@ impl<'a> HummockVersionTransaction<'a> {
         version: &'a mut HummockVersion,
         deltas: &'a mut BTreeMap<HummockVersionId, HummockVersionDelta>,
         notification_manager: &'a NotificationManager,
+        table_committed_epoch_notifiers: Option<&'a Mutex<TableCommittedEpochNotifiers>>,
         meta_metrics: &'a MetaMetrics,
     ) -> Self {
         Self {
@@ -76,6 +76,7 @@ impl<'a> HummockVersionTransaction<'a> {
             pre_applied_version: None,
             disable_apply_to_txn: false,
             notification_manager,
+            table_committed_epoch_notifiers,
             meta_metrics,
         }
     }
@@ -113,107 +114,101 @@ impl<'a> HummockVersionTransaction<'a> {
     }
 
     /// Returns a duplicate delta, used by time travel.
-    #[expect(clippy::type_complexity)]
     pub(super) fn pre_commit_epoch(
         &mut self,
-        max_committed_epoch: HummockEpoch,
-        commit_sstables: BTreeMap<CompactionGroupId, Vec<SstableInfo>>,
-        new_table_ids: HashMap<TableId, CompactionGroupId>,
+        tables_to_commit: &HashMap<TableId, u64>,
+        new_compaction_groups: Vec<CompactionGroup>,
+        group_id_to_sub_levels: BTreeMap<CompactionGroupId, Vec<Vec<SstableInfo>>>,
+        new_table_ids: &HashMap<TableId, CompactionGroupId>,
         new_table_watermarks: HashMap<TableId, TableWatermarks>,
         change_log_delta: HashMap<TableId, ChangeLogDelta>,
-        batch_commit_for_new_cg: Option<(
-            HashMap<CompactionGroupId, BTreeMap<u64, Vec<LocalSstableInfo>>>,
-            CompactionConfig,
-        )>,
+        vector_index_delta: HashMap<TableId, VectorIndexDelta>,
+        group_id_to_truncate_tables: HashMap<CompactionGroupId, Vec<TableId>>,
     ) -> HummockVersionDelta {
         let mut new_version_delta = self.new_delta();
-        new_version_delta.max_committed_epoch = max_committed_epoch;
         new_version_delta.new_table_watermarks = new_table_watermarks;
         new_version_delta.change_log_delta = change_log_delta;
+        new_version_delta.vector_index_delta = vector_index_delta;
 
-        if let Some((batch_commit_for_new_cg, compaction_group_config)) = batch_commit_for_new_cg {
-            for (compaction_group_id, batch_commit_sst) in batch_commit_for_new_cg {
-                let group_deltas = &mut new_version_delta
-                    .group_deltas
-                    .entry(compaction_group_id)
-                    .or_default()
-                    .group_deltas;
+        for compaction_group in &new_compaction_groups {
+            let group_deltas = &mut new_version_delta
+                .group_deltas
+                .entry(compaction_group.group_id())
+                .or_default()
+                .group_deltas;
 
-                #[expect(deprecated)]
-                group_deltas.push(GroupDelta::GroupConstruct(GroupConstruct {
-                    group_config: Some(compaction_group_config.clone()),
-                    group_id: compaction_group_id,
-                    parent_group_id: StaticCompactionGroupId::NewCompactionGroup
-                        as CompactionGroupId,
-                    new_sst_start_id: 0, // No need to set it when `NewCompactionGroup`
-                    table_ids: vec![],
-                    version: CompatibilityVersion::NoMemberTableIds as i32,
-                }));
-
-                for (epoch, insert_ssts) in batch_commit_sst {
-                    assert!(epoch < max_committed_epoch);
-                    let l0_sub_level_id = epoch;
-                    let group_delta = GroupDelta::IntraLevel(IntraLevelDelta::new(
-                        0,
-                        l0_sub_level_id,
-                        vec![], // default
-                        insert_ssts.into_iter().map(|s| s.sst_info).collect(),
-                        0, // default
-                    ));
-                    group_deltas.push(group_delta);
-                }
-            }
+            #[expect(deprecated)]
+            group_deltas.push(GroupDelta::GroupConstruct(Box::new(GroupConstruct {
+                group_config: Some(compaction_group.compaction_config().as_ref().clone()),
+                group_id: compaction_group.group_id(),
+                parent_group_id: StaticCompactionGroupId::NewCompactionGroup as CompactionGroupId,
+                new_sst_start_id: 0, // No need to set it when `NewCompactionGroup`
+                table_ids: vec![],
+                version: CompatibilityVersion::LATEST as _,
+                split_key: None,
+            })));
         }
 
         // Append SSTs to a new version.
-        for (compaction_group_id, inserted_table_infos) in commit_sstables {
+        for (compaction_group_id, sub_levels) in group_id_to_sub_levels {
             let group_deltas = &mut new_version_delta
                 .group_deltas
                 .entry(compaction_group_id)
                 .or_default()
                 .group_deltas;
-            let l0_sub_level_id = max_committed_epoch;
-            let group_delta = GroupDelta::IntraLevel(IntraLevelDelta::new(
-                0,
-                l0_sub_level_id,
-                vec![], // default
-                inserted_table_infos,
-                0, // default
-            ));
 
-            group_deltas.push(group_delta);
+            for sub_level in sub_levels {
+                group_deltas.push(GroupDelta::NewL0SubLevel(sub_level));
+            }
+        }
+
+        for (compaction_group_id, table_ids) in group_id_to_truncate_tables {
+            let group_deltas = &mut new_version_delta
+                .group_deltas
+                .entry(compaction_group_id)
+                .or_default()
+                .group_deltas;
+
+            group_deltas.push(GroupDelta::TruncateTables(
+                table_ids.into_iter().map(|id| id.into()).collect(),
+            ));
         }
 
         // update state table info
         new_version_delta.with_latest_version(|version, delta| {
             for (table_id, cg_id) in new_table_ids {
                 assert!(
-                    !version.state_table_info.info().contains_key(&table_id),
+                    !version.state_table_info.info().contains_key(table_id),
                     "newly added table exists previously: {:?}",
                     table_id
                 );
+                let committed_epoch = *tables_to_commit.get(table_id).expect("newly added table must exist in tables_to_commit");
                 delta.state_table_info_delta.insert(
-                    table_id,
+                    *table_id,
                     StateTableInfoDelta {
-                        committed_epoch: max_committed_epoch,
-                        safe_epoch: max_committed_epoch,
-                        compaction_group_id: cg_id,
+                        committed_epoch,
+                        compaction_group_id: *cg_id,
                     },
                 );
             }
 
-            for (table_id, info) in version.state_table_info.info() {
+            for (table_id, committed_epoch) in tables_to_commit {
+                if new_table_ids.contains_key(table_id) {
+                    continue;
+                }
+                let info = version.state_table_info.info().get(table_id).unwrap_or_else(|| {
+                    panic!("tables_to_commit {:?} contains table_id {} that is not newly added but not exists previously", tables_to_commit, table_id);
+                });
                 assert!(delta
                     .state_table_info_delta
                     .insert(
                         *table_id,
                         StateTableInfoDelta {
-                            committed_epoch: max_committed_epoch,
-                            safe_epoch: info.safe_epoch,
+                            committed_epoch: *committed_epoch,
                             compaction_group_id: info.compaction_group_id,
                         }
                     )
-                    .is_none(),);
+                    .is_none());
             }
         });
 
@@ -223,7 +218,7 @@ impl<'a> HummockVersionTransaction<'a> {
     }
 }
 
-impl<'a> InMemValTransaction for HummockVersionTransaction<'a> {
+impl InMemValTransaction for HummockVersionTransaction<'_> {
     fn commit(self) {
         if let Some((version, deltas)) = self.pre_applied_version {
             *self.orig_version = version;
@@ -235,6 +230,23 @@ impl<'a> InMemValTransaction for HummockVersionTransaction<'a> {
                         version_deltas: pb_deltas,
                     }),
                 );
+                self.notification_manager.notify_frontend_without_version(
+                    Operation::Update,
+                    Info::HummockVersionDeltas(HummockVersionDeltas {
+                        version_deltas: deltas
+                            .iter()
+                            .map(|delta| {
+                                FrontendHummockVersionDelta::from_delta(delta).to_protobuf()
+                            })
+                            .collect(),
+                    }),
+                );
+                if let Some(table_committed_epoch_notifiers) = self.table_committed_epoch_notifiers
+                {
+                    table_committed_epoch_notifiers
+                        .lock()
+                        .notify_deltas(&deltas);
+                }
             }
             for delta in deltas {
                 assert!(self.orig_deltas.insert(delta.id, delta.clone()).is_none());
@@ -246,7 +258,7 @@ impl<'a> InMemValTransaction for HummockVersionTransaction<'a> {
     }
 }
 
-impl<'a, TXN> ValTransaction<TXN> for HummockVersionTransaction<'a>
+impl<TXN> ValTransaction<TXN> for HummockVersionTransaction<'_>
 where
     HummockVersionDelta: Transactional<TXN>,
     HummockVersionStats: Transactional<TXN>,
@@ -271,7 +283,7 @@ pub(super) struct SingleDeltaTransaction<'a, 'b> {
     delta: Option<HummockVersionDelta>,
 }
 
-impl<'a, 'b> SingleDeltaTransaction<'a, 'b> {
+impl SingleDeltaTransaction<'_, '_> {
     pub(super) fn latest_version(&self) -> &HummockVersion {
         self.version_txn.latest_version()
     }
@@ -291,7 +303,7 @@ impl<'a, 'b> SingleDeltaTransaction<'a, 'b> {
     }
 }
 
-impl<'a, 'b> Deref for SingleDeltaTransaction<'a, 'b> {
+impl Deref for SingleDeltaTransaction<'_, '_> {
     type Target = HummockVersionDelta;
 
     fn deref(&self) -> &Self::Target {
@@ -299,13 +311,13 @@ impl<'a, 'b> Deref for SingleDeltaTransaction<'a, 'b> {
     }
 }
 
-impl<'a, 'b> DerefMut for SingleDeltaTransaction<'a, 'b> {
+impl DerefMut for SingleDeltaTransaction<'_, '_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.delta.as_mut().expect("should exist")
     }
 }
 
-impl<'a, 'b> Drop for SingleDeltaTransaction<'a, 'b> {
+impl Drop for SingleDeltaTransaction<'_, '_> {
     fn drop(&mut self) {
         if let Some(delta) = self.delta.take() {
             self.version_txn.pre_apply(delta);
@@ -330,7 +342,7 @@ impl<'a> HummockVersionStatsTransaction<'a> {
     }
 }
 
-impl<'a> InMemValTransaction for HummockVersionStatsTransaction<'a> {
+impl InMemValTransaction for HummockVersionStatsTransaction<'_> {
     fn commit(self) {
         if self.stats.has_new_value() {
             let stats = self.stats.clone();
@@ -341,7 +353,7 @@ impl<'a> InMemValTransaction for HummockVersionStatsTransaction<'a> {
     }
 }
 
-impl<'a, TXN> ValTransaction<TXN> for HummockVersionStatsTransaction<'a>
+impl<TXN> ValTransaction<TXN> for HummockVersionStatsTransaction<'_>
 where
     HummockVersionStats: Transactional<TXN>,
 {
@@ -350,7 +362,7 @@ where
     }
 }
 
-impl<'a> Deref for HummockVersionStatsTransaction<'a> {
+impl Deref for HummockVersionStatsTransaction<'_> {
     type Target = HummockVersionStats;
 
     fn deref(&self) -> &Self::Target {
@@ -358,7 +370,7 @@ impl<'a> Deref for HummockVersionStatsTransaction<'a> {
     }
 }
 
-impl<'a> DerefMut for HummockVersionStatsTransaction<'a> {
+impl DerefMut for HummockVersionStatsTransaction<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.stats.deref_mut()
     }

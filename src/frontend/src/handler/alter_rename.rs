@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,14 +15,15 @@
 use pgwire::pg_response::{PgResponse, StatementType};
 use risingwave_common::acl::AclMode;
 use risingwave_common::catalog::is_system_schema;
-use risingwave_pb::user::grant_privilege::Object;
+use risingwave_pb::ddl_service::alter_name_request;
+use risingwave_pb::user::grant_privilege;
 use risingwave_sqlparser::ast::ObjectName;
 
 use super::{HandlerArgs, RwPgResponse};
+use crate::Binder;
 use crate::catalog::root_catalog::SchemaPath;
 use crate::catalog::table_catalog::TableType;
 use crate::error::{ErrorCode, Result};
-use crate::Binder;
 
 pub async fn handle_rename_table(
     handler_args: HandlerArgs,
@@ -31,12 +32,12 @@ pub async fn handle_rename_table(
     new_table_name: ObjectName,
 ) -> Result<RwPgResponse> {
     let session = handler_args.session;
-    let db_name = session.database();
+    let db_name = &session.database();
     let (schema_name, real_table_name) =
-        Binder::resolve_schema_qualified_name(db_name, table_name.clone())?;
+        Binder::resolve_schema_qualified_name(db_name, &table_name)?;
     let new_table_name = Binder::resolve_table_name(new_table_name)?;
     let search_path = session.config().search_path();
-    let user_name = &session.auth_context().user_name;
+    let user_name = &session.user_name();
 
     let schema_path = SchemaPath::new(schema_name.as_deref(), &search_path, user_name);
 
@@ -58,7 +59,10 @@ pub async fn handle_rename_table(
 
     let catalog_writer = session.catalog_writer()?;
     catalog_writer
-        .alter_table_name(table_id.table_id, &new_table_name)
+        .alter_name(
+            alter_name_request::Object::TableId(table_id.table_id),
+            &new_table_name,
+        )
         .await?;
 
     let stmt_type = match table_type {
@@ -75,12 +79,12 @@ pub async fn handle_rename_index(
     new_index_name: ObjectName,
 ) -> Result<RwPgResponse> {
     let session = handler_args.session;
-    let db_name = session.database();
+    let db_name = &session.database();
     let (schema_name, real_index_name) =
-        Binder::resolve_schema_qualified_name(db_name, index_name.clone())?;
+        Binder::resolve_schema_qualified_name(db_name, &index_name)?;
     let new_index_name = Binder::resolve_index_name(new_index_name)?;
     let search_path = session.config().search_path();
-    let user_name = &session.auth_context().user_name;
+    let user_name = &session.user_name();
 
     let schema_path = SchemaPath::new(schema_name.as_deref(), &search_path, user_name);
 
@@ -94,7 +98,10 @@ pub async fn handle_rename_index(
 
     let catalog_writer = session.catalog_writer()?;
     catalog_writer
-        .alter_index_name(index_id.index_id, &new_index_name)
+        .alter_name(
+            alter_name_request::Object::IndexId(index_id.index_id),
+            &new_index_name,
+        )
         .await?;
 
     Ok(PgResponse::empty_result(StatementType::ALTER_INDEX))
@@ -106,12 +113,11 @@ pub async fn handle_rename_view(
     new_view_name: ObjectName,
 ) -> Result<RwPgResponse> {
     let session = handler_args.session;
-    let db_name = session.database();
-    let (schema_name, real_view_name) =
-        Binder::resolve_schema_qualified_name(db_name, view_name.clone())?;
+    let db_name = &session.database();
+    let (schema_name, real_view_name) = Binder::resolve_schema_qualified_name(db_name, &view_name)?;
     let new_view_name = Binder::resolve_view_name(new_view_name)?;
     let search_path = session.config().search_path();
-    let user_name = &session.auth_context().user_name;
+    let user_name = &session.user_name();
 
     let schema_path = SchemaPath::new(schema_name.as_deref(), &search_path, user_name);
 
@@ -124,7 +130,7 @@ pub async fn handle_rename_view(
 
     let catalog_writer = session.catalog_writer()?;
     catalog_writer
-        .alter_view_name(view_id, &new_view_name)
+        .alter_name(alter_name_request::Object::ViewId(view_id), &new_view_name)
         .await?;
 
     Ok(PgResponse::empty_result(StatementType::ALTER_VIEW))
@@ -136,25 +142,28 @@ pub async fn handle_rename_sink(
     new_sink_name: ObjectName,
 ) -> Result<RwPgResponse> {
     let session = handler_args.session;
-    let db_name = session.database();
-    let (schema_name, real_sink_name) =
-        Binder::resolve_schema_qualified_name(db_name, sink_name.clone())?;
+    let db_name = &session.database();
+    let (schema_name, real_sink_name) = Binder::resolve_schema_qualified_name(db_name, &sink_name)?;
     let new_sink_name = Binder::resolve_sink_name(new_sink_name)?;
     let search_path = session.config().search_path();
-    let user_name = &session.auth_context().user_name;
+    let user_name = &session.user_name();
 
     let schema_path = SchemaPath::new(schema_name.as_deref(), &search_path, user_name);
 
     let sink_id = {
         let reader = session.env().catalog_reader().read_guard();
-        let (sink, schema_name) = reader.get_sink_by_name(db_name, schema_path, &real_sink_name)?;
+        let (sink, schema_name) =
+            reader.get_created_sink_by_name(db_name, schema_path, &real_sink_name)?;
         session.check_privilege_for_drop_alter(schema_name, &**sink)?;
         sink.id
     };
 
     let catalog_writer = session.catalog_writer()?;
     catalog_writer
-        .alter_sink_name(sink_id.sink_id, &new_sink_name)
+        .alter_name(
+            alter_name_request::Object::SinkId(sink_id.sink_id),
+            &new_sink_name,
+        )
         .await?;
 
     Ok(PgResponse::empty_result(StatementType::ALTER_SINK))
@@ -166,12 +175,12 @@ pub async fn handle_rename_subscription(
     new_subscription_name: ObjectName,
 ) -> Result<RwPgResponse> {
     let session = handler_args.session;
-    let db_name = session.database();
+    let db_name = &session.database();
     let (schema_name, real_subscription_name) =
-        Binder::resolve_schema_qualified_name(db_name, subscription_name.clone())?;
+        Binder::resolve_schema_qualified_name(db_name, &subscription_name)?;
     let new_subscription_name = Binder::resolve_subscription_name(new_subscription_name)?;
     let search_path = session.config().search_path();
-    let user_name = &session.auth_context().user_name;
+    let user_name = &session.user_name();
 
     let schema_path = SchemaPath::new(schema_name.as_deref(), &search_path, user_name);
 
@@ -185,7 +194,10 @@ pub async fn handle_rename_subscription(
 
     let catalog_writer = session.catalog_writer()?;
     catalog_writer
-        .alter_subscription_name(subscription_id.subscription_id, &new_subscription_name)
+        .alter_name(
+            alter_name_request::Object::SubscriptionId(subscription_id.subscription_id),
+            &new_subscription_name,
+        )
         .await?;
 
     Ok(PgResponse::empty_result(StatementType::ALTER_SUBSCRIPTION))
@@ -197,12 +209,12 @@ pub async fn handle_rename_source(
     new_source_name: ObjectName,
 ) -> Result<RwPgResponse> {
     let session = handler_args.session;
-    let db_name = session.database();
+    let db_name = &session.database();
     let (schema_name, real_source_name) =
-        Binder::resolve_schema_qualified_name(db_name, source_name.clone())?;
+        Binder::resolve_schema_qualified_name(db_name, &source_name)?;
     let new_source_name = Binder::resolve_source_name(new_source_name)?;
     let search_path = session.config().search_path();
-    let user_name = &session.auth_context().user_name;
+    let user_name = &session.user_name();
 
     let schema_path = SchemaPath::new(schema_name.as_deref(), &search_path, user_name);
 
@@ -225,7 +237,10 @@ pub async fn handle_rename_source(
 
     let catalog_writer = session.catalog_writer()?;
     catalog_writer
-        .alter_source_name(source_id, &new_source_name)
+        .alter_name(
+            alter_name_request::Object::SourceId(source_id),
+            &new_source_name,
+        )
         .await?;
 
     Ok(PgResponse::empty_result(StatementType::ALTER_SOURCE))
@@ -237,7 +252,7 @@ pub async fn handle_rename_schema(
     new_schema_name: ObjectName,
 ) -> Result<RwPgResponse> {
     let session = handler_args.session;
-    let db_name = session.database();
+    let db_name = &session.database();
     let schema_name = Binder::resolve_schema_name(schema_name)?;
     let new_schema_name = Binder::resolve_schema_name(new_schema_name)?;
 
@@ -259,16 +274,17 @@ pub async fn handle_rename_schema(
         session.check_privilege_for_drop_alter_db_schema(schema)?;
 
         // To rename a schema you must also have the CREATE privilege for the database.
-        if let Some(user) = user_reader.get_user_by_name(session.user_name()) {
-            if !user.is_super && !user.check_privilege(&Object::DatabaseId(db_id), AclMode::Create)
+        if let Some(user) = user_reader.get_user_by_name(&session.user_name()) {
+            if !user.is_super
+                && !user.has_privilege(&grant_privilege::Object::DatabaseId(db_id), AclMode::Create)
             {
                 return Err(ErrorCode::PermissionDenied(
-                    "Do not have create privilege on the current database".to_string(),
+                    "Do not have CREATE privilege on the current database".to_owned(),
                 )
                 .into());
             }
         } else {
-            return Err(ErrorCode::PermissionDenied("Session user is invalid".to_string()).into());
+            return Err(ErrorCode::PermissionDenied("Session user is invalid".to_owned()).into());
         }
 
         schema.id()
@@ -276,7 +292,10 @@ pub async fn handle_rename_schema(
 
     let catalog_writer = session.catalog_writer()?;
     catalog_writer
-        .alter_schema_name(schema_id, &new_schema_name)
+        .alter_name(
+            alter_name_request::Object::SchemaId(schema_id),
+            &new_schema_name,
+        )
         .await?;
 
     Ok(PgResponse::empty_result(StatementType::ALTER_SCHEMA))
@@ -300,21 +319,21 @@ pub async fn handle_rename_database(
         session.check_privilege_for_drop_alter_db_schema(database)?;
 
         // Non-superuser owners must also have the CREATEDB privilege.
-        if let Some(user) = user_reader.get_user_by_name(session.user_name()) {
+        if let Some(user) = user_reader.get_user_by_name(&session.user_name()) {
             if !user.is_super && !user.can_create_db {
                 return Err(ErrorCode::PermissionDenied(
-                    "Non-superuser owners must also have the CREATEDB privilege".to_string(),
+                    "Non-superuser owners must also have the CREATEDB privilege".to_owned(),
                 )
                 .into());
             }
         } else {
-            return Err(ErrorCode::PermissionDenied("Session user is invalid".to_string()).into());
+            return Err(ErrorCode::PermissionDenied("Session user is invalid".to_owned()).into());
         }
 
         // The current database cannot be renamed.
         if database_name == session.database() {
             return Err(ErrorCode::PermissionDenied(
-                "Current database cannot be renamed".to_string(),
+                "Current database cannot be renamed".to_owned(),
             )
             .into());
         }
@@ -324,7 +343,10 @@ pub async fn handle_rename_database(
 
     let catalog_writer = session.catalog_writer()?;
     catalog_writer
-        .alter_database_name(database_id, &new_database_name)
+        .alter_name(
+            alter_name_request::Object::DatabaseId(database_id),
+            &new_database_name,
+        )
         .await?;
 
     Ok(PgResponse::empty_result(StatementType::ALTER_DATABASE))
@@ -364,7 +386,7 @@ mod tests {
             .get_any_table_by_id(&table_id)
             .unwrap()
             .name()
-            .to_string();
+            .to_owned();
         assert_eq!(altered_table_name, "t1");
     }
 }

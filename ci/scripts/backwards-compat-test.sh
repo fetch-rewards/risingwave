@@ -5,6 +5,7 @@
 set -euo pipefail
 
 source ci/scripts/common.sh
+unset RUSTC_WORKSPACE_WRAPPER
 
 while getopts 'p:' opt; do
     case ${opt} in
@@ -46,22 +47,22 @@ echo "--- Setting up cluster config"
 full-without-monitoring:
   steps:
     - use: minio
-    - use: etcd
+    - use: sqlite
     - use: meta-node
     - use: compute-node
     - use: frontend
     - use: compactor
 EOF
   else
-     # For versions >= 1.9.0, the default config will default to sql backend,
-     # breaking backwards compat, so we must specify meta-backend: etcd
+     # For versions >= 1.9.0, we have support for different sql meta-backend,
+     # so we need to specify the meta-backend: sqlite
      cat <<EOF > risedev-profiles.user.yml
 full-without-monitoring:
  steps:
    - use: minio
-   - use: etcd
+   - use: sqlite
    - use: meta-node
-     meta-backend: etcd
+     meta-backend: sqlite
    - use: compute-node
    - use: frontend
    - use: compactor
@@ -72,13 +73,13 @@ cat <<EOF > risedev-components.user.env
 RISEDEV_CONFIGURED=true
 
 ENABLE_MINIO=true
-ENABLE_ETCD=true
 
 # Whether to build or directly fetch binary from release.
 ENABLE_BUILD_RUST=$ENABLE_BUILD
 
 # Use target/debug for simplicity.
 ENABLE_RELEASE_PROFILE=false
+ENABLE_UDF=true
 EOF
 
 # See https://github.com/risingwavelabs/risingwave/pull/15448
@@ -95,10 +96,14 @@ setup_old_cluster() {
   echo "--- Get RisingWave binary for $OLD_VERSION"
   OLD_URL=https://github.com/risingwavelabs/risingwave/releases/download/v${OLD_VERSION}/risingwave-v${OLD_VERSION}-x86_64-unknown-linux.tar.gz
   set +e
-  wget "$OLD_URL"
+  wget --no-verbose "$OLD_URL"
   if [[ "$?" -ne 0 ]]; then
     set -e
     echo "Failed to download ${OLD_VERSION} from github releases, build from source later during \`risedev d\`"
+    configure_rw "$OLD_VERSION" true
+  elif [[ $OLD_VERSION = '1.10.0' || $OLD_VERSION = '1.10.1' || $OLD_VERSION = '1.10.2' || $OLD_VERSION = '2.0.0' ]]; then
+    set -e
+    echo "1.10.x, 2.0.0 have dynamically linked openssl, build from source later during \`risedev d\`"
     configure_rw "$OLD_VERSION" true
   else
     set -e

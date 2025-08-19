@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::types::Fields;
+use risingwave_common::types::{Fields, Timestamptz};
 use risingwave_frontend_macro::system_catalog;
 use risingwave_pb::user::grant_privilege::Object;
 
-use crate::catalog::system_catalog::{get_acl_items, SysCatalogReaderImpl};
+use crate::catalog::system_catalog::{SysCatalogReaderImpl, get_acl_items};
 use crate::error::Result;
 
 #[derive(Fields)]
@@ -31,8 +31,10 @@ struct RwFunction {
     return_type_id: i32,
     language: String,
     link: Option<String>,
-    acl: String,
+    acl: Vec<String>,
     always_retry_on_network_error: bool,
+    created_at: Option<Timestamptz>,
+    created_at_cluster_version: Option<String>,
 }
 
 #[system_catalog(table, "rw_catalog.rw_functions")]
@@ -62,6 +64,8 @@ fn read(reader: &SysCatalogReaderImpl) -> Result<Vec<RwFunction>> {
                     username_map,
                 ),
                 always_retry_on_network_error: function.always_retry_on_network_error,
+                created_at: function.created_at_epoch.map(|e| e.as_timestamptz()),
+                created_at_cluster_version: function.created_at_cluster_version.clone(),
             })
         })
         .collect())

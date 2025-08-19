@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ use risingwave_common::row::Row;
 use risingwave_common::types::{JsonbVal, ScalarRefImpl};
 use risingwave_common::util::iter_util::ZipEqDebug;
 use risingwave_expr::expr::Context;
-use risingwave_expr::{function, ExprError, Result};
+use risingwave_expr::{ExprError, Result, function};
 
 use super::{ToJsonb, ToTextDisplay};
 
@@ -47,7 +47,7 @@ fn jsonb_build_array(args: impl Row, ctx: &Context) -> Result<JsonbVal> {
             value.add_to(ty, &mut builder)?;
         }
     } else {
-        let ty = ctx.arg_types[0].as_list();
+        let ty = ctx.arg_types[0].as_list_element_type();
         for value in args.iter() {
             value.add_to(ty, &mut builder)?;
         }
@@ -85,7 +85,10 @@ fn jsonb_build_object(args: impl Row, ctx: &Context) -> Result<JsonbVal> {
     builder.begin_object();
     let arg_types = match ctx.variadic {
         true => Either::Left(ctx.arg_types.iter()),
-        false => Either::Right(itertools::repeat_n(ctx.arg_types[0].as_list(), args.len())),
+        false => Either::Right(itertools::repeat_n(
+            ctx.arg_types[0].as_list_element_type(),
+            args.len(),
+        )),
     };
     for (i, [(key, _), (value, value_type)]) in args
         .iter()
@@ -98,7 +101,7 @@ fn jsonb_build_object(args: impl Row, ctx: &Context) -> Result<JsonbVal> {
                 return Err(ExprError::InvalidParam {
                     name: "args",
                     reason: "key value must be scalar, not array, composite, or json".into(),
-                })
+                });
             }
             // special treatment for bool, `false` & `true` rather than `f` & `t`.
             Some(ScalarRefImpl::Bool(b)) => builder.display(b),
@@ -107,7 +110,7 @@ fn jsonb_build_object(args: impl Row, ctx: &Context) -> Result<JsonbVal> {
                 return Err(ExprError::InvalidParam {
                     name: "args",
                     reason: format!("argument {}: key must not be null", i * 2 + 1).into(),
-                })
+                });
             }
         }
         value.add_to(value_type, &mut builder)?;

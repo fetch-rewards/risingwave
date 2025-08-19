@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,35 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Debug, Display};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use async_trait::async_trait;
+use cluster_limit_service_client::ClusterLimitServiceClient;
 use either::Either;
 use futures::stream::BoxStream;
+use list_rate_limits_response::RateLimitInfo;
 use lru::LruCache;
-use risingwave_common::catalog::{CatalogVersion, FunctionId, IndexId, SecretId, TableId};
-use risingwave_common::config::{MetaConfig, MAX_CONNECTION_WINDOW_SIZE};
+use replace_job_plan::ReplaceJob;
+use risingwave_common::RW_VERSION;
+use risingwave_common::catalog::{
+    AlterDatabaseParam, FunctionId, IndexId, ObjectId, SecretId, TableId,
+};
+use risingwave_common::config::{MAX_CONNECTION_WINDOW_SIZE, MetaConfig};
 use risingwave_common::hash::WorkerSlotMapping;
+use risingwave_common::monitor::EndpointExt;
 use risingwave_common::system_param::reader::SystemParamsReader;
 use risingwave_common::telemetry::report::TelemetryInfoFetcher;
 use risingwave_common::util::addr::HostAddr;
-use risingwave_common::util::column_index_mapping::ColIndexMapping;
 use risingwave_common::util::meta_addr::MetaAddressStrategy;
 use risingwave_common::util::resource_util::cpu::total_cpu_available;
 use risingwave_common::util::resource_util::memory::system_memory_available_bytes;
-use risingwave_common::RW_VERSION;
+use risingwave_error::bail;
+use risingwave_error::tonic::ErrorIsFromTonicServerImpl;
 use risingwave_hummock_sdk::compaction_group::StateTableId;
 use risingwave_hummock_sdk::version::{HummockVersion, HummockVersionDelta};
 use risingwave_hummock_sdk::{
-    CompactionGroupId, HummockEpoch, HummockSstableObjectId, HummockVersionId, SstObjectIdRange,
-    SyncResult,
+    CompactionGroupId, HummockEpoch, HummockVersionId, ObjectIdRange, SyncResult,
 };
 use risingwave_pb::backup_service::backup_service_client::BackupServiceClient;
 use risingwave_pb::backup_service::*;
@@ -50,7 +56,8 @@ use risingwave_pb::catalog::{
 };
 use risingwave_pb::cloud_service::cloud_service_client::CloudServiceClient;
 use risingwave_pb::cloud_service::*;
-use risingwave_pb::common::{HostAddress, WorkerNode, WorkerType};
+use risingwave_pb::common::worker_node::Property;
+use risingwave_pb::common::{HostAddress, OptionalUint32, OptionalUint64, WorkerNode, WorkerType};
 use risingwave_pb::connector_service::sink_coordination_service_client::SinkCoordinationServiceClient;
 use risingwave_pb::ddl_service::alter_owner_request::Object;
 use risingwave_pb::ddl_service::create_materialized_view_request::PbBackfillType;
@@ -64,16 +71,22 @@ use risingwave_pb::hummock::rise_ctl_update_compaction_config_request::mutable_c
 use risingwave_pb::hummock::subscribe_compaction_event_request::Register;
 use risingwave_pb::hummock::write_limits::WriteLimit;
 use risingwave_pb::hummock::*;
-use risingwave_pb::meta::add_worker_node_request::Property;
+use risingwave_pb::iceberg_compaction::subscribe_iceberg_compaction_event_request::Register as IcebergRegister;
+use risingwave_pb::iceberg_compaction::{
+    SubscribeIcebergCompactionEventRequest, SubscribeIcebergCompactionEventResponse,
+    subscribe_iceberg_compaction_event_request,
+};
+use risingwave_pb::meta::alter_connector_props_request::AlterConnectorPropsObject;
 use risingwave_pb::meta::cancel_creating_jobs_request::PbJobs;
 use risingwave_pb::meta::cluster_service_client::ClusterServiceClient;
 use risingwave_pb::meta::event_log_service_client::EventLogServiceClient;
-use risingwave_pb::meta::heartbeat_request::{extra_info, ExtraInfo};
 use risingwave_pb::meta::heartbeat_service_client::HeartbeatServiceClient;
+use risingwave_pb::meta::hosted_iceberg_catalog_service_client::HostedIcebergCatalogServiceClient;
+use risingwave_pb::meta::list_actor_splits_response::ActorSplit;
 use risingwave_pb::meta::list_actor_states_response::ActorState;
-use risingwave_pb::meta::list_fragment_distribution_response::FragmentDistribution;
+use risingwave_pb::meta::list_iceberg_tables_response::IcebergTable;
 use risingwave_pb::meta::list_object_dependencies_response::PbObjectDependencies;
-use risingwave_pb::meta::list_table_fragment_states_response::TableFragmentState;
+use risingwave_pb::meta::list_streaming_job_states_response::StreamingJobState;
 use risingwave_pb::meta::list_table_fragments_response::TableFragmentInfo;
 use risingwave_pb::meta::meta_member_service_client::MetaMemberServiceClient;
 use risingwave_pb::meta::notification_service_client::NotificationServiceClient;
@@ -84,26 +97,34 @@ use risingwave_pb::meta::stream_manager_service_client::StreamManagerServiceClie
 use risingwave_pb::meta::system_params_service_client::SystemParamsServiceClient;
 use risingwave_pb::meta::telemetry_info_service_client::TelemetryInfoServiceClient;
 use risingwave_pb::meta::update_worker_node_schedulability_request::Schedulability;
-use risingwave_pb::meta::*;
+use risingwave_pb::meta::{FragmentDistribution, *};
+use risingwave_pb::monitor_service::monitor_service_client::MonitorServiceClient;
+use risingwave_pb::monitor_service::stack_trace_request::ActorTracesFormat;
+use risingwave_pb::monitor_service::{StackTraceRequest, StackTraceResponse};
+use risingwave_pb::secret::PbSecretRef;
 use risingwave_pb::stream_plan::StreamFragmentGraph;
+use risingwave_pb::user::alter_default_privilege_request::Operation as AlterDefaultPrivilegeOperation;
 use risingwave_pb::user::update_user_request::UpdateField;
 use risingwave_pb::user::user_service_client::UserServiceClient;
 use risingwave_pb::user::*;
 use thiserror_ext::AsReport;
-use tokio::sync::mpsc::{unbounded_channel, Receiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot::Sender;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{self};
-use tokio_retry::strategy::{jitter, ExponentialBackoff};
+use tokio_retry::strategy::{ExponentialBackoff, jitter};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::transport::Endpoint;
 use tonic::{Code, Request, Streaming};
 
+use crate::channel::{Channel, WrappedChannelExt};
 use crate::error::{Result, RpcError};
-use crate::hummock_meta_client::{CompactionEventItem, HummockMetaClient};
-use crate::tracing::{Channel, TracingInjectedChannelExt};
-use crate::{meta_rpc_client_method_impl, ExtraInfoSourceRef};
+use crate::hummock_meta_client::{
+    CompactionEventItem, HummockMetaClient, HummockMetaClientChangeLogInfo,
+    IcebergCompactionEventItem,
+};
+use crate::meta_rpc_client_method_impl;
 
 type ConnectionId = u32;
 type DatabaseId = u32;
@@ -168,7 +189,7 @@ impl MetaClient {
         schema_id: u32,
         owner_id: u32,
         req: create_connection_request::Payload,
-    ) -> Result<CatalogVersion> {
+    ) -> Result<WaitVersion> {
         let request = CreateConnectionRequest {
             name: connection_name,
             database_id,
@@ -177,7 +198,9 @@ impl MetaClient {
             payload: Some(req),
         };
         let resp = self.inner.create_connection(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
     pub async fn create_secret(
@@ -187,7 +210,7 @@ impl MetaClient {
         schema_id: u32,
         owner_id: u32,
         value: Vec<u8>,
-    ) -> Result<CatalogVersion> {
+    ) -> Result<WaitVersion> {
         let request = CreateSecretRequest {
             name: secret_name,
             database_id,
@@ -196,7 +219,9 @@ impl MetaClient {
             value,
         };
         let resp = self.inner.create_secret(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
     pub async fn list_connections(&self, _name: Option<&str>) -> Result<Vec<Connection>> {
@@ -205,22 +230,54 @@ impl MetaClient {
         Ok(resp.connections)
     }
 
-    pub async fn drop_connection(&self, connection_id: ConnectionId) -> Result<CatalogVersion> {
-        let request = DropConnectionRequest { connection_id };
+    pub async fn drop_connection(
+        &self,
+        connection_id: ConnectionId,
+        cascade: bool,
+    ) -> Result<WaitVersion> {
+        let request = DropConnectionRequest {
+            connection_id,
+            cascade,
+        };
         let resp = self.inner.drop_connection(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
-    pub async fn drop_secret(&self, secret_id: SecretId) -> Result<CatalogVersion> {
+    pub async fn drop_secret(&self, secret_id: SecretId) -> Result<WaitVersion> {
         let request = DropSecretRequest {
             secret_id: secret_id.into(),
         };
         let resp = self.inner.drop_secret(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
     /// Register the current node to the cluster and set the corresponding worker id.
+    ///
+    /// Retry if there's connection issue with the meta node. Exit the process if the registration fails.
     pub async fn register_new(
+        addr_strategy: MetaAddressStrategy,
+        worker_type: WorkerType,
+        addr: &HostAddr,
+        property: Property,
+        meta_config: &MetaConfig,
+    ) -> (Self, SystemParamsReader) {
+        let ret =
+            Self::register_new_inner(addr_strategy, worker_type, addr, property, meta_config).await;
+
+        match ret {
+            Ok(ret) => ret,
+            Err(err) => {
+                tracing::error!(error = %err.as_report(), "failed to register worker, exiting...");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    async fn register_new_inner(
         addr_strategy: MetaAddressStrategy,
         worker_type: WorkerType,
         addr: &HostAddr,
@@ -238,34 +295,37 @@ impl MetaClient {
         if property.is_unschedulable {
             tracing::warn!("worker {:?} registered as unschedulable", addr.clone());
         }
-        let init_result: Result<_> = tokio_retry::Retry::spawn(retry_strategy, || async {
-            let grpc_meta_client = GrpcMetaClient::new(&addr_strategy, meta_config.clone()).await?;
+        let init_result: Result<_> = tokio_retry::RetryIf::spawn(
+            retry_strategy,
+            || async {
+                let grpc_meta_client =
+                    GrpcMetaClient::new(&addr_strategy, meta_config.clone()).await?;
 
-            let add_worker_resp = grpc_meta_client
-                .add_worker_node(AddWorkerNodeRequest {
-                    worker_type: worker_type as i32,
-                    host: Some(addr.to_protobuf()),
-                    property: Some(property.clone()),
-                    resource: Some(risingwave_pb::common::worker_node::Resource {
-                        rw_version: RW_VERSION.to_string(),
-                        total_memory_bytes: system_memory_available_bytes() as _,
-                        total_cpu_cores: total_cpu_available() as _,
-                    }),
-                })
-                .await?;
-            if let Some(status) = &add_worker_resp.status
-                && status.code() == risingwave_pb::common::status::Code::UnknownWorker
-            {
-                tracing::error!("invalid worker: {}", status.message);
-                std::process::exit(1);
-            }
+                let add_worker_resp = grpc_meta_client
+                    .add_worker_node(AddWorkerNodeRequest {
+                        worker_type: worker_type as i32,
+                        host: Some(addr.to_protobuf()),
+                        property: Some(property.clone()),
+                        resource: Some(risingwave_pb::common::worker_node::Resource {
+                            rw_version: RW_VERSION.to_owned(),
+                            total_memory_bytes: system_memory_available_bytes() as _,
+                            total_cpu_cores: total_cpu_available() as _,
+                        }),
+                    })
+                    .await
+                    .context("failed to add worker node")?;
 
-            let system_params_resp = grpc_meta_client
-                .get_system_params(GetSystemParamsRequest {})
-                .await?;
+                let system_params_resp = grpc_meta_client
+                    .get_system_params(GetSystemParamsRequest {})
+                    .await
+                    .context("failed to get initial system params")?;
 
-            Ok((add_worker_resp, system_params_resp, grpc_meta_client))
-        })
+                Ok((add_worker_resp, system_params_resp, grpc_meta_client))
+            },
+            // Only retry if there's any transient connection issue.
+            // If the error is from our implementation or business, do not retry it.
+            |e: &RpcError| !e.is_from_tonic_server_impl(),
+        )
         .await;
 
         let (add_worker_resp, system_params_resp, grpc_meta_client) = init_result?;
@@ -316,131 +376,140 @@ impl MetaClient {
     }
 
     /// Send heartbeat signal to meta service.
-    pub async fn send_heartbeat(&self, node_id: u32, info: Vec<extra_info::Info>) -> Result<()> {
-        let request = HeartbeatRequest {
-            node_id,
-            info: info
-                .into_iter()
-                .map(|info| ExtraInfo { info: Some(info) })
-                .collect(),
-        };
+    pub async fn send_heartbeat(&self, node_id: u32) -> Result<()> {
+        let request = HeartbeatRequest { node_id };
         let resp = self.inner.heartbeat(request).await?;
-        if let Some(status) = resp.status {
-            if status.code() == risingwave_pb::common::status::Code::UnknownWorker {
-                // Ignore the error if we're already shutting down.
-                // Otherwise, exit the process.
-                if !self.shutting_down.load(Relaxed) {
-                    tracing::error!(message = status.message, "worker expired");
-                    std::process::exit(1);
-                }
+        if let Some(status) = resp.status
+            && status.code() == risingwave_pb::common::status::Code::UnknownWorker
+        {
+            // Ignore the error if we're already shutting down.
+            // Otherwise, exit the process.
+            if !self.shutting_down.load(Relaxed) {
+                tracing::error!(message = status.message, "worker expired");
+                std::process::exit(1);
             }
         }
         Ok(())
     }
 
-    pub async fn create_database(&self, db: PbDatabase) -> Result<CatalogVersion> {
+    pub async fn create_database(&self, db: PbDatabase) -> Result<WaitVersion> {
         let request = CreateDatabaseRequest { db: Some(db) };
         let resp = self.inner.create_database(request).await?;
         // TODO: handle error in `resp.status` here
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
-    pub async fn create_schema(&self, schema: PbSchema) -> Result<CatalogVersion> {
+    pub async fn create_schema(&self, schema: PbSchema) -> Result<WaitVersion> {
         let request = CreateSchemaRequest {
             schema: Some(schema),
         };
         let resp = self.inner.create_schema(request).await?;
         // TODO: handle error in `resp.status` here
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
     pub async fn create_materialized_view(
         &self,
         table: PbTable,
         graph: StreamFragmentGraph,
-    ) -> Result<CatalogVersion> {
+        dependencies: HashSet<ObjectId>,
+        specific_resource_group: Option<String>,
+        if_not_exists: bool,
+    ) -> Result<WaitVersion> {
         let request = CreateMaterializedViewRequest {
             materialized_view: Some(table),
             fragment_graph: Some(graph),
             backfill: PbBackfillType::Regular as _,
+            dependencies: dependencies.into_iter().collect(),
+            specific_resource_group,
+            if_not_exists,
         };
         let resp = self.inner.create_materialized_view(request).await?;
         // TODO: handle error in `resp.status` here
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
     pub async fn drop_materialized_view(
         &self,
         table_id: TableId,
         cascade: bool,
-    ) -> Result<CatalogVersion> {
+    ) -> Result<WaitVersion> {
         let request = DropMaterializedViewRequest {
             table_id: table_id.table_id(),
             cascade,
         };
 
         let resp = self.inner.drop_materialized_view(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
-    pub async fn create_source(&self, source: PbSource) -> Result<CatalogVersion> {
-        let request = CreateSourceRequest {
-            source: Some(source),
-            fragment_graph: None,
-        };
-
-        let resp = self.inner.create_source(request).await?;
-        Ok(resp.version)
-    }
-
-    pub async fn create_source_with_graph(
+    pub async fn create_source(
         &self,
         source: PbSource,
-        graph: StreamFragmentGraph,
-    ) -> Result<CatalogVersion> {
+        graph: Option<StreamFragmentGraph>,
+        if_not_exists: bool,
+    ) -> Result<WaitVersion> {
         let request = CreateSourceRequest {
             source: Some(source),
-            fragment_graph: Some(graph),
+            fragment_graph: graph,
+            if_not_exists,
         };
 
         let resp = self.inner.create_source(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
     pub async fn create_sink(
         &self,
         sink: PbSink,
         graph: StreamFragmentGraph,
-        affected_table_change: Option<ReplaceTablePlan>,
-    ) -> Result<CatalogVersion> {
+        affected_table_change: Option<ReplaceJobPlan>,
+        dependencies: HashSet<ObjectId>,
+        if_not_exists: bool,
+    ) -> Result<WaitVersion> {
         let request = CreateSinkRequest {
             sink: Some(sink),
             fragment_graph: Some(graph),
             affected_table_change,
+            dependencies: dependencies.into_iter().collect(),
+            if_not_exists,
         };
 
         let resp = self.inner.create_sink(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
-    pub async fn create_subscription(
-        &self,
-        subscription: PbSubscription,
-    ) -> Result<CatalogVersion> {
+    pub async fn create_subscription(&self, subscription: PbSubscription) -> Result<WaitVersion> {
         let request = CreateSubscriptionRequest {
             subscription: Some(subscription),
         };
 
         let resp = self.inner.create_subscription(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
-    pub async fn create_function(&self, function: PbFunction) -> Result<CatalogVersion> {
+    pub async fn create_function(&self, function: PbFunction) -> Result<WaitVersion> {
         let request = CreateFunctionRequest {
             function: Some(function),
         };
         let resp = self.inner.create_function(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
     pub async fn create_table(
@@ -449,76 +518,118 @@ impl MetaClient {
         table: PbTable,
         graph: StreamFragmentGraph,
         job_type: PbTableJobType,
-    ) -> Result<CatalogVersion> {
+        if_not_exists: bool,
+        dependencies: HashSet<ObjectId>,
+    ) -> Result<WaitVersion> {
         let request = CreateTableRequest {
             materialized_view: Some(table),
             fragment_graph: Some(graph),
             source,
             job_type: job_type as _,
+            if_not_exists,
+            dependencies: dependencies.into_iter().collect(),
         };
         let resp = self.inner.create_table(request).await?;
         // TODO: handle error in `resp.status` here
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
-    pub async fn comment_on(&self, comment: PbComment) -> Result<CatalogVersion> {
+    pub async fn comment_on(&self, comment: PbComment) -> Result<WaitVersion> {
         let request = CommentOnRequest {
             comment: Some(comment),
         };
         let resp = self.inner.comment_on(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
     pub async fn alter_name(
         &self,
         object: alter_name_request::Object,
         name: &str,
-    ) -> Result<CatalogVersion> {
+    ) -> Result<WaitVersion> {
         let request = AlterNameRequest {
             object: Some(object),
-            new_name: name.to_string(),
+            new_name: name.to_owned(),
         };
         let resp = self.inner.alter_name(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
-    // only adding columns is supported
-    pub async fn alter_source_column(&self, source: PbSource) -> Result<CatalogVersion> {
-        let request = AlterSourceRequest {
-            source: Some(source),
-        };
-        let resp = self.inner.alter_source(request).await?;
-        Ok(resp.version)
-    }
-
-    pub async fn alter_owner(&self, object: Object, owner_id: u32) -> Result<CatalogVersion> {
+    pub async fn alter_owner(&self, object: Object, owner_id: u32) -> Result<WaitVersion> {
         let request = AlterOwnerRequest {
             object: Some(object),
             owner_id,
         };
         let resp = self.inner.alter_owner(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
+    }
+
+    pub async fn alter_database_param(
+        &self,
+        database_id: DatabaseId,
+        param: AlterDatabaseParam,
+    ) -> Result<WaitVersion> {
+        let request = match param {
+            AlterDatabaseParam::BarrierIntervalMs(barrier_interval_ms) => {
+                let barrier_interval_ms = OptionalUint32 {
+                    value: barrier_interval_ms,
+                };
+                AlterDatabaseParamRequest {
+                    database_id,
+                    param: Some(alter_database_param_request::Param::BarrierIntervalMs(
+                        barrier_interval_ms,
+                    )),
+                }
+            }
+            AlterDatabaseParam::CheckpointFrequency(checkpoint_frequency) => {
+                let checkpoint_frequency = OptionalUint64 {
+                    value: checkpoint_frequency,
+                };
+                AlterDatabaseParamRequest {
+                    database_id,
+                    param: Some(alter_database_param_request::Param::CheckpointFrequency(
+                        checkpoint_frequency,
+                    )),
+                }
+            }
+        };
+        let resp = self.inner.alter_database_param(request).await?;
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
     pub async fn alter_set_schema(
         &self,
         object: alter_set_schema_request::Object,
         new_schema_id: u32,
-    ) -> Result<CatalogVersion> {
+    ) -> Result<WaitVersion> {
         let request = AlterSetSchemaRequest {
             new_schema_id,
             object: Some(object),
         };
         let resp = self.inner.alter_set_schema(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
-    pub async fn alter_source_with_sr(&self, source: PbSource) -> Result<CatalogVersion> {
+    pub async fn alter_source(&self, source: PbSource) -> Result<WaitVersion> {
         let request = AlterSourceRequest {
             source: Some(source),
         };
         let resp = self.inner.alter_source(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
     pub async fn alter_parallelism(
@@ -537,33 +648,113 @@ impl MetaClient {
         Ok(())
     }
 
-    pub async fn replace_table(
+    pub async fn alter_cdc_table_backfill_parallelism(
         &self,
-        source: Option<PbSource>,
-        table: PbTable,
-        graph: StreamFragmentGraph,
-        table_col_index_mapping: ColIndexMapping,
-        job_type: PbTableJobType,
-    ) -> Result<CatalogVersion> {
-        let request = ReplaceTablePlanRequest {
-            plan: Some(ReplaceTablePlan {
-                source,
-                table: Some(table),
-                fragment_graph: Some(graph),
-                table_col_index_mapping: Some(table_col_index_mapping.to_protobuf()),
-                job_type: job_type as _,
-            }),
+        table_id: u32,
+        parallelism: PbTableParallelism,
+    ) -> Result<()> {
+        let request = AlterCdcTableBackfillParallelismRequest {
+            table_id,
+            parallelism: Some(parallelism),
         };
-        let resp = self.inner.replace_table_plan(request).await?;
-        // TODO: handle error in `resp.status` here
-        Ok(resp.version)
+        self.inner
+            .alter_cdc_table_backfill_parallelism(request)
+            .await?;
+        Ok(())
     }
 
-    pub async fn create_view(&self, view: PbView) -> Result<CatalogVersion> {
-        let request = CreateViewRequest { view: Some(view) };
+    pub async fn alter_resource_group(
+        &self,
+        table_id: u32,
+        resource_group: Option<String>,
+        deferred: bool,
+    ) -> Result<()> {
+        let request = AlterResourceGroupRequest {
+            table_id,
+            resource_group,
+            deferred,
+        };
+
+        self.inner.alter_resource_group(request).await?;
+        Ok(())
+    }
+
+    pub async fn alter_swap_rename(
+        &self,
+        object: alter_swap_rename_request::Object,
+    ) -> Result<WaitVersion> {
+        let request = AlterSwapRenameRequest {
+            object: Some(object),
+        };
+        let resp = self.inner.alter_swap_rename(request).await?;
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
+    }
+
+    pub async fn alter_secret(
+        &self,
+        secret_id: u32,
+        secret_name: String,
+        database_id: u32,
+        schema_id: u32,
+        owner_id: u32,
+        value: Vec<u8>,
+    ) -> Result<WaitVersion> {
+        let request = AlterSecretRequest {
+            secret_id,
+            name: secret_name,
+            database_id,
+            schema_id,
+            owner_id,
+            value,
+        };
+        let resp = self.inner.alter_secret(request).await?;
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
+    }
+
+    pub async fn replace_job(
+        &self,
+        graph: StreamFragmentGraph,
+        replace_job: ReplaceJob,
+    ) -> Result<WaitVersion> {
+        let request = ReplaceJobPlanRequest {
+            plan: Some(ReplaceJobPlan {
+                fragment_graph: Some(graph),
+                replace_job: Some(replace_job),
+            }),
+        };
+        let resp = self.inner.replace_job_plan(request).await?;
+        // TODO: handle error in `resp.status` here
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
+    }
+
+    pub async fn auto_schema_change(&self, schema_change: SchemaChangeEnvelope) -> Result<()> {
+        let request = AutoSchemaChangeRequest {
+            schema_change: Some(schema_change),
+        };
+        let _ = self.inner.auto_schema_change(request).await?;
+        Ok(())
+    }
+
+    pub async fn create_view(
+        &self,
+        view: PbView,
+        dependencies: HashSet<ObjectId>,
+    ) -> Result<WaitVersion> {
+        let request = CreateViewRequest {
+            view: Some(view),
+            dependencies: dependencies.into_iter().collect(),
+        };
         let resp = self.inner.create_view(request).await?;
         // TODO: handle error in `resp.status` here
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
     pub async fn create_index(
@@ -571,15 +762,19 @@ impl MetaClient {
         index: PbIndex,
         table: PbTable,
         graph: StreamFragmentGraph,
-    ) -> Result<CatalogVersion> {
+        if_not_exists: bool,
+    ) -> Result<WaitVersion> {
         let request = CreateIndexRequest {
             index: Some(index),
             index_table: Some(table),
             fragment_graph: Some(graph),
+            if_not_exists,
         };
         let resp = self.inner.create_index(request).await?;
         // TODO: handle error in `resp.status` here
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
     pub async fn drop_table(
@@ -587,7 +782,7 @@ impl MetaClient {
         source_id: Option<u32>,
         table_id: TableId,
         cascade: bool,
-    ) -> Result<CatalogVersion> {
+    ) -> Result<WaitVersion> {
         let request = DropTableRequest {
             source_id: source_id.map(SourceId::Id),
             table_id: table_id.table_id(),
@@ -595,91 +790,100 @@ impl MetaClient {
         };
 
         let resp = self.inner.drop_table(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
-    pub async fn drop_view(&self, view_id: u32, cascade: bool) -> Result<CatalogVersion> {
+    pub async fn compact_iceberg_table(&self, sink_id: u32) -> Result<u64> {
+        let request = CompactIcebergTableRequest { sink_id };
+        let resp = self.inner.compact_iceberg_table(request).await?;
+        Ok(resp.task_id)
+    }
+
+    pub async fn drop_view(&self, view_id: u32, cascade: bool) -> Result<WaitVersion> {
         let request = DropViewRequest { view_id, cascade };
         let resp = self.inner.drop_view(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
-    pub async fn drop_source(&self, source_id: u32, cascade: bool) -> Result<CatalogVersion> {
+    pub async fn drop_source(&self, source_id: u32, cascade: bool) -> Result<WaitVersion> {
         let request = DropSourceRequest { source_id, cascade };
         let resp = self.inner.drop_source(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
     pub async fn drop_sink(
         &self,
         sink_id: u32,
         cascade: bool,
-        affected_table_change: Option<ReplaceTablePlan>,
-    ) -> Result<CatalogVersion> {
+        affected_table_change: Option<ReplaceJobPlan>,
+    ) -> Result<WaitVersion> {
         let request = DropSinkRequest {
             sink_id,
             cascade,
             affected_table_change,
         };
         let resp = self.inner.drop_sink(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
     pub async fn drop_subscription(
         &self,
         subscription_id: u32,
         cascade: bool,
-    ) -> Result<CatalogVersion> {
+    ) -> Result<WaitVersion> {
         let request = DropSubscriptionRequest {
             subscription_id,
             cascade,
         };
         let resp = self.inner.drop_subscription(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
-    pub async fn list_change_log_epochs(
-        &self,
-        table_id: u32,
-        min_epoch: u64,
-        max_count: u32,
-    ) -> Result<Vec<u64>> {
-        let request = ListChangeLogEpochsRequest {
-            table_id,
-            min_epoch,
-            max_count,
-        };
-        let resp = self.inner.list_change_log_epochs(request).await?;
-        Ok(resp.epochs)
-    }
-
-    pub async fn drop_index(&self, index_id: IndexId, cascade: bool) -> Result<CatalogVersion> {
+    pub async fn drop_index(&self, index_id: IndexId, cascade: bool) -> Result<WaitVersion> {
         let request = DropIndexRequest {
             index_id: index_id.index_id,
             cascade,
         };
         let resp = self.inner.drop_index(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
-    pub async fn drop_function(&self, function_id: FunctionId) -> Result<CatalogVersion> {
+    pub async fn drop_function(&self, function_id: FunctionId) -> Result<WaitVersion> {
         let request = DropFunctionRequest {
             function_id: function_id.0,
         };
         let resp = self.inner.drop_function(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
-    pub async fn drop_database(&self, database_id: DatabaseId) -> Result<CatalogVersion> {
+    pub async fn drop_database(&self, database_id: DatabaseId) -> Result<WaitVersion> {
         let request = DropDatabaseRequest { database_id };
         let resp = self.inner.drop_database(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
-    pub async fn drop_schema(&self, schema_id: SchemaId) -> Result<CatalogVersion> {
-        let request = DropSchemaRequest { schema_id };
+    pub async fn drop_schema(&self, schema_id: SchemaId, cascade: bool) -> Result<WaitVersion> {
+        let request = DropSchemaRequest { schema_id, cascade };
         let resp = self.inner.drop_schema(request).await?;
-        Ok(resp.version)
+        Ok(resp
+            .version
+            .ok_or_else(|| anyhow!("wait version not set"))?)
     }
 
     // TODO: using UserInfoVersion instead as return type.
@@ -749,6 +953,25 @@ impl MetaClient {
         Ok(resp.version)
     }
 
+    pub async fn alter_default_privilege(
+        &self,
+        user_ids: Vec<u32>,
+        database_id: DatabaseId,
+        schema_ids: Vec<SchemaId>,
+        operation: AlterDefaultPrivilegeOperation,
+        granted_by: u32,
+    ) -> Result<()> {
+        let request = AlterDefaultPrivilegeRequest {
+            user_ids,
+            database_id,
+            schema_ids,
+            operation: Some(operation),
+            granted_by,
+        };
+        self.inner.alter_default_privilege(request).await?;
+        Ok(())
+    }
+
     /// Unregister the current node from the cluster.
     pub async fn unregister(&self) -> Result<()> {
         let request = DeleteWorkerNodeRequest {
@@ -807,12 +1030,9 @@ impl MetaClient {
     }
 
     /// Starts a heartbeat worker.
-    ///
-    /// When sending heartbeat RPC, it also carries extra info from `extra_info_sources`.
     pub fn start_heartbeat_loop(
         meta_client: MetaClient,
         min_interval: Duration,
-        extra_info_sources: Vec<ExtraInfoSourceRef>,
     ) -> (JoinHandle<()>, Sender<()>) {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let join_handle = tokio::spawn(async move {
@@ -828,19 +1048,11 @@ impl MetaClient {
                     // Wait for interval
                     _ = min_interval_ticker.tick() => {},
                 }
-                let mut extra_info = Vec::with_capacity(extra_info_sources.len());
-                for extra_info_source in &extra_info_sources {
-                    if let Some(info) = extra_info_source.get_extra_info().await {
-                        // None means the info is not available at the moment, and won't be sent to
-                        // meta.
-                        extra_info.push(info);
-                    }
-                }
                 tracing::debug!(target: "events::meta::client_heartbeat", "heartbeat");
                 match tokio::time::timeout(
                     // TODO: decide better min_interval for timeout
                     min_interval * 3,
-                    meta_client.send_heartbeat(meta_client.worker_id(), extra_info),
+                    meta_client.send_heartbeat(meta_client.worker_id()),
                 )
                 .await
                 {
@@ -863,10 +1075,10 @@ impl MetaClient {
         Ok(resp.tables)
     }
 
-    pub async fn flush(&self, checkpoint: bool) -> Result<HummockSnapshot> {
-        let request = FlushRequest { checkpoint };
+    pub async fn flush(&self, database_id: DatabaseId) -> Result<HummockVersionId> {
+        let request = FlushRequest { database_id };
         let resp = self.inner.flush(request).await?;
-        Ok(resp.snapshot.unwrap())
+        Ok(HummockVersionId::new(resp.hummock_version_id))
     }
 
     pub async fn wait(&self) -> Result<()> {
@@ -898,10 +1110,10 @@ impl MetaClient {
         Ok(resp.table_fragments)
     }
 
-    pub async fn list_table_fragment_states(&self) -> Result<Vec<TableFragmentState>> {
+    pub async fn list_streaming_job_states(&self) -> Result<Vec<StreamingJobState>> {
         let resp = self
             .inner
-            .list_table_fragment_states(ListTableFragmentStatesRequest {})
+            .list_streaming_job_states(ListStreamingJobStatesRequest {})
             .await?;
         Ok(resp.states)
     }
@@ -914,12 +1126,40 @@ impl MetaClient {
         Ok(resp.distributions)
     }
 
+    pub async fn list_creating_fragment_distribution(&self) -> Result<Vec<FragmentDistribution>> {
+        let resp = self
+            .inner
+            .list_creating_fragment_distribution(ListCreatingFragmentDistributionRequest {})
+            .await?;
+        Ok(resp.distributions)
+    }
+
+    pub async fn get_fragment_by_id(
+        &self,
+        fragment_id: u32,
+    ) -> Result<Option<FragmentDistribution>> {
+        let resp = self
+            .inner
+            .get_fragment_by_id(GetFragmentByIdRequest { fragment_id })
+            .await?;
+        Ok(resp.distribution)
+    }
+
     pub async fn list_actor_states(&self) -> Result<Vec<ActorState>> {
         let resp = self
             .inner
             .list_actor_states(ListActorStatesRequest {})
             .await?;
         Ok(resp.states)
+    }
+
+    pub async fn list_actor_splits(&self) -> Result<Vec<ActorSplit>> {
+        let resp = self
+            .inner
+            .list_actor_splits(ListActorSplitsRequest {})
+            .await?;
+
+        Ok(resp.actor_splits)
     }
 
     pub async fn list_object_dependencies(&self) -> Result<Vec<PbObjectDependencies>> {
@@ -995,15 +1235,6 @@ impl MetaClient {
             .await
     }
 
-    pub async fn risectl_get_pinned_snapshots_summary(
-        &self,
-    ) -> Result<RiseCtlGetPinnedSnapshotsSummaryResponse> {
-        let request = RiseCtlGetPinnedSnapshotsSummaryRequest {};
-        self.inner
-            .rise_ctl_get_pinned_snapshots_summary(request)
-            .await
-    }
-
     pub async fn risectl_get_checkpoint_hummock_version(
         &self,
     ) -> Result<RiseCtlGetCheckpointVersionResponse> {
@@ -1054,12 +1285,12 @@ impl MetaClient {
 
     pub async fn list_version_deltas(
         &self,
-        start_id: u64,
+        start_id: HummockVersionId,
         num_limit: u32,
         committed_epoch_limit: HummockEpoch,
     ) -> Result<Vec<HummockVersionDelta>> {
         let req = ListVersionDeltasRequest {
-            start_id,
+            start_id: start_id.to_u64(),
             num_limit,
             committed_epoch_limit,
         };
@@ -1081,7 +1312,7 @@ impl MetaClient {
         compaction_groups: Vec<CompactionGroupId>,
     ) -> Result<()> {
         let req = TriggerCompactionDeterministicRequest {
-            version_id,
+            version_id: version_id.to_u64(),
             compaction_groups,
         };
         self.inner.trigger_compaction_deterministic(req).await?;
@@ -1098,15 +1329,6 @@ impl MetaClient {
                 .current_version
                 .unwrap(),
         ))
-    }
-
-    pub async fn pin_specific_snapshot(&self, epoch: HummockEpoch) -> Result<HummockSnapshot> {
-        let req = PinSpecificSnapshotRequest {
-            context_id: self.worker_id(),
-            epoch,
-        };
-        let resp = self.inner.pin_specific_snapshot(req).await?;
-        Ok(resp.snapshot.unwrap())
     }
 
     pub async fn get_assigned_compact_task_num(&self) -> Result<usize> {
@@ -1173,10 +1395,46 @@ impl MetaClient {
         Ok(resp)
     }
 
-    pub async fn get_system_params(&self) -> Result<SystemParamsReader> {
-        let req = GetSystemParamsRequest {};
-        let resp = self.inner.get_system_params(req).await?;
-        Ok(resp.params.unwrap().into())
+    pub async fn get_meta_store_endpoint(&self) -> Result<String> {
+        let req = GetMetaStoreInfoRequest {};
+        let resp = self.inner.get_meta_store_info(req).await?;
+        Ok(resp.meta_store_endpoint)
+    }
+
+    pub async fn alter_sink_props(
+        &self,
+        sink_id: u32,
+        changed_props: BTreeMap<String, String>,
+        changed_secret_refs: BTreeMap<String, PbSecretRef>,
+        connector_conn_ref: Option<u32>,
+    ) -> Result<()> {
+        let req = AlterConnectorPropsRequest {
+            object_id: sink_id,
+            changed_props: changed_props.into_iter().collect(),
+            changed_secret_refs: changed_secret_refs.into_iter().collect(),
+            connector_conn_ref,
+            object_type: AlterConnectorPropsObject::Sink as i32,
+        };
+        let _resp = self.inner.alter_connector_props(req).await?;
+        Ok(())
+    }
+
+    pub async fn alter_source_connector_props(
+        &self,
+        source_id: u32,
+        changed_props: BTreeMap<String, String>,
+        changed_secret_refs: BTreeMap<String, PbSecretRef>,
+        connector_conn_ref: Option<u32>,
+    ) -> Result<()> {
+        let req = AlterConnectorPropsRequest {
+            object_id: source_id,
+            changed_props: changed_props.into_iter().collect(),
+            changed_secret_refs: changed_secret_refs.into_iter().collect(),
+            connector_conn_ref,
+            object_type: AlterConnectorPropsObject::Source as i32,
+        };
+        let _resp = self.inner.alter_connector_props(req).await?;
+        Ok(())
     }
 
     pub async fn set_system_param(
@@ -1211,18 +1469,25 @@ impl MetaClient {
         &self,
         group_id: CompactionGroupId,
         table_ids_to_new_group: &[StateTableId],
+        partition_vnode_count: u32,
     ) -> Result<CompactionGroupId> {
         let req = SplitCompactionGroupRequest {
             group_id,
             table_ids: table_ids_to_new_group.to_vec(),
+            partition_vnode_count,
         };
         let resp = self.inner.split_compaction_group(req).await?;
         Ok(resp.new_group_id)
     }
 
-    pub async fn get_tables(&self, table_ids: &[u32]) -> Result<HashMap<u32, Table>> {
+    pub async fn get_tables(
+        &self,
+        table_ids: &[u32],
+        include_dropped_tables: bool,
+    ) -> Result<HashMap<u32, Table>> {
         let req = GetTablesRequest {
             table_ids: table_ids.to_vec(),
+            include_dropped_tables,
         };
         let resp = self.inner.get_tables(req).await?;
         Ok(resp.tables)
@@ -1388,6 +1653,26 @@ impl MetaClient {
         .join();
     }
 
+    pub async fn add_sink_fail_evet(
+        &self,
+        sink_id: u32,
+        sink_name: String,
+        connector: String,
+        error: String,
+    ) -> Result<()> {
+        let event = event_log::EventSinkFail {
+            sink_id,
+            sink_name,
+            connector,
+            error,
+        };
+        let req = AddEventLogRequest {
+            event: Some(add_event_log_request::Event::SinkFail(event)),
+        };
+        self.inner.add_event_log(req).await?;
+        Ok(())
+    }
+
     pub async fn cancel_compact_task(&self, task_id: u64, task_status: TaskStatus) -> Result<bool> {
         let req = CancelCompactTaskRequest {
             task_id,
@@ -1397,10 +1682,70 @@ impl MetaClient {
         Ok(resp.ret)
     }
 
-    pub async fn get_version_by_epoch(&self, epoch: HummockEpoch) -> Result<PbHummockVersion> {
-        let req = GetVersionByEpochRequest { epoch };
+    pub async fn get_version_by_epoch(
+        &self,
+        epoch: HummockEpoch,
+        table_id: u32,
+    ) -> Result<PbHummockVersion> {
+        let req = GetVersionByEpochRequest { epoch, table_id };
         let resp = self.inner.get_version_by_epoch(req).await?;
         Ok(resp.version.unwrap())
+    }
+
+    pub async fn get_cluster_limits(
+        &self,
+    ) -> Result<Vec<risingwave_common::util::cluster_limit::ClusterLimit>> {
+        let req = GetClusterLimitsRequest {};
+        let resp = self.inner.get_cluster_limits(req).await?;
+        Ok(resp.active_limits.into_iter().map(|l| l.into()).collect())
+    }
+
+    pub async fn merge_compaction_group(
+        &self,
+        left_group_id: CompactionGroupId,
+        right_group_id: CompactionGroupId,
+    ) -> Result<()> {
+        let req = MergeCompactionGroupRequest {
+            left_group_id,
+            right_group_id,
+        };
+        self.inner.merge_compaction_group(req).await?;
+        Ok(())
+    }
+
+    /// List all rate limits for sources and backfills
+    pub async fn list_rate_limits(&self) -> Result<Vec<RateLimitInfo>> {
+        let request = ListRateLimitsRequest {};
+        let resp = self.inner.list_rate_limits(request).await?;
+        Ok(resp.rate_limits)
+    }
+
+    pub async fn list_hosted_iceberg_tables(&self) -> Result<Vec<IcebergTable>> {
+        let request = ListIcebergTablesRequest {};
+        let resp = self.inner.list_iceberg_tables(request).await?;
+        Ok(resp.iceberg_tables)
+    }
+
+    /// Get the await tree of all nodes in the cluster.
+    pub async fn get_cluster_stack_trace(
+        &self,
+        actor_traces_format: ActorTracesFormat,
+    ) -> Result<StackTraceResponse> {
+        let request = StackTraceRequest {
+            actor_traces_format: actor_traces_format as i32,
+        };
+        let resp = self.inner.stack_trace(request).await?;
+        Ok(resp)
+    }
+
+    pub async fn set_sync_log_store_aligned(&self, job_id: u32, aligned: bool) -> Result<()> {
+        let request = SetSyncLogStoreAlignedRequest { job_id, aligned };
+        self.inner.set_sync_log_store_aligned(request).await?;
+        Ok(())
+    }
+
+    pub async fn refresh(&self, request: RefreshRequest) -> Result<RefreshResponse> {
+        self.inner.refresh(request).await
     }
 }
 
@@ -1409,7 +1754,7 @@ impl HummockMetaClient for MetaClient {
     async fn unpin_version_before(&self, unpin_version_before: HummockVersionId) -> Result<()> {
         let req = UnpinVersionBeforeRequest {
             context_id: self.worker_id(),
-            unpin_version_before,
+            unpin_version_before: unpin_version_before.to_u64(),
         };
         self.inner.unpin_version_before(req).await?;
         Ok(())
@@ -1427,78 +1772,21 @@ impl HummockMetaClient for MetaClient {
         ))
     }
 
-    async fn pin_snapshot(&self) -> Result<HummockSnapshot> {
-        let req = PinSnapshotRequest {
-            context_id: self.worker_id(),
-        };
-        let resp = self.inner.pin_snapshot(req).await?;
-        Ok(resp.snapshot.unwrap())
-    }
-
-    async fn get_snapshot(&self) -> Result<HummockSnapshot> {
-        let req = GetEpochRequest {};
-        let resp = self.inner.get_epoch(req).await?;
-        Ok(resp.snapshot.unwrap())
-    }
-
-    async fn unpin_snapshot(&self) -> Result<()> {
-        let req = UnpinSnapshotRequest {
-            context_id: self.worker_id(),
-        };
-        self.inner.unpin_snapshot(req).await?;
-        Ok(())
-    }
-
-    async fn unpin_snapshot_before(&self, pinned_epochs: HummockEpoch) -> Result<()> {
-        let req = UnpinSnapshotBeforeRequest {
-            context_id: self.worker_id(),
-            // For unpin_snapshot_before, we do not care about snapshots list but only min epoch.
-            min_snapshot: Some(HummockSnapshot {
-                committed_epoch: pinned_epochs,
-                current_epoch: pinned_epochs,
-            }),
-        };
-        self.inner.unpin_snapshot_before(req).await?;
-        Ok(())
-    }
-
-    async fn get_new_sst_ids(&self, number: u32) -> Result<SstObjectIdRange> {
+    async fn get_new_object_ids(&self, number: u32) -> Result<ObjectIdRange> {
         let resp = self
             .inner
-            .get_new_sst_ids(GetNewSstIdsRequest { number })
+            .get_new_object_ids(GetNewObjectIdsRequest { number })
             .await?;
-        Ok(SstObjectIdRange::new(resp.start_id, resp.end_id))
+        Ok(ObjectIdRange::new(resp.start_id, resp.end_id))
     }
 
-    async fn commit_epoch(&self, _epoch: HummockEpoch, _sync_result: SyncResult) -> Result<()> {
-        panic!("Only meta service can commit_epoch in production.")
-    }
-
-    async fn update_current_epoch(&self, _epoch: HummockEpoch) -> Result<()> {
-        panic!("Only meta service can update_current_epoch in production.")
-    }
-
-    async fn report_vacuum_task(&self, vacuum_task: VacuumTask) -> Result<()> {
-        let req = ReportVacuumTaskRequest {
-            vacuum_task: Some(vacuum_task),
-        };
-        self.inner.report_vacuum_task(req).await?;
-        Ok(())
-    }
-
-    async fn report_full_scan_task(
+    async fn commit_epoch_with_change_log(
         &self,
-        filtered_object_ids: Vec<HummockSstableObjectId>,
-        total_object_count: u64,
-        total_object_size: u64,
+        _epoch: HummockEpoch,
+        _sync_result: SyncResult,
+        _change_log_info: Option<HummockMetaClientChangeLogInfo>,
     ) -> Result<()> {
-        let req = ReportFullScanTaskRequest {
-            object_ids: filtered_object_ids,
-            total_object_count,
-            total_object_size,
-        };
-        self.inner.report_full_scan_task(req).await?;
-        Ok(())
+        panic!("Only meta service can commit_epoch in production.")
     }
 
     async fn trigger_manual_compaction(
@@ -1569,8 +1857,44 @@ impl HummockMetaClient for MetaClient {
         Ok((request_sender, Box::pin(stream)))
     }
 
-    async fn get_version_by_epoch(&self, epoch: HummockEpoch) -> Result<PbHummockVersion> {
-        self.get_version_by_epoch(epoch).await
+    async fn get_version_by_epoch(
+        &self,
+        epoch: HummockEpoch,
+        table_id: u32,
+    ) -> Result<PbHummockVersion> {
+        self.get_version_by_epoch(epoch, table_id).await
+    }
+
+    async fn subscribe_iceberg_compaction_event(
+        &self,
+    ) -> Result<(
+        UnboundedSender<SubscribeIcebergCompactionEventRequest>,
+        BoxStream<'static, IcebergCompactionEventItem>,
+    )> {
+        let (request_sender, request_receiver) =
+            unbounded_channel::<SubscribeIcebergCompactionEventRequest>();
+        request_sender
+            .send(SubscribeIcebergCompactionEventRequest {
+                event: Some(subscribe_iceberg_compaction_event_request::Event::Register(
+                    IcebergRegister {
+                        context_id: self.worker_id(),
+                    },
+                )),
+                create_at: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .expect("Clock may have gone backwards")
+                    .as_millis() as u64,
+            })
+            .context("Failed to subscribe compaction event")?;
+
+        let stream = self
+            .inner
+            .subscribe_iceberg_compaction_event(Request::new(UnboundedReceiverStream::new(
+                request_receiver,
+            )))
+            .await?;
+
+        Ok((request_sender, Box::pin(stream)))
     }
 }
 
@@ -1607,6 +1931,9 @@ struct GrpcMetaClientCore {
     cloud_client: CloudServiceClient<Channel>,
     sink_coordinate_client: SinkCoordinationRpcClient,
     event_log_client: EventLogServiceClient<Channel>,
+    cluster_limit_client: ClusterLimitServiceClient<Channel>,
+    hosted_iceberg_catalog_service_client: HostedIcebergCatalogServiceClient<Channel>,
+    monitor_client: MonitorServiceClient<Channel>,
 }
 
 impl GrpcMetaClientCore {
@@ -1633,7 +1960,11 @@ impl GrpcMetaClientCore {
         let serving_client = ServingServiceClient::new(channel.clone());
         let cloud_client = CloudServiceClient::new(channel.clone());
         let sink_coordinate_client = SinkCoordinationServiceClient::new(channel.clone());
-        let event_log_client = EventLogServiceClient::new(channel);
+        let event_log_client = EventLogServiceClient::new(channel.clone());
+        let cluster_limit_client = ClusterLimitServiceClient::new(channel.clone());
+        let hosted_iceberg_catalog_service_client =
+            HostedIcebergCatalogServiceClient::new(channel.clone());
+        let monitor_client = MonitorServiceClient::new(channel);
 
         GrpcMetaClientCore {
             cluster_client,
@@ -1653,6 +1984,9 @@ impl GrpcMetaClientCore {
             cloud_client,
             sink_coordinate_client,
             event_log_client,
+            cluster_limit_client,
+            hosted_iceberg_catalog_service_client,
+            monitor_client,
         }
     }
 }
@@ -1708,38 +2042,40 @@ impl MetaMemberManagement {
                 let mut fetched_members = None;
 
                 for (addr, client) in &mut member_group.members {
-                    let client: Result<MetaMemberClient> = try {
-                        match client {
+                    let members: Result<_> = try {
+                        let mut client = match client {
                             Some(cached_client) => cached_client.to_owned(),
                             None => {
                                 let endpoint = GrpcMetaClient::addr_to_endpoint(addr.clone());
-                                let channel = GrpcMetaClient::connect_to_endpoint(endpoint).await?;
+                                let channel = GrpcMetaClient::connect_to_endpoint(endpoint)
+                                    .await
+                                    .context("failed to create client")?;
                                 let new_client: MetaMemberClient =
                                     MetaMemberServiceClient::new(channel);
                                 *client = Some(new_client.clone());
 
                                 new_client
                             }
-                        }
+                        };
+
+                        let resp = client
+                            .members(MembersRequest {})
+                            .await
+                            .context("failed to fetch members")?;
+
+                        resp.into_inner().members
                     };
-                    if let Err(err) = client {
-                        tracing::warn!(%addr, error = %err.as_report(), "failed to create client");
-                        continue;
-                    }
-                    match client.unwrap().members(MembersRequest {}).await {
-                        Err(err) => {
-                            tracing::warn!(%addr, error = %err.as_report(), "failed to fetch members");
-                            continue;
-                        }
-                        Ok(resp) => {
-                            fetched_members = Some(resp.into_inner().members);
-                            break;
-                        }
+
+                    let fetched = members.is_ok();
+                    fetched_members = Some(members);
+                    if fetched {
+                        break;
                     }
                 }
 
-                let members =
-                    fetched_members.ok_or_else(|| anyhow!("could not refresh members"))?;
+                let members = fetched_members
+                    .context("no member available in the list")?
+                    .context("could not refresh members")?;
 
                 // find new leader
                 let mut leader = None;
@@ -1916,7 +2252,7 @@ impl GrpcMetaClient {
             .map(|addr| (Self::addr_to_endpoint(addr.clone()), addr))
             .collect();
 
-        let endpoints = endpoints.clone();
+        let mut last_error = None;
 
         for (endpoint, addr) in endpoints {
             match Self::connect_to_endpoint(endpoint).await {
@@ -1929,14 +2265,19 @@ impl GrpcMetaClient {
                         error = %e.as_report(),
                         "Failed to connect to meta server {}, trying again",
                         addr,
-                    )
+                    );
+                    last_error = Some(e);
                 }
             }
         }
 
-        Err(RpcError::Internal(anyhow!(
-            "Failed to connect to meta server"
-        )))
+        if let Some(last_error) = last_error {
+            Err(anyhow::anyhow!(last_error)
+                .context("failed to connect to all meta servers")
+                .into())
+        } else {
+            bail!("no meta server address provided")
+        }
     }
 
     async fn connect_to_endpoint(endpoint: Endpoint) -> Result<Channel> {
@@ -1944,9 +2285,9 @@ impl GrpcMetaClient {
             .http2_keep_alive_interval(Duration::from_secs(Self::ENDPOINT_KEEP_ALIVE_INTERVAL_SEC))
             .keep_alive_timeout(Duration::from_secs(Self::ENDPOINT_KEEP_ALIVE_TIMEOUT_SEC))
             .connect_timeout(Duration::from_secs(5))
-            .connect()
+            .monitored_connect("grpc-meta-client", Default::default())
             .await?
-            .tracing_injected();
+            .wrapped();
 
         Ok(channel)
     }
@@ -1982,6 +2323,7 @@ macro_rules! for_all_meta_rpc {
             ,{ cluster_client, update_worker_node_schedulability, UpdateWorkerNodeSchedulabilityRequest, UpdateWorkerNodeSchedulabilityResponse }
             ,{ cluster_client, list_all_nodes, ListAllNodesRequest, ListAllNodesResponse }
             ,{ cluster_client, get_cluster_recovery_status, GetClusterRecoveryStatusRequest, GetClusterRecoveryStatusResponse }
+            ,{ cluster_client, get_meta_store_info, GetMetaStoreInfoRequest, GetMetaStoreInfoResponse }
             ,{ heartbeat_client, heartbeat, HeartbeatRequest, HeartbeatResponse }
             ,{ stream_client, flush, FlushRequest, FlushResponse }
             ,{ stream_client, pause, PauseRequest, PauseResponse }
@@ -1989,16 +2331,26 @@ macro_rules! for_all_meta_rpc {
             ,{ stream_client, apply_throttle, ApplyThrottleRequest, ApplyThrottleResponse }
             ,{ stream_client, cancel_creating_jobs, CancelCreatingJobsRequest, CancelCreatingJobsResponse }
             ,{ stream_client, list_table_fragments, ListTableFragmentsRequest, ListTableFragmentsResponse }
-            ,{ stream_client, list_table_fragment_states, ListTableFragmentStatesRequest, ListTableFragmentStatesResponse }
+            ,{ stream_client, list_streaming_job_states, ListStreamingJobStatesRequest, ListStreamingJobStatesResponse }
             ,{ stream_client, list_fragment_distribution, ListFragmentDistributionRequest, ListFragmentDistributionResponse }
+            ,{ stream_client, list_creating_fragment_distribution, ListCreatingFragmentDistributionRequest, ListCreatingFragmentDistributionResponse }
             ,{ stream_client, list_actor_states, ListActorStatesRequest, ListActorStatesResponse }
+            ,{ stream_client, list_actor_splits, ListActorSplitsRequest, ListActorSplitsResponse }
             ,{ stream_client, list_object_dependencies, ListObjectDependenciesRequest, ListObjectDependenciesResponse }
             ,{ stream_client, recover, RecoverRequest, RecoverResponse }
+            ,{ stream_client, list_rate_limits, ListRateLimitsRequest, ListRateLimitsResponse }
+            ,{ stream_client, alter_connector_props, AlterConnectorPropsRequest, AlterConnectorPropsResponse }
+            ,{ stream_client, get_fragment_by_id, GetFragmentByIdRequest, GetFragmentByIdResponse }
+            ,{ stream_client, set_sync_log_store_aligned, SetSyncLogStoreAlignedRequest, SetSyncLogStoreAlignedResponse }
+            ,{ stream_client, refresh, RefreshRequest, RefreshResponse }
             ,{ ddl_client, create_table, CreateTableRequest, CreateTableResponse }
             ,{ ddl_client, alter_name, AlterNameRequest, AlterNameResponse }
             ,{ ddl_client, alter_owner, AlterOwnerRequest, AlterOwnerResponse }
             ,{ ddl_client, alter_set_schema, AlterSetSchemaRequest, AlterSetSchemaResponse }
             ,{ ddl_client, alter_parallelism, AlterParallelismRequest, AlterParallelismResponse }
+            ,{ ddl_client, alter_cdc_table_backfill_parallelism, AlterCdcTableBackfillParallelismRequest, AlterCdcTableBackfillParallelismResponse }
+            ,{ ddl_client, alter_resource_group, AlterResourceGroupRequest, AlterResourceGroupResponse }
+            ,{ ddl_client, alter_database_param, AlterDatabaseParamRequest, AlterDatabaseParamResponse }
             ,{ ddl_client, create_materialized_view, CreateMaterializedViewRequest, CreateMaterializedViewResponse }
             ,{ ddl_client, create_view, CreateViewRequest, CreateViewResponse }
             ,{ ddl_client, create_source, CreateSourceRequest, CreateSourceResponse }
@@ -2006,21 +2358,21 @@ macro_rules! for_all_meta_rpc {
             ,{ ddl_client, create_subscription, CreateSubscriptionRequest, CreateSubscriptionResponse }
             ,{ ddl_client, create_schema, CreateSchemaRequest, CreateSchemaResponse }
             ,{ ddl_client, create_database, CreateDatabaseRequest, CreateDatabaseResponse }
-             ,{ ddl_client, create_secret, CreateSecretRequest, CreateSecretResponse }
+            ,{ ddl_client, create_secret, CreateSecretRequest, CreateSecretResponse }
             ,{ ddl_client, create_index, CreateIndexRequest, CreateIndexResponse }
             ,{ ddl_client, create_function, CreateFunctionRequest, CreateFunctionResponse }
             ,{ ddl_client, drop_table, DropTableRequest, DropTableResponse }
             ,{ ddl_client, drop_materialized_view, DropMaterializedViewRequest, DropMaterializedViewResponse }
             ,{ ddl_client, drop_view, DropViewRequest, DropViewResponse }
             ,{ ddl_client, drop_source, DropSourceRequest, DropSourceResponse }
-             , {ddl_client, drop_secret, DropSecretRequest, DropSecretResponse}
+            ,{ ddl_client, drop_secret, DropSecretRequest, DropSecretResponse}
             ,{ ddl_client, drop_sink, DropSinkRequest, DropSinkResponse }
             ,{ ddl_client, drop_subscription, DropSubscriptionRequest, DropSubscriptionResponse }
             ,{ ddl_client, drop_database, DropDatabaseRequest, DropDatabaseResponse }
             ,{ ddl_client, drop_schema, DropSchemaRequest, DropSchemaResponse }
             ,{ ddl_client, drop_index, DropIndexRequest, DropIndexResponse }
             ,{ ddl_client, drop_function, DropFunctionRequest, DropFunctionResponse }
-            ,{ ddl_client, replace_table_plan, ReplaceTablePlanRequest, ReplaceTablePlanResponse }
+            ,{ ddl_client, replace_job_plan, ReplaceJobPlanRequest, ReplaceJobPlanResponse }
             ,{ ddl_client, alter_source, AlterSourceRequest, AlterSourceResponse }
             ,{ ddl_client, risectl_list_state_tables, RisectlListStateTablesRequest, RisectlListStateTablesResponse }
             ,{ ddl_client, get_ddl_progress, GetDdlProgressRequest, GetDdlProgressResponse }
@@ -2030,6 +2382,10 @@ macro_rules! for_all_meta_rpc {
             ,{ ddl_client, comment_on, CommentOnRequest, CommentOnResponse }
             ,{ ddl_client, get_tables, GetTablesRequest, GetTablesResponse }
             ,{ ddl_client, wait, WaitRequest, WaitResponse }
+            ,{ ddl_client, auto_schema_change, AutoSchemaChangeRequest, AutoSchemaChangeResponse }
+            ,{ ddl_client, alter_swap_rename, AlterSwapRenameRequest, AlterSwapRenameResponse }
+            ,{ ddl_client, alter_secret, AlterSecretRequest, AlterSecretResponse }
+            ,{ ddl_client, compact_iceberg_table, CompactIcebergTableRequest, CompactIcebergTableResponse }
             ,{ hummock_client, unpin_version_before, UnpinVersionBeforeRequest, UnpinVersionBeforeResponse }
             ,{ hummock_client, get_current_version, GetCurrentVersionRequest, GetCurrentVersionResponse }
             ,{ hummock_client, replay_version_delta, ReplayVersionDeltaRequest, ReplayVersionDeltaResponse }
@@ -2037,18 +2393,10 @@ macro_rules! for_all_meta_rpc {
             ,{ hummock_client, get_assigned_compact_task_num, GetAssignedCompactTaskNumRequest, GetAssignedCompactTaskNumResponse }
             ,{ hummock_client, trigger_compaction_deterministic, TriggerCompactionDeterministicRequest, TriggerCompactionDeterministicResponse }
             ,{ hummock_client, disable_commit_epoch, DisableCommitEpochRequest, DisableCommitEpochResponse }
-            ,{ hummock_client, pin_snapshot, PinSnapshotRequest, PinSnapshotResponse }
-            ,{ hummock_client, pin_specific_snapshot, PinSpecificSnapshotRequest, PinSnapshotResponse }
-            ,{ hummock_client, get_epoch, GetEpochRequest, GetEpochResponse }
-            ,{ hummock_client, unpin_snapshot, UnpinSnapshotRequest, UnpinSnapshotResponse }
-            ,{ hummock_client, unpin_snapshot_before, UnpinSnapshotBeforeRequest, UnpinSnapshotBeforeResponse }
-            ,{ hummock_client, get_new_sst_ids, GetNewSstIdsRequest, GetNewSstIdsResponse }
-            ,{ hummock_client, report_vacuum_task, ReportVacuumTaskRequest, ReportVacuumTaskResponse }
+            ,{ hummock_client, get_new_object_ids, GetNewObjectIdsRequest, GetNewObjectIdsResponse }
             ,{ hummock_client, trigger_manual_compaction, TriggerManualCompactionRequest, TriggerManualCompactionResponse }
-            ,{ hummock_client, report_full_scan_task, ReportFullScanTaskRequest, ReportFullScanTaskResponse }
             ,{ hummock_client, trigger_full_gc, TriggerFullGcRequest, TriggerFullGcResponse }
             ,{ hummock_client, rise_ctl_get_pinned_versions_summary, RiseCtlGetPinnedVersionsSummaryRequest, RiseCtlGetPinnedVersionsSummaryResponse }
-            ,{ hummock_client, rise_ctl_get_pinned_snapshots_summary, RiseCtlGetPinnedSnapshotsSummaryRequest, RiseCtlGetPinnedSnapshotsSummaryResponse }
             ,{ hummock_client, rise_ctl_list_compaction_group, RiseCtlListCompactionGroupRequest, RiseCtlListCompactionGroupResponse }
             ,{ hummock_client, rise_ctl_update_compaction_config, RiseCtlUpdateCompactionConfigRequest, RiseCtlUpdateCompactionConfigResponse }
             ,{ hummock_client, rise_ctl_get_checkpoint_version, RiseCtlGetCheckpointVersionRequest, RiseCtlGetCheckpointVersionResponse }
@@ -2060,19 +2408,21 @@ macro_rules! for_all_meta_rpc {
             ,{ hummock_client, get_compaction_score, GetCompactionScoreRequest, GetCompactionScoreResponse }
             ,{ hummock_client, rise_ctl_rebuild_table_stats, RiseCtlRebuildTableStatsRequest, RiseCtlRebuildTableStatsResponse }
             ,{ hummock_client, subscribe_compaction_event, impl tonic::IntoStreamingRequest<Message = SubscribeCompactionEventRequest>, Streaming<SubscribeCompactionEventResponse> }
+            ,{ hummock_client, subscribe_iceberg_compaction_event, impl tonic::IntoStreamingRequest<Message = SubscribeIcebergCompactionEventRequest>, Streaming<SubscribeIcebergCompactionEventResponse> }
             ,{ hummock_client, list_branched_object, ListBranchedObjectRequest, ListBranchedObjectResponse }
             ,{ hummock_client, list_active_write_limit, ListActiveWriteLimitRequest, ListActiveWriteLimitResponse }
             ,{ hummock_client, list_hummock_meta_config, ListHummockMetaConfigRequest, ListHummockMetaConfigResponse }
             ,{ hummock_client, list_compact_task_assignment, ListCompactTaskAssignmentRequest, ListCompactTaskAssignmentResponse }
             ,{ hummock_client, list_compact_task_progress, ListCompactTaskProgressRequest, ListCompactTaskProgressResponse }
             ,{ hummock_client, cancel_compact_task, CancelCompactTaskRequest, CancelCompactTaskResponse}
-            ,{ hummock_client, list_change_log_epochs, ListChangeLogEpochsRequest, ListChangeLogEpochsResponse }
             ,{ hummock_client, get_version_by_epoch, GetVersionByEpochRequest, GetVersionByEpochResponse }
+            ,{ hummock_client, merge_compaction_group, MergeCompactionGroupRequest, MergeCompactionGroupResponse }
             ,{ user_client, create_user, CreateUserRequest, CreateUserResponse }
             ,{ user_client, update_user, UpdateUserRequest, UpdateUserResponse }
             ,{ user_client, drop_user, DropUserRequest, DropUserResponse }
             ,{ user_client, grant_privilege, GrantPrivilegeRequest, GrantPrivilegeResponse }
             ,{ user_client, revoke_privilege, RevokePrivilegeRequest, RevokePrivilegeResponse }
+            ,{ user_client, alter_default_privilege, AlterDefaultPrivilegeRequest, AlterDefaultPrivilegeResponse }
             ,{ scale_client, get_cluster_info, GetClusterInfoRequest, GetClusterInfoResponse }
             ,{ scale_client, reschedule, RescheduleRequest, RescheduleResponse }
             ,{ notification_client, subscribe, SubscribeRequest, Streaming<SubscribeResponse> }
@@ -2089,6 +2439,9 @@ macro_rules! for_all_meta_rpc {
             ,{ cloud_client, rw_cloud_validate_source, RwCloudValidateSourceRequest, RwCloudValidateSourceResponse }
             ,{ event_log_client, list_event_log, ListEventLogRequest, ListEventLogResponse }
             ,{ event_log_client, add_event_log, AddEventLogRequest, AddEventLogResponse }
+            ,{ cluster_limit_client, get_cluster_limits, GetClusterLimitsRequest, GetClusterLimitsResponse }
+            ,{ hosted_iceberg_catalog_service_client, list_iceberg_tables, ListIcebergTablesRequest, ListIcebergTablesResponse }
+            ,{ monitor_client, stack_trace, StackTraceRequest, StackTraceResponse }
         }
     };
 }

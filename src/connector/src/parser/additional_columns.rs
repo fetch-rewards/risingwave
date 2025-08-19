@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,23 +16,21 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use risingwave_common::bail;
-use risingwave_common::catalog::{max_column_id, ColumnCatalog, ColumnDesc, ColumnId};
+use risingwave_common::catalog::{ColumnCatalog, ColumnDesc, ColumnId, max_column_id};
 use risingwave_common::types::{DataType, StructType};
-use risingwave_pb::data::data_type::TypeName;
-use risingwave_pb::data::DataType as PbDataType;
 use risingwave_pb::plan_common::additional_column::ColumnType as AdditionalColumnType;
 use risingwave_pb::plan_common::{
     AdditionalCollectionName, AdditionalColumn, AdditionalColumnFilename, AdditionalColumnHeader,
     AdditionalColumnHeaders, AdditionalColumnKey, AdditionalColumnOffset,
-    AdditionalColumnPartition, AdditionalColumnTimestamp, AdditionalDatabaseName,
-    AdditionalSchemaName, AdditionalTableName,
+    AdditionalColumnPartition, AdditionalColumnPayload, AdditionalColumnTimestamp,
+    AdditionalDatabaseName, AdditionalSchemaName, AdditionalSubject, AdditionalTableName,
 };
 
 use crate::error::ConnectorResult;
 use crate::source::cdc::MONGODB_CDC_CONNECTOR;
 use crate::source::{
-    GCS_CONNECTOR, KAFKA_CONNECTOR, KINESIS_CONNECTOR, OPENDAL_S3_CONNECTOR, PULSAR_CONNECTOR,
-    S3_CONNECTOR,
+    AZBLOB_CONNECTOR, GCS_CONNECTOR, KAFKA_CONNECTOR, KINESIS_CONNECTOR, MQTT_CONNECTOR,
+    NATS_CONNECTOR, OPENDAL_S3_CONNECTOR, POSIX_FS_CONNECTOR, PULSAR_CONNECTOR,
 };
 
 // Hidden additional columns connectors which do not support `include` syntax.
@@ -44,19 +42,40 @@ pub static COMPATIBLE_ADDITIONAL_COLUMNS: LazyLock<HashMap<&'static str, HashSet
         HashMap::from([
             (
                 KAFKA_CONNECTOR,
-                HashSet::from(["key", "timestamp", "partition", "offset", "header"]),
+                HashSet::from([
+                    "key",
+                    "timestamp",
+                    "partition",
+                    "offset",
+                    "header",
+                    "payload",
+                ]),
             ),
             (
                 PULSAR_CONNECTOR,
-                HashSet::from(["key", "partition", "offset"]),
+                HashSet::from(["key", "partition", "offset", "payload"]),
             ),
             (
                 KINESIS_CONNECTOR,
-                HashSet::from(["key", "partition", "offset", "timestamp"]),
+                HashSet::from(["key", "partition", "offset", "timestamp", "payload"]),
             ),
-            (OPENDAL_S3_CONNECTOR, HashSet::from(["file", "offset"])),
-            (S3_CONNECTOR, HashSet::from(["file", "offset"])),
-            (GCS_CONNECTOR, HashSet::from(["file", "offset"])),
+            (
+                NATS_CONNECTOR,
+                HashSet::from(["partition", "offset", "payload", "subject"]),
+            ),
+            (
+                OPENDAL_S3_CONNECTOR,
+                HashSet::from(["file", "offset", "payload"]),
+            ),
+            (GCS_CONNECTOR, HashSet::from(["file", "offset", "payload"])),
+            (
+                AZBLOB_CONNECTOR,
+                HashSet::from(["file", "offset", "payload"]),
+            ),
+            (
+                POSIX_FS_CONNECTOR,
+                HashSet::from(["file", "offset", "payload"]),
+            ),
             // mongodb-cdc doesn't support cdc backfill table
             (
                 MONGODB_CDC_CONNECTOR,
@@ -68,6 +87,7 @@ pub static COMPATIBLE_ADDITIONAL_COLUMNS: LazyLock<HashMap<&'static str, HashSet
                     "collection_name",
                 ]),
             ),
+            (MQTT_CONNECTOR, HashSet::from(["offset", "partition"])),
         ])
     });
 
@@ -97,15 +117,16 @@ pub fn gen_default_addition_col_name(
     connector_name: &str,
     additional_col_type: &str,
     inner_field_name: Option<&str>,
-    data_type: Option<&str>,
+    data_type: Option<&DataType>,
 ) -> String {
+    let legacy_dt_name = data_type.map(|dt| format!("{:?}", dt).to_lowercase());
     let col_name = [
         Some(connector_name),
         Some(additional_col_type),
         inner_field_name,
-        data_type,
+        legacy_dt_name.as_deref(),
     ];
-    col_name.iter().fold("_rw".to_string(), |name, ele| {
+    col_name.iter().fold("_rw".to_owned(), |name, ele| {
         if let Some(ele) = ele {
             format!("{}_{}", name, ele)
         } else {
@@ -120,7 +141,7 @@ pub fn build_additional_column_desc(
     additional_col_type: &str,
     column_alias: Option<String>,
     inner_field_name: Option<&str>,
-    data_type: Option<&str>,
+    data_type: Option<&DataType>,
     reject_unknown_connector: bool,
     is_cdc_backfill_table: bool,
 ) -> ConnectorResult<ColumnDesc> {
@@ -141,7 +162,9 @@ pub fn build_additional_column_desc(
     if !compatible_columns.contains(additional_col_type) {
         bail!(
             "additional column type {} is not supported for connector {}, acceptable column types: {:?}",
-            additional_col_type, connector_name, compatible_columns
+            additional_col_type,
+            connector_name,
+            compatible_columns
         );
     }
 
@@ -182,6 +205,14 @@ pub fn build_additional_column_desc(
                 column_type: Some(AdditionalColumnType::Partition(
                     AdditionalColumnPartition {},
                 )),
+            },
+        ),
+        "payload" => ColumnDesc::named_with_additional_column(
+            column_name,
+            column_id,
+            DataType::Jsonb,
+            AdditionalColumn {
+                column_type: Some(AdditionalColumnType::Payload(AdditionalColumnPayload {})),
             },
         ),
         "offset" => ColumnDesc::named_with_additional_column(
@@ -238,6 +269,14 @@ pub fn build_additional_column_desc(
                 )),
             },
         ),
+        "subject" => ColumnDesc::named_with_additional_column(
+            column_name,
+            column_id,
+            DataType::Varchar, // Assuming subject is a string
+            AdditionalColumn {
+                column_type: Some(AdditionalColumnType::Subject(AdditionalSubject {})),
+            },
+        ),
         _ => unreachable!(),
     };
 
@@ -252,9 +291,20 @@ pub fn build_additional_column_desc(
 pub fn source_add_partition_offset_cols(
     columns: &[ColumnCatalog],
     connector_name: &str,
+    skip_col_id: bool,
 ) -> ([bool; 2], [ColumnDesc; 2]) {
     let mut columns_exist = [false; 2];
+
     let mut last_column_id = max_column_id(columns);
+    let mut assign_col_id = || {
+        if skip_col_id {
+            // col id will be filled outside later. Here just use a placeholder.
+            ColumnId::placeholder()
+        } else {
+            last_column_id = last_column_id.next();
+            last_column_id
+        }
+    };
 
     let additional_columns: Vec<_> = {
         let compat_col_types = COMPATIBLE_ADDITIONAL_COLUMNS
@@ -263,11 +313,10 @@ pub fn source_add_partition_offset_cols(
         ["partition", "file", "offset"]
             .iter()
             .filter_map(|col_type| {
-                last_column_id = last_column_id.next();
                 if compat_col_types.contains(col_type) {
                     Some(
                         build_additional_column_desc(
-                            last_column_id,
+                            assign_col_id(),
                             connector_name,
                             col_type,
                             None,
@@ -323,45 +372,18 @@ fn build_header_catalog(
     column_id: ColumnId,
     col_name: &str,
     inner_field_name: Option<&str>,
-    data_type: Option<&str>,
+    data_type: Option<&DataType>,
 ) -> ColumnDesc {
     if let Some(inner) = inner_field_name {
-        let (data_type, pb_data_type) = {
-            if let Some(type_name) = data_type {
-                match type_name {
-                    "bytea" => (
-                        DataType::Bytea,
-                        PbDataType {
-                            type_name: TypeName::Bytea as i32,
-                            ..Default::default()
-                        },
-                    ),
-                    "varchar" => (
-                        DataType::Varchar,
-                        PbDataType {
-                            type_name: TypeName::Varchar as i32,
-                            ..Default::default()
-                        },
-                    ),
-                    _ => unreachable!(),
-                }
-            } else {
-                (
-                    DataType::Bytea,
-                    PbDataType {
-                        type_name: TypeName::Bytea as i32,
-                        ..Default::default()
-                    },
-                )
-            }
-        };
+        let data_type = data_type.unwrap_or(&DataType::Bytea);
+        let pb_data_type = data_type.to_protobuf();
         ColumnDesc::named_with_additional_column(
             col_name,
             column_id,
-            data_type,
+            data_type.clone(),
             AdditionalColumn {
                 column_type: Some(AdditionalColumnType::HeaderInner(AdditionalColumnHeader {
-                    inner_field: inner.to_string(),
+                    inner_field: inner.to_owned(),
                     data_type: Some(pb_data_type),
                 })),
             },
@@ -398,7 +420,12 @@ mod test {
             "_rw_kafka_header_inner"
         );
         assert_eq!(
-            gen_default_addition_col_name("kafka", "header", Some("inner"), Some("varchar")),
+            gen_default_addition_col_name(
+                "kafka",
+                "header",
+                Some("inner"),
+                Some(&DataType::Varchar)
+            ),
             "_rw_kafka_header_inner_varchar"
         );
     }

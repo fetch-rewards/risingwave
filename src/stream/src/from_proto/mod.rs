@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 mod agg_common;
 mod append_only_dedup;
+mod asof_join;
 mod barrier_recv;
 mod batch_query;
 mod cdc_filter;
@@ -31,6 +32,7 @@ mod hash_join;
 mod hop_window;
 mod lookup;
 mod lookup_union;
+mod materialized_exprs;
 mod merge;
 mod mview;
 mod no_op;
@@ -53,6 +55,13 @@ mod union;
 mod values;
 mod watermark_filter;
 
+mod row_merge;
+
+mod approx_percentile;
+
+mod sync_log_store;
+mod vector_index;
+
 // import for submodules
 use itertools::Itertools;
 use risingwave_pb::stream_plan::stream_node::NodeBody;
@@ -60,6 +69,9 @@ use risingwave_pb::stream_plan::{StreamNode, TemporalJoinNode};
 use risingwave_storage::StateStore;
 
 use self::append_only_dedup::*;
+use self::approx_percentile::global::*;
+use self::approx_percentile::local::*;
+use self::asof_join::AsOfJoinExecutorBuilder;
 use self::barrier_recv::*;
 use self::batch_query::*;
 use self::cdc_filter::CdcFilterExecutorBuilder;
@@ -74,7 +86,8 @@ use self::hash_join::*;
 use self::hop_window::*;
 use self::lookup::*;
 use self::lookup_union::*;
-use self::merge::*;
+use self::materialized_exprs::MaterializedExprsExecutorBuilder;
+pub(crate) use self::merge::MergeExecutorBuilder;
 use self::mview::*;
 use self::no_op::*;
 use self::now::NowExecutorBuilder;
@@ -82,6 +95,7 @@ use self::over_window::*;
 use self::project::*;
 use self::project_set::*;
 use self::row_id_gen::RowIdGenExecutorBuilder;
+use self::row_merge::*;
 use self::simple_agg::*;
 use self::sink::*;
 use self::sort::*;
@@ -90,6 +104,7 @@ use self::source_backfill::*;
 use self::stateless_simple_agg::*;
 use self::stream_cdc_scan::*;
 use self::stream_scan::*;
+use self::sync_log_store::*;
 use self::temporal_join::*;
 use self::top_n::*;
 use self::union::*;
@@ -98,6 +113,7 @@ use crate::error::StreamResult;
 use crate::executor::{Execute, Executor, ExecutorInfo};
 use crate::from_proto::changelog::ChangeLogExecutorBuilder;
 use crate::from_proto::values::ValuesExecutorBuilder;
+use crate::from_proto::vector_index::VectorIndexWriteExecutorBuilder;
 use crate::task::ExecutorParams;
 
 trait ExecutorBuilder {
@@ -175,5 +191,12 @@ pub async fn create_executor(
         NodeBody::StreamFsFetch => FsFetchExecutorBuilder,
         NodeBody::SourceBackfill => SourceBackfillExecutorBuilder,
         NodeBody::Changelog => ChangeLogExecutorBuilder,
+        NodeBody::GlobalApproxPercentile => GlobalApproxPercentileExecutorBuilder,
+        NodeBody::LocalApproxPercentile => LocalApproxPercentileExecutorBuilder,
+        NodeBody::RowMerge => RowMergeExecutorBuilder,
+        NodeBody::AsOfJoin => AsOfJoinExecutorBuilder,
+        NodeBody::SyncLogStore => SyncLogStoreExecutorBuilder,
+        NodeBody::MaterializedExprs => MaterializedExprsExecutorBuilder,
+        NodeBody::VectorIndexWrite => VectorIndexWriteExecutorBuilder,
     }
 }

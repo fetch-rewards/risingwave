@@ -45,6 +45,7 @@ pub fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, ParserError> {
 }
 
 /// Ensures that `sql` parses as a single statement and returns it.
+///
 /// If non-empty `canonical` SQL representation is provided,
 /// additionally asserts that parsing `sql` results in the same parse
 /// tree as parsing `canonical`, and that serializing it back to string
@@ -110,10 +111,11 @@ pub fn verified_expr(sql: &str) -> Expr {
 
 pub fn only<T>(v: impl IntoIterator<Item = T>) -> T {
     let mut iter = v.into_iter();
-    if let (Some(item), None) = (iter.next(), iter.next()) {
-        item
-    } else {
-        panic!("only called on collection without exactly one item")
+    match (iter.next(), iter.next()) {
+        (Some(item), None) => item,
+        _ => {
+            panic!("only called on collection without exactly one item")
+        }
     }
 }
 

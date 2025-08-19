@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use await_tree::InstrumentAwait;
+use await_tree::{InstrumentAwait, SpanExt};
 use foyer::{FetchState, HybridCacheEntry, HybridFetch};
 use risingwave_common::config::EvictionConfig;
 
@@ -96,12 +96,12 @@ impl BlockResponse {
                 .map(BlockHolder::from_hybrid_cache_entry)
                 .map_err(HummockError::foyer_error),
             FetchState::Wait => entry
-                .verbose_instrument_await("wait_pending_fetch_block")
+                .instrument_await("wait_pending_fetch_block".verbose())
                 .await
                 .map(BlockHolder::from_hybrid_cache_entry)
                 .map_err(HummockError::foyer_error),
             FetchState::Miss => entry
-                .verbose_instrument_await("fetch_block")
+                .instrument_await("fetch_block".verbose())
                 .await
                 .map(BlockHolder::from_hybrid_cache_entry)
                 .map_err(HummockError::foyer_error),

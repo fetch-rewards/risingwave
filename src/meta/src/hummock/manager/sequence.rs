@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,16 +17,19 @@ use std::fmt::Display;
 use std::sync::LazyLock;
 
 use risingwave_hummock_sdk::compaction_group::StaticCompactionGroupId;
-use risingwave_meta_model_v2::hummock_sequence;
-use risingwave_meta_model_v2::hummock_sequence::{
+use risingwave_hummock_sdk::{
+    HummockRawObjectId, HummockSstableId, HummockSstableObjectId, TypedPrimitive,
+};
+use risingwave_meta_model::hummock_sequence;
+use risingwave_meta_model::hummock_sequence::{
     COMPACTION_GROUP_ID, COMPACTION_TASK_ID, META_BACKUP_ID, SSTABLE_OBJECT_ID,
 };
-use risingwave_meta_model_v2::prelude::HummockSequence;
+use risingwave_meta_model::prelude::HummockSequence;
 use sea_orm::{ActiveModelTrait, ActiveValue, DatabaseConnection, EntityTrait, TransactionTrait};
 use tokio::sync::Mutex;
 
 use crate::hummock::error::Result;
-use crate::manager::{IdCategory, MetaSrvEnv};
+use crate::manager::MetaSrvEnv;
 
 static SEQ_INIT: LazyLock<HashMap<String, i64>> = LazyLock::new(|| {
     maplit::hashmap! {
@@ -56,7 +59,7 @@ impl SequenceGenerator {
         let guard = self.db.lock().await;
         let txn = guard.begin().await?;
         let model: Option<hummock_sequence::Model> =
-            hummock_sequence::Entity::find_by_id(ident.to_string())
+            hummock_sequence::Entity::find_by_id(ident.to_owned())
                 .one(&txn)
                 .await?;
         let start_seq = match model {
@@ -93,63 +96,55 @@ impl SequenceGenerator {
 }
 
 pub async fn next_compaction_task_id(env: &MetaSrvEnv) -> Result<u64> {
-    match env.hummock_seq.clone() {
-        None => env
-            .id_gen_manager()
-            .as_kv()
-            .generate::<{ IdCategory::HummockCompactionTask }>()
-            .await
-            .map_err(Into::into),
-        Some(seq) => seq.next_interval(COMPACTION_TASK_ID, 1).await,
-    }
+    env.hummock_seq.next_interval(COMPACTION_TASK_ID, 1).await
 }
 
 pub async fn next_meta_backup_id(env: &MetaSrvEnv) -> Result<u64> {
-    match env.hummock_seq.clone() {
-        None => env
-            .id_gen_manager()
-            .as_kv()
-            .generate::<{ IdCategory::Backup }>()
-            .await
-            .map_err(Into::into),
-        Some(seq) => seq.next_interval(META_BACKUP_ID, 1).await,
-    }
+    env.hummock_seq.next_interval(META_BACKUP_ID, 1).await
 }
 
 pub async fn next_compaction_group_id(env: &MetaSrvEnv) -> Result<u64> {
-    match env.hummock_seq.clone() {
-        None => env
-            .id_gen_manager()
-            .as_kv()
-            .generate::<{ IdCategory::CompactionGroup }>()
-            .await
-            .map_err(Into::into),
-        Some(seq) => seq.next_interval(COMPACTION_GROUP_ID, 1).await,
-    }
+    env.hummock_seq.next_interval(COMPACTION_GROUP_ID, 1).await
 }
 
 pub async fn next_sstable_object_id(
     env: &MetaSrvEnv,
     num: impl TryInto<u32> + Display + Copy,
-) -> Result<u64> {
+) -> Result<HummockSstableObjectId> {
+    next_unique_id(env, num).await
+}
+
+pub async fn next_sstable_id(
+    env: &MetaSrvEnv,
+    num: impl TryInto<u32> + Display + Copy,
+) -> Result<HummockSstableId> {
+    next_unique_id(env, num).await
+}
+
+pub async fn next_raw_object_id(
+    env: &MetaSrvEnv,
+    num: impl TryInto<u32> + Display + Copy,
+) -> Result<HummockRawObjectId> {
+    next_unique_id(env, num).await
+}
+
+async fn next_unique_id<const C: usize>(
+    env: &MetaSrvEnv,
+    num: impl TryInto<u32> + Display + Copy,
+) -> Result<TypedPrimitive<C, u64>> {
     let num: u32 = num
         .try_into()
         .unwrap_or_else(|_| panic!("fail to convert {num} into u32"));
-    match env.hummock_seq.clone() {
-        None => env
-            .id_gen_manager()
-            .as_kv()
-            .generate_interval::<{ IdCategory::HummockSstableId }>(num as u64)
-            .await
-            .map_err(Into::into),
-        Some(seq) => seq.next_interval(SSTABLE_OBJECT_ID, num).await,
-    }
+    env.hummock_seq
+        .next_interval(SSTABLE_OBJECT_ID, num)
+        .await
+        .map(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::controller::SqlMetaStore;
-    use crate::hummock::manager::sequence::{SequenceGenerator, COMPACTION_TASK_ID};
+    use crate::hummock::manager::sequence::{COMPACTION_TASK_ID, SequenceGenerator};
 
     #[cfg(not(madsim))]
     #[tokio::test]

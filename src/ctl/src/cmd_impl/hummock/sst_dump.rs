@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
-use chrono::offset::Utc;
 use chrono::DateTime;
+use chrono::offset::Utc;
 use clap::Args;
 use futures::TryStreamExt;
 use itertools::Itertools;
@@ -29,8 +29,8 @@ use risingwave_common::util::value_encoding::{BasicSerde, EitherSerde, ValueRowD
 use risingwave_frontend::TableCatalog;
 use risingwave_hummock_sdk::key::FullKey;
 use risingwave_hummock_sdk::level::Level;
-use risingwave_hummock_sdk::sstable_info::SstableInfo;
-use risingwave_hummock_sdk::HummockSstableObjectId;
+use risingwave_hummock_sdk::sstable_info::{SstableInfo, SstableInfoInner};
+use risingwave_hummock_sdk::{HummockObjectId, HummockSstableObjectId};
 use risingwave_object_store::object::{ObjectMetadata, ObjectStoreImpl};
 use risingwave_rpc_client::MetaClient;
 use risingwave_storage::hummock::value::HummockValue;
@@ -40,8 +40,8 @@ use risingwave_storage::hummock::{
 use risingwave_storage::monitor::StoreLocalStatistic;
 use risingwave_storage::row_serde::value_serde::ValueRowSerdeNew;
 
-use crate::common::HummockServiceOpts;
 use crate::CtlContext;
+use crate::common::HummockServiceOpts;
 
 type TableData = HashMap<u32, TableCatalog>;
 
@@ -79,7 +79,7 @@ pub async fn sst_dump(context: &CtlContext, args: SstDumpArgs) -> anyhow::Result
                 args.use_new_object_prefix_strategy,
             )?)
             .await?;
-        let version = hummock.inner().get_pinned_version().version().clone();
+        let version = hummock.inner().get_pinned_version().clone();
         let sstable_store = hummock.sstable_store();
         for level in version.get_combined_levels() {
             for sstable_info in &level.table_infos {
@@ -126,10 +126,9 @@ pub async fn sst_dump(context: &CtlContext, args: SstDumpArgs) -> anyhow::Result
             let obj = obj_store.metadata(&obj_path).await?;
             print_object(&obj);
             let meta_offset = get_meta_offset_from_object(&obj, obj_store.as_ref()).await?;
-            let obj_id = SstableStore::get_object_id_from_path(&obj.key);
             sst_dump_via_sstable_store(
                 &sstable_store,
-                obj_id,
+                (*obj_id).into(),
                 meta_offset,
                 obj.total_size as u64,
                 &table_data,
@@ -138,13 +137,23 @@ pub async fn sst_dump(context: &CtlContext, args: SstDumpArgs) -> anyhow::Result
             .await?;
         } else {
             let mut metadata_iter = sstable_store
-                .list_object_metadata_from_object_store(None)
+                .list_sst_object_metadata_from_object_store(None, None, None)
                 .await?;
             while let Some(obj) = metadata_iter.try_next().await? {
                 print_object(&obj);
+                let obj_id = SstableStore::get_object_id_from_path(&obj.key);
+                let obj_id = match obj_id {
+                    HummockObjectId::Sstable(obj_id) => obj_id,
+                    HummockObjectId::VectorFile(_) => {
+                        println!(
+                            "object id {:?} not a sstable object id: {}. skip",
+                            obj_id, obj.key
+                        );
+                        continue;
+                    }
+                };
                 let meta_offset =
                     get_meta_offset_from_object(&obj, sstable_store.store().as_ref()).await?;
-                let obj_id = SstableStore::get_object_id_from_path(&obj.key);
                 sst_dump_via_sstable_store(
                     &sstable_store,
                     obj_id,
@@ -200,12 +209,24 @@ pub async fn sst_dump_via_sstable_store(
     table_data: &TableData,
     args: &SstDumpArgs,
 ) -> anyhow::Result<()> {
-    let sstable_info = SstableInfo {
+    let sstable_info = SstableInfoInner {
         object_id,
         file_size,
         meta_offset,
-        ..Default::default()
-    };
+        // below are default unused value
+        sst_id: 0.into(),
+        key_range: Default::default(),
+        table_ids: vec![],
+        stale_key_count: 0,
+        total_key_count: 0,
+        min_epoch: 0,
+        max_epoch: 0,
+        uncompressed_file_size: 0,
+        range_tombstone_count: 0,
+        bloom_filter_kind: Default::default(),
+        sst_size: 0,
+    }
+    .into();
     let sstable_cache = sstable_store
         .sstable(&sstable_info, &mut StoreLocalStatistic::default())
         .await?;
@@ -228,14 +249,6 @@ pub async fn sst_dump_via_sstable_store(
     println!("Bloom Filter Size: {}", sstable_meta.bloom_filter.len());
     println!("Key Count: {}", sstable_meta.key_count);
     println!("Version: {}", sstable_meta.version);
-    println!(
-        "Monotonoic Deletes Count: {}",
-        sstable_meta.monotonic_tombstone_events.len()
-    );
-    for monotonic_delete in &sstable_meta.monotonic_tombstone_events {
-        println!("\tevent key: {:?}", monotonic_delete.event_key);
-        println!("\tnew epoch: {:?}", monotonic_delete.new_epoch);
-    }
 
     println!("Block Count: {}", sstable.block_count());
     for i in 0..sstable.block_count() {

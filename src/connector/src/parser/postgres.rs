@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ use risingwave_common::types::{DataType, Decimal, ScalarImpl};
 use thiserror_ext::AsReport;
 
 use crate::parser::scalar_adapter::ScalarAdapter;
-use crate::parser::util::log_error;
+use crate::parser::utils::log_error;
 
 static LOG_SUPPERSSER: LazyLock<LogSuppresser> = LazyLock::new(LogSuppresser::default);
 
@@ -49,7 +49,7 @@ pub fn postgres_row_to_owned_row(row: tokio_postgres::Row, schema: &Schema) -> O
     OwnedRow::new(datums)
 }
 
-fn postgres_cell_to_scalar_impl(
+pub fn postgres_cell_to_scalar_impl(
     row: &tokio_postgres::Row,
     data_type: &DataType,
     i: usize,
@@ -116,7 +116,8 @@ fn postgres_cell_to_scalar_impl(
                 }
             }
         },
-        DataType::Struct(_) | DataType::Serial => {
+        DataType::Vector(_) | DataType::Struct(_) | DataType::Serial | DataType::Map(_) => {
+            // Is this branch reachable?
             // Struct and Serial are not supported
             tracing::warn!(name, ?data_type, "unsupported data type, set to null");
             None

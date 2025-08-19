@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,6 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
+#![expect(
+    unexpected_cfgs,
+    reason = "feature(hdfs-backend) is banned https://github.com/risingwavelabs/risingwave/pull/7875"
+)]
 
 pub mod sim;
 use std::ops::{Range, RangeBounds};
@@ -26,7 +31,7 @@ pub mod opendal_engine;
 pub use opendal_engine::*;
 
 pub mod s3;
-use await_tree::InstrumentAwait;
+use await_tree::{InstrumentAwait, SpanExt};
 use futures::stream::BoxStream;
 use futures::{Future, StreamExt};
 pub use risingwave_common::config::ObjectStoreConfig;
@@ -35,12 +40,12 @@ pub use s3::*;
 pub mod error;
 pub mod object_metrics;
 
-mod prefix;
+pub mod prefix;
 
 pub use error::*;
 use object_metrics::ObjectStoreMetrics;
 use thiserror_ext::AsReport;
-use tokio_retry::strategy::{jitter, ExponentialBackoff};
+use tokio_retry::strategy::{ExponentialBackoff, jitter};
 
 #[cfg(madsim)]
 use self::sim::SimObjectStore;
@@ -116,7 +121,12 @@ pub trait ObjectStore: Send + Sync {
         MonitoredObjectStore::new(self, metrics, config)
     }
 
-    async fn list(&self, prefix: &str) -> ObjectResult<ObjectMetadataIter>;
+    async fn list(
+        &self,
+        prefix: &str,
+        start_after: Option<String>,
+        limit: Option<usize>,
+    ) -> ObjectResult<ObjectMetadataIter>;
 
     fn store_media_type(&self) -> &'static str;
 
@@ -321,8 +331,13 @@ impl ObjectStoreImpl {
         object_store_impl_method_body!(self, delete_objects(paths).await)
     }
 
-    pub async fn list(&self, prefix: &str) -> ObjectResult<ObjectMetadataIter> {
-        object_store_impl_method_body!(self, list(prefix).await)
+    pub async fn list(
+        &self,
+        prefix: &str,
+        start_after: Option<String>,
+        limit: Option<usize>,
+    ) -> ObjectResult<ObjectMetadataIter> {
+        object_store_impl_method_body!(self, list(prefix, start_after, limit).await)
     }
 
     pub fn get_object_prefix(&self, obj_id: u64, use_new_object_prefix_strategy: bool) -> String {
@@ -393,7 +408,7 @@ impl<U: StreamingUploader> MonitoredStreamingUploader<U> {
         let res = self
             .inner
             .write_bytes(data)
-            .verbose_instrument_await(operation_type_str)
+            .instrument_await(operation_type_str.verbose())
             .await;
 
         try_update_failure_metric(&self.object_store_metrics, &res, operation_type_str);
@@ -419,7 +434,7 @@ impl<U: StreamingUploader> MonitoredStreamingUploader<U> {
             // TODO: we should avoid this special case after fully migrating to opeandal for s3.
             self.inner
                 .finish()
-                .verbose_instrument_await(operation_type_str)
+                .instrument_await(operation_type_str.verbose())
                 .await;
 
         try_update_failure_metric(&self.object_store_metrics, &res, operation_type_str);
@@ -472,7 +487,7 @@ impl MonitoredStreamingReader {
         let future = async {
             self.inner
                 .next()
-                .verbose_instrument_await(self.operation_type_str)
+                .instrument_await(self.operation_type_str.verbose())
                 .await
         };
         let res = match self.streaming_read_timeout.as_ref() {
@@ -562,6 +577,7 @@ impl<OS: ObjectStore> MonitoredObjectStore<OS> {
     pub async fn upload(&self, path: &str, obj: Bytes) -> ObjectResult<()> {
         let operation_type = OperationType::Upload;
         let operation_type_str = operation_type.as_str();
+        let media_type = self.media_type();
 
         self.object_store_metrics
             .write_bytes
@@ -573,13 +589,13 @@ impl<OS: ObjectStore> MonitoredObjectStore<OS> {
         let _timer = self
             .object_store_metrics
             .operation_latency
-            .with_label_values(&[self.media_type(), operation_type_str])
+            .with_label_values(&[media_type, operation_type_str])
             .start_timer();
 
         let builder = || async {
             self.inner
                 .upload(path, obj.clone())
-                .verbose_instrument_await(operation_type_str)
+                .instrument_await(operation_type_str.verbose())
                 .await
         };
 
@@ -588,6 +604,7 @@ impl<OS: ObjectStore> MonitoredObjectStore<OS> {
             &self.config,
             operation_type,
             self.object_store_metrics.clone(),
+            media_type,
         )
         .await;
 
@@ -611,7 +628,7 @@ impl<OS: ObjectStore> MonitoredObjectStore<OS> {
         let res = self
             .inner
             .streaming_upload(path)
-            .verbose_instrument_await(operation_type_str)
+            .instrument_await(operation_type_str.verbose())
             .await;
 
         try_update_failure_metric(&self.object_store_metrics, &res, operation_type_str);
@@ -625,16 +642,18 @@ impl<OS: ObjectStore> MonitoredObjectStore<OS> {
     pub async fn read(&self, path: &str, range: impl ObjectRangeBounds) -> ObjectResult<Bytes> {
         let operation_type = OperationType::Read;
         let operation_type_str = operation_type.as_str();
+        let media_type = self.media_type();
+
         let _timer = self
             .object_store_metrics
             .operation_latency
-            .with_label_values(&[self.media_type(), operation_type_str])
+            .with_label_values(&[media_type, operation_type_str])
             .start_timer();
 
         let builder = || async {
             self.inner
                 .read(path, range.clone())
-                .verbose_instrument_await(operation_type_str)
+                .instrument_await(operation_type_str.verbose())
                 .await
         };
 
@@ -643,6 +662,7 @@ impl<OS: ObjectStore> MonitoredObjectStore<OS> {
             &self.config,
             operation_type,
             self.object_store_metrics.clone(),
+            media_type,
         )
         .await;
 
@@ -687,7 +707,7 @@ impl<OS: ObjectStore> MonitoredObjectStore<OS> {
         let builder = || async {
             self.inner
                 .streaming_read(path, range.clone())
-                .verbose_instrument_await(operation_type_str)
+                .instrument_await(operation_type_str.verbose())
                 .await
         };
 
@@ -696,6 +716,7 @@ impl<OS: ObjectStore> MonitoredObjectStore<OS> {
             &self.config,
             operation_type,
             self.object_store_metrics.clone(),
+            media_type,
         )
         .await;
 
@@ -714,16 +735,17 @@ impl<OS: ObjectStore> MonitoredObjectStore<OS> {
     pub async fn metadata(&self, path: &str) -> ObjectResult<ObjectMetadata> {
         let operation_type = OperationType::Metadata;
         let operation_type_str = operation_type.as_str();
+        let media_type = self.media_type();
         let _timer = self
             .object_store_metrics
             .operation_latency
-            .with_label_values(&[self.media_type(), operation_type_str])
+            .with_label_values(&[media_type, operation_type_str])
             .start_timer();
 
         let builder = || async {
             self.inner
                 .metadata(path)
-                .verbose_instrument_await(operation_type_str)
+                .instrument_await(operation_type_str.verbose())
                 .await
         };
 
@@ -732,6 +754,7 @@ impl<OS: ObjectStore> MonitoredObjectStore<OS> {
             &self.config,
             operation_type,
             self.object_store_metrics.clone(),
+            media_type,
         )
         .await;
 
@@ -742,16 +765,18 @@ impl<OS: ObjectStore> MonitoredObjectStore<OS> {
     pub async fn delete(&self, path: &str) -> ObjectResult<()> {
         let operation_type = OperationType::Delete;
         let operation_type_str = operation_type.as_str();
+        let media_type = self.media_type();
+
         let _timer = self
             .object_store_metrics
             .operation_latency
-            .with_label_values(&[self.media_type(), operation_type_str])
+            .with_label_values(&[media_type, operation_type_str])
             .start_timer();
 
         let builder = || async {
             self.inner
                 .delete(path)
-                .verbose_instrument_await(operation_type_str)
+                .instrument_await(operation_type_str.verbose())
                 .await
         };
 
@@ -760,6 +785,7 @@ impl<OS: ObjectStore> MonitoredObjectStore<OS> {
             &self.config,
             operation_type,
             self.object_store_metrics.clone(),
+            media_type,
         )
         .await;
 
@@ -770,6 +796,8 @@ impl<OS: ObjectStore> MonitoredObjectStore<OS> {
     async fn delete_objects(&self, paths: &[String]) -> ObjectResult<()> {
         let operation_type = OperationType::DeleteObjects;
         let operation_type_str = operation_type.as_str();
+        let media_type = self.media_type();
+
         let _timer = self
             .object_store_metrics
             .operation_latency
@@ -779,7 +807,7 @@ impl<OS: ObjectStore> MonitoredObjectStore<OS> {
         let builder = || async {
             self.inner
                 .delete_objects(paths)
-                .verbose_instrument_await(operation_type_str)
+                .instrument_await(operation_type_str.verbose())
                 .await
         };
 
@@ -788,6 +816,7 @@ impl<OS: ObjectStore> MonitoredObjectStore<OS> {
             &self.config,
             operation_type,
             self.object_store_metrics.clone(),
+            media_type,
         )
         .await;
 
@@ -795,20 +824,26 @@ impl<OS: ObjectStore> MonitoredObjectStore<OS> {
         res
     }
 
-    pub async fn list(&self, prefix: &str) -> ObjectResult<ObjectMetadataIter> {
+    pub async fn list(
+        &self,
+        prefix: &str,
+        start_after: Option<String>,
+        limit: Option<usize>,
+    ) -> ObjectResult<ObjectMetadataIter> {
         let operation_type = OperationType::List;
         let operation_type_str = operation_type.as_str();
+        let media_type = self.media_type();
 
         let _timer = self
             .object_store_metrics
             .operation_latency
-            .with_label_values(&[self.media_type(), operation_type_str])
+            .with_label_values(&[media_type, operation_type_str])
             .start_timer();
 
         let builder = || async {
             self.inner
-                .list(prefix)
-                .verbose_instrument_await(operation_type_str)
+                .list(prefix, start_after.clone(), limit)
+                .instrument_await(operation_type_str.verbose())
                 .await
         };
 
@@ -817,6 +852,7 @@ impl<OS: ObjectStore> MonitoredObjectStore<OS> {
             &self.config,
             operation_type,
             self.object_store_metrics.clone(),
+            media_type,
         )
         .await;
 
@@ -844,7 +880,7 @@ pub async fn build_remote_object_store(
                 tracing::info!("Using OpenDAL to access s3, bucket is {}", bucket);
                 ObjectStoreImpl::Opendal(
                     OpendalObjectStore::new_s3_engine(
-                        bucket.to_string(),
+                        bucket.to_owned(),
                         config.clone(),
                         metrics.clone(),
                     )
@@ -854,7 +890,7 @@ pub async fn build_remote_object_store(
             } else {
                 ObjectStoreImpl::S3(
                     S3ObjectStore::new_with_config(
-                        s3.strip_prefix("s3://").unwrap().to_string(),
+                        s3.strip_prefix("s3://").unwrap().to_owned(),
                         metrics.clone(),
                         config.clone(),
                     )
@@ -883,8 +919,8 @@ pub async fn build_remote_object_store(
             let (bucket, root) = gcs.split_once('@').unwrap_or((gcs, ""));
             ObjectStoreImpl::Opendal(
                 OpendalObjectStore::new_gcs_engine(
-                    bucket.to_string(),
-                    root.to_string(),
+                    bucket.to_owned(),
+                    root.to_owned(),
                     config.clone(),
                     metrics.clone(),
                 )
@@ -897,8 +933,8 @@ pub async fn build_remote_object_store(
             let (bucket, root) = obs.split_once('@').unwrap_or((obs, ""));
             ObjectStoreImpl::Opendal(
                 OpendalObjectStore::new_obs_engine(
-                    bucket.to_string(),
-                    root.to_string(),
+                    bucket.to_owned(),
+                    root.to_owned(),
                     config.clone(),
                     metrics.clone(),
                 )
@@ -912,8 +948,8 @@ pub async fn build_remote_object_store(
             let (bucket, root) = oss.split_once('@').unwrap_or((oss, ""));
             ObjectStoreImpl::Opendal(
                 OpendalObjectStore::new_oss_engine(
-                    bucket.to_string(),
-                    root.to_string(),
+                    bucket.to_owned(),
+                    root.to_owned(),
                     config.clone(),
                     metrics.clone(),
                 )
@@ -926,8 +962,8 @@ pub async fn build_remote_object_store(
             let (namenode, root) = webhdfs.split_once('@').unwrap_or((webhdfs, ""));
             ObjectStoreImpl::Opendal(
                 OpendalObjectStore::new_webhdfs_engine(
-                    namenode.to_string(),
-                    root.to_string(),
+                    namenode.to_owned(),
+                    root.to_owned(),
                     config.clone(),
                     metrics.clone(),
                 )
@@ -940,8 +976,8 @@ pub async fn build_remote_object_store(
             let (container_name, root) = azblob.split_once('@').unwrap_or((azblob, ""));
             ObjectStoreImpl::Opendal(
                 OpendalObjectStore::new_azblob_engine(
-                    container_name.to_string(),
-                    root.to_string(),
+                    container_name.to_owned(),
+                    root.to_owned(),
                     config.clone(),
                     metrics.clone(),
                 )
@@ -952,7 +988,7 @@ pub async fn build_remote_object_store(
         fs if fs.starts_with("fs://") => {
             let fs = fs.strip_prefix("fs://").unwrap();
             ObjectStoreImpl::Opendal(
-                OpendalObjectStore::new_fs_engine(fs.to_string(), config.clone(), metrics.clone())
+                OpendalObjectStore::new_fs_engine(fs.to_owned(), config.clone(), metrics.clone())
                     .unwrap()
                     .monitored(metrics, config),
             )
@@ -962,7 +998,9 @@ pub async fn build_remote_object_store(
             tracing::error!("The s3 compatible mode has been unified with s3.");
             tracing::error!("If you want to use s3 compatible storage, please set your access_key, secret_key and region to the environment variable AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION,
             set your endpoint to the environment variable RW_S3_ENDPOINT.");
-            panic!("Passing s3-compatible is not supported, please modify the environment variable and pass in s3.");
+            panic!(
+                "Passing s3-compatible is not supported, please modify the environment variable and pass in s3."
+            );
         }
         minio if minio.starts_with("minio://") => {
             if config.s3.developer.use_opendal {
@@ -980,21 +1018,23 @@ pub async fn build_remote_object_store(
                 )
             }
         }
-        "memory" => {
+        "memory" | "memory-shared" /* backward compatible, memory is always shared now */ => {
             if ident == "Meta Backup" {
-                tracing::warn!("You're using in-memory remote object store for {}. This is not recommended for production environment.", ident);
+                tracing::warn!(
+                    "You're using in-memory remote object store for {}. This is not recommended for production environment.",
+                    ident
+                );
             } else {
-                tracing::warn!("You're using in-memory remote object store for {}. This should never be used in benchmarks and production environment.", ident);
-            }
-            ObjectStoreImpl::InMem(InMemObjectStore::new().monitored(metrics, config))
-        }
-        "memory-shared" => {
-            if ident == "Meta Backup" {
-                tracing::warn!("You're using shared in-memory remote object store for {}. This should never be used in production environment.", ident);
-            } else {
-                tracing::warn!("You're using shared in-memory remote object store for {}. This should never be used in benchmarks and production environment.", ident);
+                tracing::warn!(
+                    "You're using in-memory remote object store for {}. This should never be used in benchmarks and production environment.",
+                    ident
+                );
             }
             ObjectStoreImpl::InMem(InMemObjectStore::shared().monitored(metrics, config))
+        }
+        #[cfg(debug_assertions)]
+        "memory-isolated-for-test" /* isolated memory is only available for tests */ => {
+            ObjectStoreImpl::InMem(InMemObjectStore::for_test().monitored(metrics, config))
         }
         #[cfg(madsim)]
         sim if sim.starts_with("sim://") => {
@@ -1002,7 +1042,7 @@ pub async fn build_remote_object_store(
         }
         other => {
             unimplemented!(
-                "{} remote object store only supports s3, minio, gcs, oss, cos, azure blob, hdfs, disk, memory, and memory-shared.",
+                "{} remote object store only supports s3, minio, gcs, oss, cos, azure blob, hdfs, disk, memory.",
                 other
             )
         }
@@ -1013,7 +1053,7 @@ pub async fn build_remote_object_store(
 fn get_retry_strategy(
     config: &ObjectStoreConfig,
     operation_type: OperationType,
-) -> impl Iterator<Item = Duration> {
+) -> impl Iterator<Item = Duration> + use<> {
     let attempts = get_retry_attempts_by_type(config, operation_type);
     ExponentialBackoff::from_millis(config.retry.req_backoff_interval_ms)
         .max_delay(Duration::from_millis(config.retry.req_backoff_max_delay_ms))
@@ -1096,20 +1136,26 @@ struct RetryCondition {
     operation_type: OperationType,
     retry_count: usize,
     metrics: Arc<ObjectStoreMetrics>,
+    retry_opendal_s3_unknown_error: bool,
 }
 
 impl RetryCondition {
-    fn new(operation_type: OperationType, metrics: Arc<ObjectStoreMetrics>) -> Self {
+    fn new(
+        operation_type: OperationType,
+        metrics: Arc<ObjectStoreMetrics>,
+        retry_opendal_s3_unknown_error: bool,
+    ) -> Self {
         Self {
             operation_type,
             retry_count: 0,
             metrics,
+            retry_opendal_s3_unknown_error,
         }
     }
 
     #[inline(always)]
     fn should_retry_inner(&mut self, err: &ObjectError) -> bool {
-        let should_retry = err.should_retry();
+        let should_retry = err.should_retry(self.retry_opendal_s3_unknown_error);
         if should_retry {
             self.retry_count += 1;
         }
@@ -1140,6 +1186,7 @@ async fn retry_request<F, T, B>(
     config: &ObjectStoreConfig,
     operation_type: OperationType,
     object_store_metrics: Arc<ObjectStoreMetrics>,
+    media_type: &'static str,
 ) -> ObjectResult<T>
 where
     B: Fn() -> F,
@@ -1150,7 +1197,13 @@ where
         Duration::from_millis(get_attempt_timeout_by_type(config, operation_type));
     let operation_type_str = operation_type.as_str();
 
-    let retry_condition = RetryCondition::new(operation_type, object_store_metrics);
+    let retry_condition = RetryCondition::new(
+        operation_type,
+        object_store_metrics,
+        (config.s3.developer.retry_unknown_service_error || config.s3.retry_unknown_service_error)
+            && (media_type == opendal_engine::MediaType::S3.as_str()
+                || media_type == opendal_engine::MediaType::Minio.as_str()),
+    );
 
     let f = || async {
         let future = builder();

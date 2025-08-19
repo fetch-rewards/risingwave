@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,11 @@
 use std::collections::{HashMap, HashSet};
 use std::process::exit;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use inquire::Confirm;
 use itertools::Itertools;
 use regex::Regex;
-use risingwave_meta::manager::WorkerId;
+use risingwave_meta_model::WorkerId;
 use risingwave_pb::common::WorkerNode;
 use risingwave_pb::meta::{GetClusterInfoResponse, PbWorkerReschedule};
 use serde::{Deserialize, Serialize};

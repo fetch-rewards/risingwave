@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -85,7 +85,7 @@ where
     }
 }
 
-impl<'a, V, S> Drop for MutGuard<'a, V, S>
+impl<V, S> Drop for MutGuard<'_, V, S>
 where
     V: EstimateSize,
     S: private::GenericKvSize,
@@ -96,7 +96,7 @@ where
     }
 }
 
-impl<'a, V, S> Deref for MutGuard<'a, V, S>
+impl<V, S> Deref for MutGuard<'_, V, S>
 where
     V: EstimateSize,
     S: private::GenericKvSize,
@@ -108,7 +108,7 @@ where
     }
 }
 
-impl<'a, V, S> DerefMut for MutGuard<'a, V, S>
+impl<V, S> DerefMut for MutGuard<'_, V, S>
 where
     V: EstimateSize,
     S: private::GenericKvSize,

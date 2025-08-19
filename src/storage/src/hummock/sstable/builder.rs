@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,26 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cmp;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use bytes::{Bytes, BytesMut};
-use risingwave_common::util::epoch::is_max_epoch;
-use risingwave_hummock_sdk::key::{user_key, FullKey, MAX_KEY_LEN};
+use risingwave_common::util::row_serde::OrderedRowSerde;
+use risingwave_hummock_sdk::compaction_group::StateTableId;
+use risingwave_hummock_sdk::key::{FullKey, MAX_KEY_LEN, user_key};
 use risingwave_hummock_sdk::key_range::KeyRange;
-use risingwave_hummock_sdk::sstable_info::SstableInfo;
+use risingwave_hummock_sdk::sstable_info::{SstableInfo, SstableInfoInner};
 use risingwave_hummock_sdk::table_stats::{TableStats, TableStatsMap};
-use risingwave_hummock_sdk::{HummockEpoch, LocalSstableInfo};
+use risingwave_hummock_sdk::{HummockEpoch, HummockSstableObjectId, LocalSstableInfo};
 use risingwave_pb::hummock::BloomFilterType;
 
 use super::utils::CompressionAlgorithm;
 use super::{
-    BlockBuilder, BlockBuilderOptions, BlockMeta, SstableMeta, SstableWriter, DEFAULT_BLOCK_SIZE,
-    DEFAULT_ENTRY_SIZE, DEFAULT_RESTART_INTERVAL, VERSION,
+    BlockBuilder, BlockBuilderOptions, BlockMeta, DEFAULT_BLOCK_SIZE, DEFAULT_ENTRY_SIZE,
+    DEFAULT_RESTART_INTERVAL, SstableMeta, SstableWriter, VERSION,
 };
-use crate::filter_key_extractor::{FilterKeyExtractorImpl, FullKeyFilterKeyExtractor};
-use crate::hummock::sstable::{utils, FilterBuilder};
+use crate::compaction_catalog_manager::{
+    CompactionCatalogAgent, CompactionCatalogAgentRef, FilterKeyExtractorImpl,
+    FullKeyFilterKeyExtractor,
+};
+use crate::hummock::sstable::{FilterBuilder, utils};
 use crate::hummock::value::HummockValue;
 use crate::hummock::{
     Block, BlockHolder, BlockIterator, HummockResult, MemoryLimiter, Xor16FilterBuilder,
@@ -99,7 +103,8 @@ pub struct SstableBuilder<W: SstableWriter, F: FilterBuilder> {
     writer: W,
     /// Current block builder.
     block_builder: BlockBuilder,
-    filter_key_extractor: Arc<FilterKeyExtractorImpl>,
+
+    compaction_catalog_agent_ref: CompactionCatalogAgentRef,
     /// Block metadata vec.
     block_metas: Vec<BlockMeta>,
 
@@ -110,7 +115,7 @@ pub struct SstableBuilder<W: SstableWriter, F: FilterBuilder> {
     raw_key: BytesMut,
     raw_value: BytesMut,
     last_table_id: Option<u32>,
-    sstable_id: u64,
+    sst_object_id: HummockSstableObjectId,
 
     /// Per table stats.
     table_stats: TableStatsMap,
@@ -127,13 +132,28 @@ pub struct SstableBuilder<W: SstableWriter, F: FilterBuilder> {
 }
 
 impl<W: SstableWriter> SstableBuilder<W, Xor16FilterBuilder> {
-    pub fn for_test(sstable_id: u64, writer: W, options: SstableBuilderOptions) -> Self {
+    pub fn for_test(
+        sstable_id: u64,
+        writer: W,
+        options: SstableBuilderOptions,
+        table_id_to_vnode: HashMap<StateTableId, usize>,
+        table_id_to_watermark_serde: HashMap<
+            u32,
+            Option<(OrderedRowSerde, OrderedRowSerde, usize)>,
+        >,
+    ) -> Self {
+        let compaction_catalog_agent_ref = Arc::new(CompactionCatalogAgent::new(
+            FilterKeyExtractorImpl::FullKey(FullKeyFilterKeyExtractor),
+            table_id_to_vnode,
+            table_id_to_watermark_serde,
+        ));
+
         Self::new(
             sstable_id,
             writer,
             Xor16FilterBuilder::new(options.capacity / DEFAULT_ENTRY_SIZE + 1),
             options,
-            Arc::new(FilterKeyExtractorImpl::FullKey(FullKeyFilterKeyExtractor)),
+            compaction_catalog_agent_ref,
             None,
         )
     }
@@ -141,13 +161,14 @@ impl<W: SstableWriter> SstableBuilder<W, Xor16FilterBuilder> {
 
 impl<W: SstableWriter, F: FilterBuilder> SstableBuilder<W, F> {
     pub fn new(
-        sstable_id: u64,
+        sst_object_id: impl Into<HummockSstableObjectId>,
         writer: W,
         filter_builder: F,
         options: SstableBuilderOptions,
-        filter_key_extractor: Arc<FilterKeyExtractorImpl>,
+        compaction_catalog_agent_ref: CompactionCatalogAgentRef,
         memory_limiter: Option<Arc<MemoryLimiter>>,
     ) -> Self {
+        let sst_object_id = sst_object_id.into();
         Self {
             options: options.clone(),
             writer,
@@ -163,8 +184,8 @@ impl<W: SstableWriter, F: FilterBuilder> SstableBuilder<W, F> {
             raw_key: BytesMut::new(),
             raw_value: BytesMut::new(),
             last_full_key: vec![],
-            sstable_id,
-            filter_key_extractor,
+            sst_object_id,
+            compaction_catalog_agent_ref,
             table_stats: Default::default(),
             last_table_stats: Default::default(),
             epoch_set: BTreeSet::default(),
@@ -197,12 +218,20 @@ impl<W: SstableWriter, F: FilterBuilder> SstableBuilder<W, F> {
     ) -> HummockResult<bool> {
         let table_id = smallest_key.user_key.table_id.table_id;
         if self.last_table_id.is_none() || self.last_table_id.unwrap() != table_id {
+            if !self.block_builder.is_empty() {
+                // Try to finish the previous `Block`` when the `table_id` is switched, making sure that the data in the `Block` doesn't span two `table_ids`.
+                self.build_block().await?;
+            }
+
             self.table_ids.insert(table_id);
             self.finalize_last_table_stats();
             self.last_table_id = Some(table_id);
         }
+
         if !self.block_builder.is_empty() {
             let min_block_size = std::cmp::min(MIN_BLOCK_SIZE, self.options.block_capacity / 4);
+
+            // If the previous block is too small, we should merge it into the previous block.
             if self.block_builder.approximate_len() < min_block_size {
                 let block = Block::decode(buf, meta.uncompressed_size as usize)?;
                 let mut iter = BlockIterator::new(BlockHolder::from_owned_block(Box::new(block)));
@@ -211,7 +240,7 @@ impl<W: SstableWriter, F: FilterBuilder> SstableBuilder<W, F> {
                     let value = HummockValue::from_slice(iter.value()).unwrap_or_else(|_| {
                         panic!(
                             "decode failed for fast compact sst_id {} block_idx {} last_table_id {:?}",
-                            self.sstable_id, self.block_metas.len(), self.last_table_id
+                            self.sst_object_id, self.block_metas.len(), self.last_table_id
                         )
                     });
                     self.add_impl(iter.key(), value, false).await?;
@@ -219,6 +248,7 @@ impl<W: SstableWriter, F: FilterBuilder> SstableBuilder<W, F> {
                 }
                 return Ok(false);
             }
+
             self.build_block().await?;
         }
         self.last_full_key = largest_key;
@@ -235,6 +265,7 @@ impl<W: SstableWriter, F: FilterBuilder> SstableBuilder<W, F> {
         self.filter_builder.add_raw_data(filter_data);
         let block_meta = self.block_metas.last_mut().unwrap();
         self.writer.write_block_bytes(buf, block_meta).await?;
+
         Ok(true)
     }
 
@@ -295,7 +326,12 @@ impl<W: SstableWriter, F: FilterBuilder> SstableBuilder<W, F> {
             assert!(
                 could_switch_block,
                 "is_new_user_key {} sst_id {} block_idx {} table_id {} last_table_id {:?} full_key {:?}",
-                is_new_user_key, self.sstable_id, self.block_metas.len(), table_id, self.last_table_id, full_key
+                is_new_user_key,
+                self.sst_object_id,
+                self.block_metas.len(),
+                table_id,
+                self.last_table_id,
+                full_key
             );
             self.table_ids.insert(table_id);
             self.finalize_last_table_stats();
@@ -316,7 +352,7 @@ impl<W: SstableWriter, F: FilterBuilder> SstableBuilder<W, F> {
                     panic!(
                         "WARN overflow can't convert writer_data_len {} into u32 sst_id {} block_idx {} tables {:?}",
                         self.writer.data_len(),
-                        self.sstable_id,
+                        self.sst_object_id,
                         self.block_metas.len(),
                         self.table_ids,
                     )
@@ -331,7 +367,7 @@ impl<W: SstableWriter, F: FilterBuilder> SstableBuilder<W, F> {
 
         let table_id = full_key.user_key.table_id.table_id();
         let mut extract_key = user_key(&self.raw_key);
-        extract_key = self.filter_key_extractor.extract(extract_key);
+        extract_key = self.compaction_catalog_agent_ref.extract(extract_key);
         // add bloom_filter check
         if !extract_key.is_empty() {
             self.filter_builder.add_key(extract_key, table_id);
@@ -401,6 +437,7 @@ impl<W: SstableWriter, F: FilterBuilder> SstableBuilder<W, F> {
             .map(|block_meta| block_meta.uncompressed_size as u64)
             .sum::<u64>();
 
+        #[expect(deprecated)]
         let mut meta = SstableMeta {
             block_metas: self.block_metas,
             bloom_filter,
@@ -439,21 +476,6 @@ impl<W: SstableWriter, F: FilterBuilder> SstableBuilder<W, F> {
                     encoded_size_u32, meta_offset_u32, self.last_table_id, self.table_ids
                 )
             });
-
-        // Expand the epoch of the whole sst by tombstone epoch
-        let (tombstone_min_epoch, tombstone_max_epoch) = {
-            let mut tombstone_min_epoch = HummockEpoch::MAX;
-            let mut tombstone_max_epoch = u64::MIN;
-
-            for monotonic_delete in &meta.monotonic_tombstone_events {
-                if !is_max_epoch(monotonic_delete.new_epoch) {
-                    tombstone_min_epoch = cmp::min(tombstone_min_epoch, monotonic_delete.new_epoch);
-                    tombstone_max_epoch = cmp::max(tombstone_max_epoch, monotonic_delete.new_epoch);
-                }
-            }
-
-            (tombstone_min_epoch, tombstone_max_epoch)
-        };
 
         let (avg_key_size, avg_value_size) = if self.table_stats.is_empty() {
             (0, 0)
@@ -497,9 +519,10 @@ impl<W: SstableWriter, F: FilterBuilder> SstableBuilder<W, F> {
             }
         };
 
-        let sst_info = SstableInfo {
-            object_id: self.sstable_id,
-            sst_id: self.sstable_id,
+        let sst_info: SstableInfo = SstableInfoInner {
+            object_id: self.sst_object_id,
+            // use the same sst_id as object_id for initial sst
+            sst_id: self.sst_object_id.inner().into(),
             bloom_filter_kind,
             key_range: KeyRange {
                 left: Bytes::from(meta.smallest_key.clone()),
@@ -512,10 +535,12 @@ impl<W: SstableWriter, F: FilterBuilder> SstableBuilder<W, F> {
             stale_key_count,
             total_key_count,
             uncompressed_file_size: uncompressed_file_size + meta.encoded_size() as u64,
-            min_epoch: cmp::min(min_epoch, tombstone_min_epoch),
-            max_epoch: cmp::max(max_epoch, tombstone_max_epoch),
-            range_tombstone_count: meta.monotonic_tombstone_events.len() as u64,
-        };
+            min_epoch,
+            max_epoch,
+            range_tombstone_count: 0,
+            sst_size: meta.estimated_size as u64,
+        }
+        .into();
         tracing::trace!(
             "meta_size {} bloom_filter_size {}  add_key_counts {} stale_key_count {} min_epoch {} max_epoch {} epoch_count {}",
             meta.encoded_size(),
@@ -529,9 +554,36 @@ impl<W: SstableWriter, F: FilterBuilder> SstableBuilder<W, F> {
         let bloom_filter_size = meta.bloom_filter.len();
         let sstable_file_size = sst_info.file_size as usize;
 
+        if !meta.block_metas.is_empty() {
+            // fill total_compressed_size
+            let mut last_table_id = meta.block_metas[0].table_id().table_id();
+            let mut last_table_stats = self.table_stats.get_mut(&last_table_id).unwrap();
+            for block_meta in &meta.block_metas {
+                let block_table_id = block_meta.table_id();
+                if last_table_id != block_table_id.table_id() {
+                    last_table_id = block_table_id.table_id();
+                    last_table_stats = self.table_stats.get_mut(&last_table_id).unwrap();
+                }
+
+                last_table_stats.total_compressed_size += block_meta.len as u64;
+            }
+        }
+
         let writer_output = self.writer.finish(meta).await?;
+        // The timestamp is only used during full GC.
+        //
+        // Ideally object store object's last_modified should be used.
+        // However, it'll incur additional IO overhead since S3 lacks an interface to retrieve the last_modified timestamp after the PUT operation on an object.
+        //
+        // The local timestamp below is expected to precede the last_modified of object store object, given that the object store object is created afterward.
+        // It should help alleviate the clock drift issue.
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Clock may have gone backwards")
+            .as_secs();
         Ok(SstableBuilderOutput::<W::Output> {
-            sst_info: LocalSstableInfo::new(sst_info, self.table_stats),
+            sst_info: LocalSstableInfo::new(sst_info, self.table_stats, now),
             writer_output,
             stats: SstableBuilderOutputStats {
                 bloom_filter_size,
@@ -666,7 +718,7 @@ impl SstableBuilderOutputStats {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use std::collections::Bound;
+    use std::collections::{Bound, HashMap};
 
     use risingwave_common::catalog::TableId;
     use risingwave_common::hash::VirtualNode;
@@ -675,12 +727,14 @@ pub(super) mod tests {
 
     use super::*;
     use crate::assert_bytes_eq;
-    use crate::filter_key_extractor::{DummyFilterKeyExtractor, MultiFilterKeyExtractor};
+    use crate::compaction_catalog_manager::{
+        CompactionCatalogAgent, DummyFilterKeyExtractor, MultiFilterKeyExtractor,
+    };
     use crate::hummock::iterator::test_utils::mock_sstable_store;
     use crate::hummock::sstable::xor_filter::BlockedXor16FilterBuilder;
     use crate::hummock::test_utils::{
-        default_builder_opt_for_test, gen_test_sstable_impl, mock_sst_writer, test_key_of,
-        test_value_of, TEST_KEYS_COUNT,
+        TEST_KEYS_COUNT, default_builder_opt_for_test, gen_test_sstable_impl, mock_sst_writer,
+        test_key_of, test_value_of,
     };
     use crate::hummock::{CachePolicy, Sstable, SstableWriterOptions, Xor8FilterBuilder};
     use crate::monitor::StoreLocalStatistic;
@@ -695,7 +749,15 @@ pub(super) mod tests {
             ..Default::default()
         };
 
-        let b = SstableBuilder::for_test(0, mock_sst_writer(&opt), opt);
+        let table_id_to_vnode = HashMap::from_iter(vec![(0, VirtualNode::COUNT_FOR_TEST)]);
+        let table_id_to_watermark_serde = HashMap::from_iter(vec![(0, None)]);
+        let b = SstableBuilder::for_test(
+            0,
+            mock_sst_writer(&opt),
+            opt,
+            table_id_to_vnode,
+            table_id_to_watermark_serde,
+        );
 
         b.finish().await.unwrap();
     }
@@ -703,7 +765,16 @@ pub(super) mod tests {
     #[tokio::test]
     async fn test_basic() {
         let opt = default_builder_opt_for_test();
-        let mut b = SstableBuilder::for_test(0, mock_sst_writer(&opt), opt);
+
+        let table_id_to_vnode = HashMap::from_iter(vec![(0, VirtualNode::COUNT_FOR_TEST)]);
+        let table_id_to_watermark_serde = HashMap::from_iter(vec![(0, None)]);
+        let mut b = SstableBuilder::for_test(
+            0,
+            mock_sst_writer(&opt),
+            opt,
+            table_id_to_vnode,
+            table_id_to_watermark_serde,
+        );
 
         for i in 0..TEST_KEYS_COUNT {
             b.add_for_test(
@@ -742,12 +813,16 @@ pub(super) mod tests {
 
         // build remote table
         let sstable_store = mock_sstable_store().await;
+        let table_id_to_vnode = HashMap::from_iter(vec![(0, VirtualNode::COUNT_FOR_TEST)]);
+        let table_id_to_watermark_serde = HashMap::from_iter(vec![(0, None)]);
         let sst_info = gen_test_sstable_impl::<Vec<u8>, F>(
             opts,
             0,
             (0..TEST_KEYS_COUNT).map(|i| (test_key_of(i), HummockValue::put(test_value_of(i)))),
             sstable_store.clone(),
             CachePolicy::NotFill,
+            table_id_to_vnode,
+            table_id_to_watermark_serde,
         )
         .await;
         let table = sstable_store
@@ -792,24 +867,32 @@ pub(super) mod tests {
             .clone()
             .create_sst_writer(object_id, writer_opts);
         let mut filter = MultiFilterKeyExtractor::default();
-        filter.register(
-            1,
-            Arc::new(FilterKeyExtractorImpl::Dummy(DummyFilterKeyExtractor)),
-        );
+        filter.register(1, FilterKeyExtractorImpl::Dummy(DummyFilterKeyExtractor));
         filter.register(
             2,
-            Arc::new(FilterKeyExtractorImpl::FullKey(FullKeyFilterKeyExtractor)),
+            FilterKeyExtractorImpl::FullKey(FullKeyFilterKeyExtractor),
         );
-        filter.register(
-            3,
-            Arc::new(FilterKeyExtractorImpl::Dummy(DummyFilterKeyExtractor)),
-        );
+        filter.register(3, FilterKeyExtractorImpl::Dummy(DummyFilterKeyExtractor));
+
+        let table_id_to_vnode = HashMap::from_iter(vec![
+            (1, VirtualNode::COUNT_FOR_TEST),
+            (2, VirtualNode::COUNT_FOR_TEST),
+            (3, VirtualNode::COUNT_FOR_TEST),
+        ]);
+        let table_id_to_watermark_serde = HashMap::from_iter(vec![(1, None), (2, None), (3, None)]);
+
+        let compaction_catalog_agent_ref = Arc::new(CompactionCatalogAgent::new(
+            FilterKeyExtractorImpl::Multi(filter),
+            table_id_to_vnode,
+            table_id_to_watermark_serde,
+        ));
+
         let mut builder = SstableBuilder::new(
             object_id,
             writer,
             BlockedXor16FilterBuilder::new(1024),
             opts,
-            Arc::new(FilterKeyExtractorImpl::Multi(filter)),
+            compaction_catalog_agent_ref,
             None,
         );
 

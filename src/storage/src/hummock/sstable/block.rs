@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,11 +20,11 @@ use std::ops::Range;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use risingwave_common::catalog::TableId;
-use risingwave_hummock_sdk::key::FullKey;
 use risingwave_hummock_sdk::KeyComparator;
+use risingwave_hummock_sdk::key::FullKey;
 use serde::{Deserialize, Serialize};
 
-use super::utils::{bytes_diff_below_max_key_length, xxhash64_verify, CompressionAlgorithm};
+use super::utils::{CompressionAlgorithm, bytes_diff_below_max_key_length, xxhash64_verify};
 use crate::hummock::sstable::utils;
 use crate::hummock::sstable::utils::xxhash64_checksum;
 use crate::hummock::{HummockError, HummockResult};
@@ -522,7 +522,7 @@ impl BlockBuilder {
     pub fn add(&mut self, full_key: FullKey<&[u8]>, value: &[u8]) {
         let input_table_id = full_key.user_key.table_id.table_id();
         match self.table_id {
-            Some(current_table_id) => debug_assert_eq!(current_table_id, input_table_id),
+            Some(current_table_id) => assert_eq!(current_table_id, input_table_id),
             None => self.table_id = Some(input_table_id),
         }
         #[cfg(debug_assertions)]

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,7 +38,7 @@ impl CommonHandler {
         }
         // Refresh the license key.
         if let Some(key) = diff.license_key.as_ref() {
-            LicenseManager::get().refresh(key);
+            LicenseManager::get().refresh(key.as_ref());
         }
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 RisingWave Labs
+ * Copyright 2025 RisingWave Labs
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,9 +19,10 @@ package com.risingwave.connector;
 import java.util.concurrent.TimeUnit;
 
 public interface BulkProcessorAdapter {
-    public void addRow(String index, String key, String doc);
+    public void addRow(String index, String key, String doc, String routing)
+            throws InterruptedException;
 
-    public void deleteRow(String index, String key);
+    public void deleteRow(String index, String key, String routing) throws InterruptedException;
 
     public void flush();
 

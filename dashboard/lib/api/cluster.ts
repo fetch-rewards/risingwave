@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 RisingWave Labs
+ * Copyright 2025 RisingWave Labs
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,5 +33,10 @@ export async function getClusterInfoComputeNode() {
   const res: WorkerNode[] = (await api.get("/clusters/2")).map(
     WorkerNode.fromJSON
   )
+  return res
+}
+
+export async function getClusterVersion() {
+  const res = await api.get("/version")
   return res
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use console::style;
 use dialoguer::MultiSelect;
-use enum_iterator::{all, Sequence};
+use enum_iterator::{Sequence, all};
 use fs_err::OpenOptions;
 use itertools::Itertools;
 
@@ -59,13 +59,14 @@ enum Commands {
 pub enum Components {
     #[clap(name = "minio")]
     Minio,
+    Lakekeeper,
     Hdfs,
     PrometheusAndGrafana,
-    Etcd,
     Pubsub,
     Redis,
     Tracing,
     RustComponents,
+    UseSystem,
     BuildConnectorNode,
     Dashboard,
     Release,
@@ -74,23 +75,22 @@ pub enum Components {
     HummockTrace,
     Coredump,
     NoBacktrace,
-    ExternalUdf,
-    WasmUdf,
-    JsUdf,
-    PythonUdf,
+    Udf,
+    NoDefaultFeatures,
 }
 
 impl Components {
     pub fn title(&self) -> String {
         match self {
             Self::Minio => "[Component] Hummock: MinIO + MinIO-CLI",
+            Self::Lakekeeper => "[Component] Apache Iceberg: Lakekeeper REST Catalog",
             Self::Hdfs => "[Component] Hummock: Hdfs Backend",
             Self::PrometheusAndGrafana => "[Component] Metrics: Prometheus + Grafana",
-            Self::Etcd => "[Component] Etcd",
             Self::Pubsub => "[Component] Google Pubsub",
             Self::Redis => "[Component] Redis",
             Self::BuildConnectorNode => "[Build] Build RisingWave Connector (Java)",
             Self::RustComponents => "[Build] Rust components",
+            Self::UseSystem => "[Build] Use system RisingWave",
             Self::Dashboard => "[Build] Dashboard",
             Self::Tracing => "[Component] Tracing: Grafana Tempo",
             Self::Release => "[Build] Enable release mode",
@@ -99,10 +99,8 @@ impl Components {
             Self::HummockTrace => "[Build] Hummock Trace",
             Self::Coredump => "[Runtime] Enable coredump",
             Self::NoBacktrace => "[Runtime] Disable backtrace",
-            Self::ExternalUdf => "[Build] Enable external UDF",
-            Self::WasmUdf => "[Build] Enable Wasm UDF",
-            Self::JsUdf => "[Build] Enable JS UDF",
-            Self::PythonUdf => "[Build] Enable Python UDF",
+            Self::Udf => "[Build] Enable UDF",
+            Self::NoDefaultFeatures => "[Build] Disable default features",
         }
         .into()
     }
@@ -113,6 +111,11 @@ impl Components {
                 "
 Required by Hummock state store."
             }
+            Self::Lakekeeper => {
+                "
+Required if you want to use Apache Iceberg REST Catalog.
+Provides catalog and metadata management for Apache Iceberg tables."
+            }
             Self::Hdfs => {
                 "
 Required by Hummock state store."
@@ -120,11 +123,6 @@ Required by Hummock state store."
             Self::PrometheusAndGrafana => {
                 "
 Required if you want to view metrics."
-            }
-            Self::Etcd => {
-                "
-Required if you want to persistent meta-node data.
-                "
             }
             Self::Pubsub => {
                 "
@@ -134,8 +132,14 @@ Required if you want to create source from Emulated Google Pub/sub.
             Self::RustComponents => {
                 "
 Required if you want to build compute-node and meta-node.
-Otherwise you will need to manually download and copy it
-to RiseDev directory."
+Otherwise you will need to enable `USE_SYSTEM_RISINGWAVE`, or
+manually download a binary and copy it to RiseDev directory."
+            }
+            Self::UseSystem => {
+                "
+Use the RisingWave installed in the PATH, instead of building it
+from source. This implies `ENABLE_BUILD_RUST` to be false.
+                "
             }
             Self::Dashboard => {
                 "
@@ -200,10 +204,17 @@ As a result, RisingWave will dump the core on panics.
 With this option enabled, RiseDev will not set `RUST_BACKTRACE` when launching nodes.
                 "
             }
-            Self::ExternalUdf => "Required if you want to support external UDF.",
-            Self::WasmUdf => "Required if you want to support WASM UDF.",
-            Self::JsUdf => "Required if you want to support JS UDF.",
-            Self::PythonUdf => "Required if you want to support Python UDF.",
+            Self::Udf => {
+                "
+Add --features udf to build command (by default disabled).
+Required if you want to support UDF."
+            }
+            Self::NoDefaultFeatures => {
+                "
+Add --no-default-features to build command.
+Currently, default features are: rw-static-link, all-connectors
+"
+            }
         }
         .into()
     }
@@ -211,11 +222,12 @@ With this option enabled, RiseDev will not set `RUST_BACKTRACE` when launching n
     pub fn from_env(env: impl AsRef<str>) -> Option<Self> {
         match env.as_ref() {
             "ENABLE_MINIO" => Some(Self::Minio),
+            "ENABLE_LAKEKEEPER" => Some(Self::Lakekeeper),
             "ENABLE_HDFS" => Some(Self::Hdfs),
             "ENABLE_PROMETHEUS_GRAFANA" => Some(Self::PrometheusAndGrafana),
-            "ENABLE_ETCD" => Some(Self::Etcd),
             "ENABLE_PUBSUB" => Some(Self::Pubsub),
             "ENABLE_BUILD_RUST" => Some(Self::RustComponents),
+            "USE_SYSTEM_RISINGWAVE" => Some(Self::UseSystem),
             "ENABLE_BUILD_DASHBOARD" => Some(Self::Dashboard),
             "ENABLE_COMPUTE_TRACING" => Some(Self::Tracing),
             "ENABLE_RELEASE_PROFILE" => Some(Self::Release),
@@ -226,10 +238,8 @@ With this option enabled, RiseDev will not set `RUST_BACKTRACE` when launching n
             "ENABLE_HUMMOCK_TRACE" => Some(Self::HummockTrace),
             "ENABLE_COREDUMP" => Some(Self::Coredump),
             "DISABLE_BACKTRACE" => Some(Self::NoBacktrace),
-            "ENABLE_EXTERNAL_UDF" => Some(Self::ExternalUdf),
-            "ENABLE_WASM_UDF" => Some(Self::WasmUdf),
-            "ENABLE_JS_UDF" => Some(Self::JsUdf),
-            "ENABLE_PYTHON_UDF" => Some(Self::PythonUdf),
+            "ENABLE_UDF" => Some(Self::Udf),
+            "DISABLE_DEFAULT_FEATURES" => Some(Self::NoDefaultFeatures),
             _ => None,
         }
     }
@@ -237,12 +247,13 @@ With this option enabled, RiseDev will not set `RUST_BACKTRACE` when launching n
     pub fn env(&self) -> String {
         match self {
             Self::Minio => "ENABLE_MINIO",
+            Self::Lakekeeper => "ENABLE_LAKEKEEPER",
             Self::Hdfs => "ENABLE_HDFS",
             Self::PrometheusAndGrafana => "ENABLE_PROMETHEUS_GRAFANA",
-            Self::Etcd => "ENABLE_ETCD",
             Self::Pubsub => "ENABLE_PUBSUB",
             Self::Redis => "ENABLE_REDIS",
             Self::RustComponents => "ENABLE_BUILD_RUST",
+            Self::UseSystem => "USE_SYSTEM_RISINGWAVE",
             Self::Dashboard => "ENABLE_BUILD_DASHBOARD",
             Self::Tracing => "ENABLE_COMPUTE_TRACING",
             Self::Release => "ENABLE_RELEASE_PROFILE",
@@ -252,10 +263,8 @@ With this option enabled, RiseDev will not set `RUST_BACKTRACE` when launching n
             Self::HummockTrace => "ENABLE_HUMMOCK_TRACE",
             Self::Coredump => "ENABLE_COREDUMP",
             Self::NoBacktrace => "DISABLE_BACKTRACE",
-            Self::ExternalUdf => "ENABLE_EXTERNAL_UDF",
-            Self::WasmUdf => "ENABLE_WASM_UDF",
-            Self::JsUdf => "ENABLE_JS_UDF",
-            Self::PythonUdf => "ENABLE_PYTHON_UDF",
+            Self::Udf => "ENABLE_UDF",
+            Self::NoDefaultFeatures => "DISABLE_DEFAULT_FEATURES",
         }
         .into()
     }
@@ -277,7 +286,7 @@ fn configure(chosen: &[Components]) -> Result<Option<Vec<Components>>> {
         .map(|c| {
             let title = c.title();
             let desc = style(
-                ("\n".to_string() + c.description().trim())
+                ("\n".to_owned() + c.description().trim())
                     .split('\n')
                     .join("\n      "),
             )
@@ -316,40 +325,43 @@ fn main() -> Result<()> {
     let file_path = opts.file;
 
     let chosen = {
-        if let Ok(file) = OpenOptions::new().read(true).open(&file_path) {
-            let reader = BufReader::new(file);
-            let mut enabled = vec![];
-            for line in reader.lines() {
-                let line = line?;
-                if line.trim().is_empty() || line.trim().starts_with('#') {
-                    continue;
-                }
-                let Some((component, val)) = line.split_once('=') else {
-                    println!("invalid config line {}, discarded", line);
-                    continue;
-                };
-                if component == "RISEDEV_CONFIGURED" {
-                    continue;
-                }
-                match Components::from_env(component) {
-                    Some(component) => {
-                        if val == "true" {
-                            enabled.push(component);
-                        }
-                    }
-                    None => {
-                        println!("unknown configure {}, discarded", component);
+        match OpenOptions::new().read(true).open(&file_path) {
+            Ok(file) => {
+                let reader = BufReader::new(file);
+                let mut enabled = vec![];
+                for line in reader.lines() {
+                    let line = line?;
+                    if line.trim().is_empty() || line.trim().starts_with('#') {
                         continue;
                     }
+                    let Some((component, val)) = line.split_once('=') else {
+                        println!("invalid config line {}, discarded", line);
+                        continue;
+                    };
+                    if component == "RISEDEV_CONFIGURED" {
+                        continue;
+                    }
+                    match Components::from_env(component) {
+                        Some(component) => {
+                            if val == "true" {
+                                enabled.push(component);
+                            }
+                        }
+                        None => {
+                            println!("unknown configure {}, discarded", component);
+                            continue;
+                        }
+                    }
                 }
+                enabled
             }
-            enabled
-        } else {
-            println!(
-                "RiseDev component config not found, generating {}",
-                file_path
-            );
-            Components::default_enabled().to_vec()
+            _ => {
+                println!(
+                    "RiseDev component config not found, generating {}",
+                    file_path
+                );
+                Components::default_enabled().to_vec()
+            }
         }
     };
 

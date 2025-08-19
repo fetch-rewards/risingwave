@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,13 +15,14 @@
 use std::borrow::Cow;
 use std::env;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use either::Either;
-use minitrace_opentelemetry::OpenTelemetryReporter;
-use opentelemetry::trace::SpanKind;
-use opentelemetry::InstrumentationLibrary;
+use fastrace_opentelemetry::OpenTelemetryReporter;
+use opentelemetry::InstrumentationScope;
+use opentelemetry::trace::{SpanKind, TracerProvider};
+use opentelemetry_otlp::SpanExporter;
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::trace::TracerProviderBuilder;
 use risingwave_common::metrics::MetricsLayer;
 use risingwave_common::util::deployment::Deployment;
 use risingwave_common::util::env_var::env_var_is_true;
@@ -29,13 +30,13 @@ use risingwave_common::util::query_log::*;
 use risingwave_common::util::tracing::layer::set_toggle_otel_layer_fn;
 use thiserror_ext::AsReport;
 use tracing::level_filters::LevelFilter as Level;
-use tracing_subscriber::filter::{FilterFn, Targets};
+use tracing_subscriber::filter::Targets;
+use tracing_subscriber::fmt::FormatFields;
 use tracing_subscriber::fmt::format::DefaultFields;
 use tracing_subscriber::fmt::time::OffsetTime;
-use tracing_subscriber::fmt::FormatFields;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::{filter, reload, EnvFilter};
+use tracing_subscriber::{EnvFilter, filter, reload};
 
 pub struct LoggerSettings {
     /// The name of the service. Used to identify the service in distributed tracing.
@@ -178,7 +179,7 @@ fn disabled_filter() -> filter::Targets {
 /// `RW_QUERY_LOG_TRUNCATE_LEN` configures the max length of the SQLs logged in the query log,
 /// to avoid the log file growing too large. The default value is 1024 in production.
 ///
-/// ### `RW_ENABLE_PRETTY_LOG`
+/// ### `ENABLE_PRETTY_LOG`
 ///
 /// If it is set to `true`, enable pretty log output, which contains line numbers and prints spans in multiple lines.
 /// This can be helpful for development and debugging.
@@ -186,7 +187,7 @@ fn disabled_filter() -> filter::Targets {
 /// Hint: Also turn off other uninteresting logs to make the most of the pretty log.
 /// e.g.,
 /// ```bash
-/// RUST_LOG="risingwave_storage::hummock::event_handler=off,batch_execute=off,risingwave_batch::task=off" RW_ENABLE_PRETTY_LOG=true risedev d
+/// RUST_LOG="risingwave_storage::hummock::event_handler=off,batch_execute=off,risingwave_batch::task=off" ENABLE_PRETTY_LOG=true risedev d
 /// ```
 pub fn init_risingwave_logger(settings: LoggerSettings) {
     let deployment = Deployment::current();
@@ -210,6 +211,7 @@ pub fn init_risingwave_logger(settings: LoggerSettings) {
         // Configure levels for some RisingWave crates.
         // Other RisingWave crates like `stream` and `storage` will follow the default level.
         filter = filter
+            .with_target("auto_schema_change", Level::INFO)
             .with_target("risingwave_sqlparser", Level::INFO)
             .with_target("risingwave_connector_node", Level::INFO)
             .with_target("pgwire", Level::INFO)
@@ -234,7 +236,9 @@ pub fn init_risingwave_logger(settings: LoggerSettings) {
             .with_target("sled", Level::INFO)
             .with_target("cranelift", Level::INFO)
             .with_target("wasmtime", Level::INFO)
-            .with_target("sqlx", Level::WARN);
+            .with_target("sqlx", Level::WARN)
+            .with_target("opendal", Level::INFO)
+            .with_target("reqsign", Level::INFO);
 
         // For all other crates, apply default level depending on the deployment and `debug_assertions` flag.
         let default_level = match deployment {
@@ -286,16 +290,13 @@ pub fn init_risingwave_logger(settings: LoggerSettings) {
             });
 
         let fmt_layer = match deployment {
-            Deployment::Ci => fmt_layer
-                .compact()
-                .with_filter(FilterFn::new(|metadata| metadata.is_event())) // filter-out all span-related info
-                .boxed(),
+            Deployment::Ci => fmt_layer.compact().boxed(),
             Deployment::Cloud => fmt_layer
                 .json()
                 .map_event_format(|e| e.with_current_span(false)) // avoid duplication as there's a span list field
                 .boxed(),
             Deployment::Other => {
-                if env_var_is_true("RW_ENABLE_PRETTY_LOG") {
+                if env_var_is_true("ENABLE_PRETTY_LOG") {
                     fmt_layer.pretty().boxed()
                 } else {
                     fmt_layer.boxed()
@@ -419,7 +420,6 @@ pub fn init_risingwave_logger(settings: LoggerSettings) {
 
         use opentelemetry::KeyValue;
         use opentelemetry_otlp::WithExportConfig;
-        use opentelemetry_sdk as sdk;
         use opentelemetry_semantic_conventions::resource;
 
         let id = format!(
@@ -443,35 +443,36 @@ pub fn init_risingwave_logger(settings: LoggerSettings) {
             // Installing the exporter requires a tokio runtime.
             let _entered = runtime.enter();
 
-            let otel_tracer = opentelemetry_otlp::new_pipeline()
-                .tracing()
-                .with_exporter(
-                    opentelemetry_otlp::new_exporter()
-                        .tonic()
-                        .with_endpoint(&endpoint),
+            // TODO(bugen): better service name
+            // https://github.com/jaegertracing/jaeger-ui/issues/336
+            let service_name = format!("{}-{}", settings.name, id);
+            let otel_tracer = TracerProviderBuilder::default()
+                .with_batch_exporter(
+                    SpanExporter::builder()
+                        .with_tonic()
+                        .with_endpoint(&endpoint)
+                        .build()
+                        .unwrap(),
                 )
-                .with_trace_config(sdk::trace::config().with_resource(sdk::Resource::new([
-                    KeyValue::new(
-                        resource::SERVICE_NAME,
-                        // TODO(bugen): better service name
-                        // https://github.com/jaegertracing/jaeger-ui/issues/336
-                        format!("{}-{}", settings.name, id),
-                    ),
-                    KeyValue::new(resource::SERVICE_INSTANCE_ID, id.clone()),
-                    KeyValue::new(resource::SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
-                    KeyValue::new(resource::PROCESS_PID, std::process::id().to_string()),
-                ])))
-                .install_batch(sdk::runtime::Tokio)
-                .unwrap();
+                .with_resource(
+                    Resource::builder()
+                        .with_attributes([
+                            KeyValue::new(resource::SERVICE_NAME, service_name.clone()),
+                            KeyValue::new(resource::SERVICE_INSTANCE_ID, id.clone()),
+                            KeyValue::new(resource::SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
+                            KeyValue::new(resource::PROCESS_PID, std::process::id().to_string()),
+                        ])
+                        .build(),
+                )
+                .build()
+                .tracer(service_name);
 
-            let exporter = opentelemetry_otlp::new_exporter()
-                .tonic()
+            let exporter = SpanExporter::builder()
+                .with_tonic()
                 .with_endpoint(&endpoint)
                 .with_protocol(opentelemetry_otlp::Protocol::Grpc)
-                .with_timeout(Duration::from_secs(
-                    opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT,
-                ))
-                .build_span_exporter()
+                .with_timeout(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT)
+                .build()
                 .unwrap();
 
             (otel_tracer, exporter)
@@ -511,7 +512,7 @@ pub fn init_risingwave_logger(settings: LoggerSettings) {
 
         layers.push(layer.boxed());
 
-        // The reporter is used by minitrace in foyer for dynamically tail-based tracing.
+        // The reporter is used by fastrace in foyer for dynamically tail-based tracing.
         //
         // Code here only setup the OpenTelemetry reporter. To enable/disable the function, please use risectl.
         //
@@ -523,14 +524,15 @@ pub fn init_risingwave_logger(settings: LoggerSettings) {
         let reporter = OpenTelemetryReporter::new(
             exporter,
             SpanKind::Server,
-            Cow::Owned(Resource::new([KeyValue::new(
-                resource::SERVICE_NAME,
-                format!("minitrace-{id}"),
-            )])),
-            InstrumentationLibrary::builder("opentelemetry-instrumentation-foyer").build(),
+            Cow::Owned(
+                Resource::builder()
+                    .with_service_name(format!("fastrace-{id}"))
+                    .build(),
+            ),
+            InstrumentationScope::builder("opentelemetry-instrumentation-foyer").build(),
         );
-        minitrace::set_reporter(reporter, minitrace::collector::Config::default());
-        tracing::info!("opentelemetry exporter for minitrace is set at {endpoint}");
+        fastrace::set_reporter(reporter, fastrace::collector::Config::default());
+        tracing::info!("opentelemetry exporter for fastrace is set at {endpoint}");
     }
 
     // Metrics layer

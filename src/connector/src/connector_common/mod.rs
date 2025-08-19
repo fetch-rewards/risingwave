@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,12 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod mqtt_common;
+//! Common parameters and utilities for both source and sink.
+
+mod mqtt_common;
 pub use mqtt_common::{MqttCommon, QualityOfService as MqttQualityOfService};
 
-pub mod common;
+mod common;
 pub use common::{
-    AwsAuthProps, AwsPrivateLinkItem, KafkaCommon, KafkaPrivateLinkCommon, KinesisCommon,
-    MongodbCommon, NatsCommon, PulsarCommon, PulsarOauthCommon, RdKafkaPropertiesCommon,
-    PRIVATE_LINK_BROKER_REWRITE_MAP_KEY, PRIVATE_LINK_TARGETS_KEY,
+    AwsAuthProps, AwsPrivateLinkItem, DISABLE_DEFAULT_CREDENTIAL, KafkaCommon,
+    KafkaConnectionProps, KafkaPrivateLinkCommon, KinesisCommon, MongodbCommon, NatsCommon,
+    PRIVATE_LINK_BROKER_REWRITE_MAP_KEY, PRIVATE_LINK_TARGETS_KEY, PulsarCommon, PulsarOauthCommon,
+    RdKafkaPropertiesCommon,
 };
+mod connection;
+pub use connection::{
+    ConfluentSchemaRegistryConnection, Connection, ElasticsearchConnection, IcebergConnection,
+    KafkaConnection, SCHEMA_REGISTRY_CONNECTION_TYPE, read_kafka_log_level, validate_connection,
+};
+pub use iceberg::compaction::IcebergSinkCompactionUpdate;
+
+mod iceberg;
+#[cfg(not(madsim))]
+mod maybe_tls_connector;
+pub mod postgres;
+
+pub use iceberg::IcebergCommon;
+pub use postgres::{PostgresExternalTable, SslMode, create_pg_client};
+
+#[cfg(test)]
+mod common_test;

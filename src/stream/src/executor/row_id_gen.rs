@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::array::stream_chunk::Ops;
 use risingwave_common::array::{Array, ArrayBuilder, ArrayRef, Op, SerialArrayBuilder};
 use risingwave_common::bitmap::Bitmap;
 use risingwave_common::hash::VnodeBitmapExt;
@@ -50,14 +49,14 @@ impl RowIdGenExecutor {
 
     /// Create a new row id generator based on the assigned vnodes.
     fn new_generator(vnodes: &Bitmap) -> RowIdGenerator {
-        RowIdGenerator::new(vnodes.iter_vnodes())
+        RowIdGenerator::new(vnodes.iter_vnodes(), vnodes.len())
     }
 
     /// Generate a row ID column according to ops.
     fn gen_row_id_column_by_op(
         &mut self,
         column: &ArrayRef,
-        ops: Ops<'_>,
+        ops: &'_ [Op],
         vis: &Bitmap,
     ) -> ArrayRef {
         let len = column.len();
@@ -134,13 +133,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_row_id_gen_executor() {
+        // This test only works when vnode count is 256.
+        assert_eq!(VirtualNode::COUNT_FOR_TEST, 256);
+
         let schema = Schema::new(vec![
             Field::unnamed(DataType::Serial),
             Field::unnamed(DataType::Int64),
         ]);
         let pk_indices = vec![0];
         let row_id_index = 0;
-        let row_id_generator = Bitmap::ones(VirtualNode::COUNT);
+        let row_id_generator = Bitmap::ones(VirtualNode::COUNT_FOR_TEST);
         let (mut tx, upstream) = MockSource::channel();
         let upstream = upstream.into_executor(schema.clone(), pk_indices.clone());
 

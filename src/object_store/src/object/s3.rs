@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,10 +18,11 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
-use await_tree::InstrumentAwait;
+use await_tree::{InstrumentAwait, SpanExt};
+use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::BoxError;
 use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadError;
@@ -29,8 +30,8 @@ use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadErr
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadError;
 use aws_sdk_s3::operation::delete_object::DeleteObjectError;
 use aws_sdk_s3::operation::delete_objects::DeleteObjectsError;
-use aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder;
 use aws_sdk_s3::operation::get_object::GetObjectError;
+use aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error;
 use aws_sdk_s3::operation::put_object::PutObjectError;
@@ -40,7 +41,6 @@ use aws_sdk_s3::types::{
     AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, CompletedMultipartUpload,
     CompletedPart, Delete, ExpirationStatus, LifecycleRule, LifecycleRuleFilter, ObjectIdentifier,
 };
-use aws_sdk_s3::Client;
 use aws_smithy_http::futures_stream_adapter::FuturesStreamCompatByteStream;
 use aws_smithy_runtime::client::http::hyper_014::HyperClientBuilder;
 use aws_smithy_runtime_api::client::http::HttpClient;
@@ -48,8 +48,8 @@ use aws_smithy_runtime_api::client::result::SdkError;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use fail::fail_point;
-use futures::future::{try_join_all, BoxFuture, FutureExt};
-use futures::{stream, Stream, StreamExt, TryStreamExt};
+use futures::future::{BoxFuture, FutureExt, try_join_all};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use hyper::Body;
 use itertools::Itertools;
 use risingwave_common::config::ObjectStoreConfig;
@@ -60,11 +60,11 @@ use tokio::task::JoinHandle;
 
 use super::object_metrics::ObjectStoreMetrics;
 use super::{
-    prefix, retry_request, Bytes, ObjectError, ObjectErrorInner, ObjectMetadata, ObjectRangeBounds,
-    ObjectResult, ObjectStore, StreamingUploader,
+    Bytes, ObjectError, ObjectErrorInner, ObjectMetadata, ObjectRangeBounds, ObjectResult,
+    ObjectStore, StreamingUploader, prefix, retry_request,
 };
 use crate::object::{
-    try_update_failure_metric, ObjectDataStream, ObjectMetadataIter, OperationType,
+    ObjectDataStream, ObjectMetadataIter, OperationType, try_update_failure_metric,
 };
 
 type PartId = i32;
@@ -103,6 +103,8 @@ pub struct S3StreamingUploader {
 }
 
 impl S3StreamingUploader {
+    const MEDIA_TYPE: &'static str = "s3";
+
     pub fn new(
         client: Client,
         bucket: String,
@@ -116,10 +118,7 @@ impl S3StreamingUploader {
         /// Reference: <https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html>
         const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
         const MAX_PART_SIZE: usize = 5 * 1024 * 1024 * 1024;
-        let part_size = config
-            .upload_part_size
-            .min(MAX_PART_SIZE)
-            .max(MIN_PART_SIZE);
+        let part_size = config.upload_part_size.clamp(MIN_PART_SIZE, MAX_PART_SIZE);
 
         Self {
             client,
@@ -162,6 +161,7 @@ impl S3StreamingUploader {
                 &self.config,
                 OperationType::StreamingUploadInit,
                 self.metrics.clone(),
+                Self::MEDIA_TYPE,
             )
             .await;
 
@@ -224,7 +224,14 @@ impl S3StreamingUploader {
                     })
             };
 
-            let res = retry_request(builder, &config, operation_type, metrics.clone()).await;
+            let res = retry_request(
+                builder,
+                &config,
+                operation_type,
+                metrics.clone(),
+                Self::MEDIA_TYPE,
+            )
+            .await;
             try_update_failure_metric(&metrics, &res, operation_type_str);
             Ok((part_id, res?))
         }));
@@ -283,7 +290,14 @@ impl S3StreamingUploader {
                 })
         };
 
-        let res = retry_request(builder, &self.config, operation_type, self.metrics.clone()).await;
+        let res = retry_request(
+            builder,
+            &self.config,
+            operation_type,
+            self.metrics.clone(),
+            Self::MEDIA_TYPE,
+        )
+        .await;
         try_update_failure_metric(&self.metrics, &res, operation_type.as_str());
         let _res = res?;
 
@@ -316,7 +330,7 @@ impl StreamingUploader for S3StreamingUploader {
 
         if self.not_uploaded_len >= self.part_size {
             self.upload_next_part()
-                .verbose_instrument_await("s3_upload_next_part")
+                .instrument_await("s3_upload_next_part".verbose())
                 .await?;
             self.not_uploaded_len = 0;
         }
@@ -346,7 +360,7 @@ impl StreamingUploader for S3StreamingUploader {
                         .content_length(self.not_uploaded_len as i64)
                         .key(&self.key)
                         .send()
-                        .verbose_instrument_await("s3_put_object")
+                        .instrument_await("s3_put_object".verbose())
                         .await
                         .map_err(|err| {
                             set_error_should_retry::<PutObjectError>(
@@ -356,23 +370,31 @@ impl StreamingUploader for S3StreamingUploader {
                         })
                 };
 
-                let res =
-                    retry_request(builder, &self.config, operation_type, self.metrics.clone())
-                        .await;
+                let res = retry_request(
+                    builder,
+                    &self.config,
+                    operation_type,
+                    self.metrics.clone(),
+                    Self::MEDIA_TYPE,
+                )
+                .await;
                 try_update_failure_metric(&self.metrics, &res, operation_type.as_str());
                 res?;
                 Ok(())
             }
-        } else if let Err(e) = self
-            .flush_multipart_and_complete()
-            .verbose_instrument_await("s3_flush_multipart_and_complete")
-            .await
-        {
-            tracing::warn!(key = self.key, error = %e.as_report(), "Failed to upload object");
-            self.abort_multipart_upload().await?;
-            Err(e)
         } else {
-            Ok(())
+            match self
+                .flush_multipart_and_complete()
+                .instrument_await("s3_flush_multipart_and_complete".verbose())
+                .await
+            {
+                Err(e) => {
+                    tracing::warn!(key = self.key, error = %e.as_report(), "Failed to upload object");
+                    self.abort_multipart_upload().await?;
+                    Err(e)
+                }
+                _ => Ok(()),
+            }
         }
     }
 
@@ -438,7 +460,7 @@ impl ObjectStore for S3ObjectStore {
         Ok(S3StreamingUploader::new(
             self.client.clone(),
             self.bucket.clone(),
-            path.to_string(),
+            path.to_owned(),
             self.metrics.clone(),
             self.config.clone(),
         ))
@@ -558,7 +580,7 @@ impl ObjectStore for S3ObjectStore {
     /// Deletes the objects with the given paths permanently from the storage. If an object
     /// specified in the request is not found, it will be considered as successfully deleted.
     ///
-    /// Uses AWS' DeleteObjects API. See [AWS Docs](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html) for more details.
+    /// Uses AWS' `DeleteObjects` API. See [AWS Docs](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html) for more details.
     async fn delete_objects(&self, paths: &[String]) -> ObjectResult<()> {
         // AWS restricts the number of objects per request to 1000.
         const MAX_LEN: usize = 1000;
@@ -600,13 +622,22 @@ impl ObjectStore for S3ObjectStore {
         Ok(())
     }
 
-    async fn list(&self, prefix: &str) -> ObjectResult<ObjectMetadataIter> {
-        Ok(Box::pin(S3ObjectIter::new(
-            self.client.clone(),
-            self.bucket.clone(),
-            prefix.to_string(),
-            self.config.clone(),
-        )))
+    async fn list(
+        &self,
+        prefix: &str,
+        start_after: Option<String>,
+        limit: Option<usize>,
+    ) -> ObjectResult<ObjectMetadataIter> {
+        Ok(Box::pin(
+            S3ObjectIter::new(
+                self.client.clone(),
+                self.bucket.clone(),
+                prefix.to_owned(),
+                self.config.clone(),
+                start_after,
+            )
+            .take(limit.unwrap_or(usize::MAX)),
+        ))
     }
 
     fn store_media_type(&self) -> &'static str {
@@ -615,7 +646,7 @@ impl ObjectStore for S3ObjectStore {
 }
 
 impl S3ObjectStore {
-    pub fn new_http_client(config: &ObjectStoreConfig) -> impl HttpClient {
+    pub fn new_http_client(config: &ObjectStoreConfig) -> impl HttpClient + use<> {
         let mut http = hyper::client::HttpConnector::new();
 
         // connection config
@@ -777,7 +808,7 @@ impl S3ObjectStore {
 
         Self {
             client,
-            bucket: bucket.to_string(),
+            bucket: bucket.to_owned(),
             metrics,
             config: object_store_config,
         }
@@ -899,7 +930,10 @@ impl S3ObjectStore {
                     S3_INCOMPLETE_MULTIPART_UPLOAD_RETENTION_DAYS,
                 );
             } else {
-                tracing::warn!("Failed to configure life cycle rule for S3 bucket: {:?}. It is recommended to configure it manually to avoid unnecessary storage cost.", bucket);
+                tracing::warn!(
+                    "Failed to configure life cycle rule for S3 bucket: {:?}. It is recommended to configure it manually to avoid unnecessary storage cost.",
+                    bucket
+                );
             }
         }
         if is_expiration_configured {
@@ -928,10 +962,17 @@ struct S3ObjectIter {
     >,
 
     config: Arc<ObjectStoreConfig>,
+    start_after: Option<String>,
 }
 
 impl S3ObjectIter {
-    fn new(client: Client, bucket: String, prefix: String, config: Arc<ObjectStoreConfig>) -> Self {
+    fn new(
+        client: Client,
+        bucket: String,
+        prefix: String,
+        config: Arc<ObjectStoreConfig>,
+        start_after: Option<String>,
+    ) -> Self {
         Self {
             buffer: VecDeque::default(),
             client,
@@ -941,6 +982,7 @@ impl S3ObjectIter {
             is_truncated: Some(true),
             send_future: None,
             config,
+            start_after,
         }
     }
 }
@@ -959,6 +1001,8 @@ impl Stream for S3ObjectIter {
                     self.is_truncated = is_truncated;
                     self.buffer.extend(more);
                     self.send_future = None;
+                    // only the first request may set start_after
+                    self.start_after = None;
                     self.poll_next(cx)
                 }
                 Err(e) => {
@@ -975,6 +1019,10 @@ impl Stream for S3ObjectIter {
             .list_objects_v2()
             .bucket(&self.bucket)
             .prefix(&self.prefix);
+        #[cfg(not(madsim))]
+        if let Some(start_after) = self.start_after.as_ref() {
+            request = request.start_after(start_after);
+        }
         if let Some(continuation_token) = self.next_continuation_token.as_ref() {
             request = request.continuation_token(continuation_token);
         }
@@ -1039,36 +1087,32 @@ where
                     }
                 }
 
-                Some(SdkError::ServiceError(e)) => {
-                    let retry = match e.err().code() {
-                        None => {
-                            if config.s3.developer.retry_unknown_service_error
-                                || config.s3.retry_unknown_service_error
-                            {
-                                tracing::warn!(target: "unknown_service_error", "{e:?} occurs, retry S3 get_object request.");
-                                true
-                            } else {
-                                false
-                            }
+                Some(SdkError::ServiceError(e)) => match e.err().code() {
+                    None => {
+                        if config.s3.developer.retry_unknown_service_error
+                            || config.s3.retry_unknown_service_error
+                        {
+                            tracing::warn!(target: "unknown_service_error", "{e:?} occurs, retry S3 get_object request.");
+                            true
+                        } else {
+                            false
                         }
-                        Some(code) => {
-                            if config
-                                .s3
-                                .developer
-                                .retryable_service_error_codes
-                                .iter()
-                                .any(|s| s.as_str().eq_ignore_ascii_case(code))
-                            {
-                                tracing::warn!(target: "retryable_service_error", "{e:?} occurs, retry S3 get_object request.");
-                                true
-                            } else {
-                                false
-                            }
+                    }
+                    Some(code) => {
+                        if config
+                            .s3
+                            .developer
+                            .retryable_service_error_codes
+                            .iter()
+                            .any(|s| s.as_str().eq_ignore_ascii_case(code))
+                        {
+                            tracing::warn!(target: "retryable_service_error", "{e:?} occurs, retry S3 get_object request.");
+                            true
+                        } else {
+                            false
                         }
-                    };
-
-                    retry
-                }
+                    }
+                },
 
                 Some(SdkError::TimeoutError(_err)) => true,
 
@@ -1087,7 +1131,7 @@ where
 #[cfg(test)]
 #[cfg(not(madsim))]
 mod tests {
-    use crate::object::prefix::s3::{get_object_prefix, NUM_BUCKET_PREFIXES};
+    use crate::object::prefix::s3::{NUM_BUCKET_PREFIXES, get_object_prefix};
 
     fn get_hash_of_object(obj_id: u64) -> u32 {
         let crc_hash = crc32fast::hash(&obj_id.to_be_bytes());

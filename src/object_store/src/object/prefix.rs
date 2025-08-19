@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,11 +24,11 @@ pub(crate) mod s3 {
     }
 }
 
-pub(crate) mod opendal_engine {
+pub mod opendal_engine {
     /// The number of Azblob bucket prefixes
     pub(crate) const NUM_BUCKET_PREFIXES_AZBLOB: u32 = 256;
 
-    pub(crate) fn get_object_prefix(obj_id: u64, use_new_object_prefix_strategy: bool) -> String {
+    pub fn get_object_prefix(obj_id: u64, use_new_object_prefix_strategy: bool) -> String {
         // For OpenDAL object storage, whether objects are divided by prefixes depends on whether it is a new cluster:
         // If it is a new cluster, objects will be divided into `NUM_BUCKET_PREFIXES_AZBLOB` prefixes.
         // If it is an old cluster, prefixes are not used due to the need to read and write old data.

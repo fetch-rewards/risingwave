@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::util::recursive::{tracker, Recurse};
+use risingwave_common::util::recursive::{Recurse, tracker};
 
 use super::{
-    AggCall, CorrelatedInputRef, ExprImpl, FunctionCall, FunctionCallWithLambda, InputRef, Literal,
-    Parameter, Subquery, TableFunction, UserDefinedFunction, WindowFunction, EXPR_DEPTH_THRESHOLD,
-    EXPR_TOO_DEEP_NOTICE,
+    AggCall, CorrelatedInputRef, EXPR_DEPTH_THRESHOLD, EXPR_TOO_DEEP_NOTICE, ExprImpl,
+    FunctionCall, FunctionCallWithLambda, InputRef, Literal, Parameter, Subquery, TableFunction,
+    UserDefinedFunction, WindowFunction,
 };
 use crate::expr::Now;
 use crate::session::current::notice_to_user;
@@ -87,7 +87,7 @@ pub trait ExprRewriter {
 
     fn rewrite_agg_call(&mut self, agg_call: AggCall) -> ExprImpl {
         let AggCall {
-            agg_kind,
+            agg_type,
             return_type,
             args,
             distinct,
@@ -102,7 +102,7 @@ pub trait ExprRewriter {
         let order_by = order_by.rewrite_expr(self);
         let filter = filter.rewrite_expr(self);
         AggCall {
-            agg_kind,
+            agg_type,
             return_type,
             args,
             distinct,
@@ -155,9 +155,10 @@ pub trait ExprRewriter {
 
     fn rewrite_window_function(&mut self, window_func: WindowFunction) -> ExprImpl {
         let WindowFunction {
-            args,
-            return_type,
             kind,
+            return_type,
+            args,
+            ignore_nulls,
             partition_by,
             order_by,
             frame,
@@ -168,8 +169,9 @@ pub trait ExprRewriter {
             .collect();
         WindowFunction {
             kind,
-            args,
             return_type,
+            args,
+            ignore_nulls,
             partition_by,
             order_by,
             frame,

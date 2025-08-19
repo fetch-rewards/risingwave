@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -82,7 +82,7 @@ impl Tracker {
             }
         }
 
-        impl<'a> Drop for DepthGuard<'a> {
+        impl Drop for DepthGuard<'_> {
             fn drop(&mut self) {
                 let mut d = self.depth.borrow_mut();
                 d.last_max = d.last_max.max(d.current); // update the last max depth

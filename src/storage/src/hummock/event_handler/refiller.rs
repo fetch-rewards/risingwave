@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::poll_fn;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
-use std::task::{ready, Poll};
+use std::task::{Poll, ready};
 use std::time::{Duration, Instant};
 
 use foyer::{HybridCacheEntry, RangeBoundsExt};
@@ -25,9 +25,10 @@ use futures::{Future, FutureExt};
 use itertools::Itertools;
 use prometheus::core::{AtomicU64, GenericCounter, GenericCounterVec};
 use prometheus::{
-    register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
-    register_int_gauge_with_registry, Histogram, HistogramVec, IntGauge, Registry,
+    Histogram, HistogramVec, IntGauge, Registry, register_histogram_vec_with_registry,
+    register_int_counter_vec_with_registry, register_int_gauge_with_registry,
 };
+use risingwave_common::license::Feature;
 use risingwave_common::monitor::GLOBAL_METRICS_REGISTRY;
 use risingwave_hummock_sdk::compaction_group::hummock_version_ext::SstDeltaInfo;
 use risingwave_hummock_sdk::{HummockSstableObjectId, KeyComparator};
@@ -200,13 +201,21 @@ pub struct CacheRefillConfig {
 
 impl CacheRefillConfig {
     pub fn from_storage_opts(options: &StorageOpts) -> Self {
-        Self {
-            timeout: Duration::from_millis(options.cache_refill_timeout_ms),
-            data_refill_levels: options
+        let data_refill_levels = match Feature::ElasticDiskCache.check_available() {
+            Ok(_) => options
                 .cache_refill_data_refill_levels
                 .iter()
                 .copied()
                 .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e.as_report(), "ElasticDiskCache is not available.");
+                HashSet::new()
+            }
+        };
+
+        Self {
+            timeout: Duration::from_millis(options.cache_refill_timeout_ms),
+            data_refill_levels,
             concurrency: options.cache_refill_concurrency,
             unit: options.cache_refill_unit,
             threshold: options.cache_refill_threshold,
@@ -286,21 +295,6 @@ impl CacheRefiller {
 
     pub(crate) fn last_new_pinned_version(&self) -> Option<&PinnedVersion> {
         self.queue.back().map(|item| &item.event.new_pinned_version)
-    }
-
-    /// Clear the queue for cache refill and return an event that merges all pending cache refill events
-    /// into a single event that takes the earliest and latest version.
-    pub(crate) fn clear(&mut self) -> Option<CacheRefillerEvent> {
-        let last_item = self.queue.pop_back()?;
-        let mut event = last_item.event;
-        while let Some(item) = self.queue.pop_back() {
-            assert_eq!(
-                event.pinned_version.id(),
-                item.event.new_pinned_version.id()
-            );
-            event.pinned_version = item.event.pinned_version;
-        }
-        Some(event)
     }
 }
 
@@ -464,20 +458,26 @@ impl CacheRefillTask {
         res
     }
 
+    /// Data cache refill entry point.
     async fn data_cache_refill(
         context: &CacheRefillContext,
         delta: &SstDeltaInfo,
         holders: Vec<TableHolder>,
     ) {
-        // return if data file cache is disabled
-        let Some(filter) = context.sstable_store.data_recent_filter() else {
+        // Skip data cache refill if data disk cache is not enabled.
+        if !context.sstable_store.block_cache().is_hybrid() {
             return;
-        };
+        }
 
         // return if no data to refill
         if delta.insert_sst_infos.is_empty() || delta.delete_sst_object_ids.is_empty() {
             return;
         }
+
+        // return if data file cache is disabled
+        let Some(filter) = context.sstable_store.data_recent_filter() else {
+            return;
+        };
 
         // return if recent filter miss
         if !context
@@ -558,7 +558,7 @@ impl CacheRefillTask {
         let parent_ssts = match try_join_all(futures).await {
             Ok(parent_ssts) => parent_ssts.into_iter().flatten(),
             Err(e) => {
-                return tracing::error!(error = %e.as_report(), "get old meta from cache error")
+                return tracing::error!(error = %e.as_report(), "get old meta from cache error");
             }
         };
         let units = Self::get_units_to_refill_by_inheritance(context, &holders, parent_ssts);
@@ -613,7 +613,7 @@ impl CacheRefillTask {
 
             let mut writer = sstable_store.block_cache().storage_writer(key);
 
-            if writer.pick() {
+            if writer.pick().admitted() {
                 admits += 1;
             }
 

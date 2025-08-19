@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,25 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use pretty_xmlish::{Pretty, XmlNode};
-use risingwave_common::catalog::{ColumnId, TableDesc};
+use risingwave_common::catalog::ColumnId;
 use risingwave_pb::batch_plan::plan_node::NodeBody;
 use risingwave_pb::batch_plan::{DistributedLookupJoinNode, LocalLookupJoinNode};
+use risingwave_pb::plan_common::AsOfJoinDesc;
 use risingwave_sqlparser::ast::AsOf;
 
 use super::batch::prelude::*;
-use super::utils::{childless_record, to_pb_time_travel_as_of, Distill};
-use super::{generic, ExprRewritable};
+use super::utils::{Distill, childless_record, to_pb_time_travel_as_of};
+use super::{BatchPlanRef as PlanRef, BatchSeqScan, ExprRewritable, generic};
+use crate::TableCatalog;
 use crate::error::Result;
 use crate::expr::{Expr, ExprRewriter, ExprVisitor};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_node::utils::IndicesDisplay;
 use crate::optimizer::plan_node::{
-    EqJoinPredicate, EqJoinPredicateDisplay, LogicalScan, PlanBase, PlanTreeNodeUnary,
-    ToDistributedBatch, ToLocalBatch, TryToBatchPb,
+    EqJoinPredicate, EqJoinPredicateDisplay, PlanBase, PlanTreeNodeUnary, ToDistributedBatch,
+    ToLocalBatch, TryToBatchPb,
 };
 use crate::optimizer::property::{Distribution, Order, RequiredDist};
-use crate::optimizer::PlanRef;
 use crate::scheduler::SchedulerResult;
 use crate::utils::ColIndexMappingRewriteExt;
 
@@ -44,7 +47,7 @@ pub struct BatchLookupJoin {
     eq_join_predicate: EqJoinPredicate,
 
     /// Table description of the right side table
-    right_table_desc: TableDesc,
+    right_table: Arc<TableCatalog>,
 
     /// Output column ids of the right side table
     right_output_column_ids: Vec<ColumnId>,
@@ -57,17 +60,20 @@ pub struct BatchLookupJoin {
     distributed_lookup: bool,
 
     as_of: Option<AsOf>,
+    // `AsOf` join description
+    asof_desc: Option<AsOfJoinDesc>,
 }
 
 impl BatchLookupJoin {
     pub fn new(
         core: generic::Join<PlanRef>,
         eq_join_predicate: EqJoinPredicate,
-        right_table_desc: TableDesc,
+        right_table: Arc<TableCatalog>,
         right_output_column_ids: Vec<ColumnId>,
         lookup_prefix_len: usize,
         distributed_lookup: bool,
         as_of: Option<AsOf>,
+        asof_desc: Option<AsOfJoinDesc>,
     ) -> Self {
         // We cannot create a `BatchLookupJoin` without any eq keys. We require eq keys to do the
         // lookup.
@@ -79,11 +85,12 @@ impl BatchLookupJoin {
             base,
             core,
             eq_join_predicate,
-            right_table_desc,
+            right_table,
             right_output_column_ids,
             lookup_prefix_len,
             distributed_lookup,
             as_of,
+            asof_desc,
         }
     }
 
@@ -102,8 +109,8 @@ impl BatchLookupJoin {
         &self.eq_join_predicate
     }
 
-    pub fn right_table_desc(&self) -> &TableDesc {
-        &self.right_table_desc
+    pub fn right_table(&self) -> &TableCatalog {
+        &self.right_table
     }
 
     fn clone_with_distributed_lookup(&self, input: PlanRef, distributed_lookup: bool) -> Self {
@@ -137,16 +144,15 @@ impl Distill for BatchLookupJoin {
             vec.push(("output", data));
         }
 
-        if let Some(scan) = self.core.right.as_logical_scan() {
-            let scan: &LogicalScan = scan;
-            vec.push(("lookup table", Pretty::display(&scan.table_name())));
-        }
+        let scan: &BatchSeqScan = self.core.right.as_batch_seq_scan().unwrap();
+
+        vec.push(("lookup table", Pretty::display(&scan.core().table_name())));
 
         childless_record("BatchLookupJoin", vec)
     }
 }
 
-impl PlanTreeNodeUnary for BatchLookupJoin {
+impl PlanTreeNodeUnary<Batch> for BatchLookupJoin {
     fn input(&self) -> PlanRef {
         self.core.left.clone()
     }
@@ -158,25 +164,26 @@ impl PlanTreeNodeUnary for BatchLookupJoin {
         Self::new(
             core,
             self.eq_join_predicate.clone(),
-            self.right_table_desc.clone(),
+            self.right_table.clone(),
             self.right_output_column_ids.clone(),
             self.lookup_prefix_len,
             self.distributed_lookup,
             self.as_of.clone(),
+            self.asof_desc,
         )
     }
 }
 
-impl_plan_tree_node_for_unary! { BatchLookupJoin }
+impl_plan_tree_node_for_unary! { Batch, BatchLookupJoin }
 
 impl ToDistributedBatch for BatchLookupJoin {
     fn to_distributed(&self) -> Result<PlanRef> {
         // Align left distribution keys with the right table.
         let mut exchange_dist_keys = vec![];
         let left_eq_indexes = self.eq_join_predicate.left_eq_indexes();
-        let right_table_desc = self.right_table_desc();
-        for dist_col_index in &right_table_desc.distribution_key {
-            let dist_col_id = right_table_desc.columns[*dist_col_index].column_id;
+        let right_table = &self.right_table;
+        for dist_col_index in &right_table.distribution_key {
+            let dist_col_id = right_table.columns[*dist_col_index].column_desc.column_id;
             let output_pos = self
                 .right_output_column_ids
                 .iter()
@@ -198,7 +205,7 @@ impl ToDistributedBatch for BatchLookupJoin {
             &Order::any(),
             &RequiredDist::PhysicalDist(Distribution::UpstreamHashShard(
                 exchange_dist_keys,
-                self.right_table_desc.table_id,
+                self.right_table.id,
             )),
         )?;
 
@@ -228,7 +235,7 @@ impl TryToBatchPb for BatchLookupJoin {
                     .into_iter()
                     .map(|a| a as _)
                     .collect(),
-                inner_side_table_desc: Some(self.right_table_desc.try_to_protobuf()?),
+                inner_side_table_desc: Some(self.right_table.table_desc().try_to_protobuf()?),
                 inner_side_column_ids: self
                     .right_output_column_ids
                     .iter()
@@ -238,6 +245,7 @@ impl TryToBatchPb for BatchLookupJoin {
                 null_safe: self.eq_join_predicate.null_safes(),
                 lookup_prefix_len: self.lookup_prefix_len as u32,
                 as_of: to_pb_time_travel_as_of(&self.as_of)?,
+                asof_desc: self.asof_desc,
             })
         } else {
             NodeBody::LocalLookupJoin(LocalLookupJoinNode {
@@ -259,7 +267,7 @@ impl TryToBatchPb for BatchLookupJoin {
                     .into_iter()
                     .map(|a| a as _)
                     .collect(),
-                inner_side_table_desc: Some(self.right_table_desc.try_to_protobuf()?),
+                inner_side_table_desc: Some(self.right_table.table_desc().try_to_protobuf()?),
                 inner_side_vnode_mapping: vec![], // To be filled in at local.rs
                 inner_side_column_ids: self
                     .right_output_column_ids
@@ -271,6 +279,7 @@ impl TryToBatchPb for BatchLookupJoin {
                 null_safe: self.eq_join_predicate.null_safes(),
                 lookup_prefix_len: self.lookup_prefix_len as u32,
                 as_of: to_pb_time_travel_as_of(&self.as_of)?,
+                asof_desc: self.asof_desc,
             })
         })
     }
@@ -279,13 +288,13 @@ impl TryToBatchPb for BatchLookupJoin {
 impl ToLocalBatch for BatchLookupJoin {
     fn to_local(&self) -> Result<PlanRef> {
         let input = RequiredDist::single()
-            .enforce_if_not_satisfies(self.input().to_local()?, &Order::any())?;
+            .batch_enforce_if_not_satisfies(self.input().to_local()?, &Order::any())?;
 
         Ok(self.clone_with_distributed_lookup(input, false).into())
     }
 }
 
-impl ExprRewritable for BatchLookupJoin {
+impl ExprRewritable<Batch> for BatchLookupJoin {
     fn has_rewritable_expr(&self) -> bool {
         true
     }

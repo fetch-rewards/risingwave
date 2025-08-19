@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,12 +14,13 @@
 
 use std::sync::Arc;
 
+use opendal::Operator;
 use opendal::layers::LoggingLayer;
 use opendal::services::Hdfs;
-use opendal::Operator;
 use risingwave_common::config::ObjectStoreConfig;
+use risingwave_common::global_jvm::JVM;
 
-use super::{EngineType, OpendalObjectStore};
+use super::{MediaType, OpendalObjectStore};
 // use crate::object::opendal_engine::ATOMIC_WRITE_DIR;
 use crate::object::ObjectResult;
 
@@ -32,7 +33,6 @@ impl OpendalObjectStore {
         metrics: Arc<ObjectStoreMetrics>,
     ) -> ObjectResult<Self> {
         // Init the jvm explicitly to avoid duplicate JVM creation by hdfs client
-        use risingwave_jni_core::jvm_runtime::JVM;
         let _ = JVM
             .get_or_init()
             .inspect_err(|e| tracing::error!("Failed to init JVM: {:?}", e))
@@ -53,7 +53,7 @@ impl OpendalObjectStore {
             .finish();
         Ok(Self {
             op,
-            engine_type: EngineType::Hdfs,
+            media_type: MediaType::Hdfs,
             config,
             metrics,
         })

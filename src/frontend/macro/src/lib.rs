@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
-use syn::{parse_macro_input, Ident, ItemFn, ItemStruct, LitStr, Result, Token};
+use syn::{Ident, ItemFn, ItemStruct, LitStr, Result, Token, parse_macro_input};
 
 #[proc_macro_attribute]
 pub fn system_catalog(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -116,7 +116,7 @@ fn gen_sys_table(attr: Attr, item_fn: ItemFn) -> Result<TokenStream2> {
 
     Ok(quote! {
         #[linkme::distributed_slice(crate::catalog::system_catalog::SYS_CATALOGS_SLICE)]
-        #[no_mangle]    // to prevent duplicate schema.table name
+        #[unsafe(no_mangle)]    // to prevent duplicate schema.table name
         fn #gen_fn_name() -> crate::catalog::system_catalog::BuiltinCatalog {
             const _: () = {
                 assert!(#struct_type::PRIMARY_KEY.is_some(), "primary key is required for system table");
@@ -164,7 +164,7 @@ fn gen_sys_view(attr: Attr, item_struct: ItemStruct) -> Result<TokenStream2> {
 
     Ok(quote! {
         #[linkme::distributed_slice(crate::catalog::system_catalog::SYS_CATALOGS_SLICE)]
-        #[no_mangle]    // to prevent duplicate schema.table name
+        #[unsafe(no_mangle)]    // to prevent duplicate schema.table name
         fn #gen_fn_name() -> crate::catalog::system_catalog::BuiltinCatalog {
             let fields = #struct_type::fields();
             crate::catalog::system_catalog::BuiltinCatalog::View(crate::catalog::system_catalog::BuiltinView {

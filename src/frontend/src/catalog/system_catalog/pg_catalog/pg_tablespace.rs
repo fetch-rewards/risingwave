@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,6 +24,6 @@ struct PgTablespace {
     oid: i32,
     spcname: String,
     spcowner: i32,
-    spcacl: String,
+    spcacl: Vec<String>,
     spcoptions: String,
 }

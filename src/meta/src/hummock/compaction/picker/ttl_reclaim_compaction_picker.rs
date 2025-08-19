@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -176,7 +176,7 @@ impl TtlReclaimCompactionPicker {
         });
 
         Some(CompactionInput {
-            select_input_size: select_input_ssts.iter().map(|sst| sst.file_size).sum(),
+            select_input_size: select_input_ssts.iter().map(|sst| sst.sst_size).sum(),
             total_file_count: select_input_ssts.len() as _,
             input_levels: vec![
                 InputLevel {
@@ -203,9 +203,10 @@ mod test {
 
     use itertools::Itertools;
     use risingwave_hummock_sdk::level::Level;
+    use risingwave_hummock_sdk::sstable_info::SstableInfoInner;
     use risingwave_hummock_sdk::version::HummockVersionStateTableInfo;
-    use risingwave_pb::hummock::compact_task;
     pub use risingwave_pb::hummock::LevelType;
+    use risingwave_pb::hummock::compact_task;
 
     use super::*;
     use crate::hummock::compaction::compaction_config::CompactionConfigBuilder;
@@ -349,7 +350,14 @@ mod test {
         {
             let sst_10 = levels[3].table_infos.get_mut(8).unwrap();
             assert_eq!(10, sst_10.sst_id);
-            sst_10.key_range.right_exclusive = true;
+            *sst_10 = SstableInfoInner {
+                key_range: KeyRange {
+                    right_exclusive: true,
+                    ..sst_10.key_range.clone()
+                },
+                ..sst_10.get_inner()
+            }
+            .into();
         }
 
         assert_eq!(levels.len(), 4);

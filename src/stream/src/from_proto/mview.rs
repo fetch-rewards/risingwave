@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use risingwave_common::catalog::ConflictBehavior;
 use risingwave_common::util::sort_util::ColumnOrder;
-use risingwave_common::util::value_encoding::column_aware_row_encoding::ColumnAwareSerde;
 use risingwave_common::util::value_encoding::BasicSerde;
+use risingwave_common::util::value_encoding::column_aware_row_encoding::ColumnAwareSerde;
 use risingwave_pb::stream_plan::{ArrangeNode, MaterializeNode};
 
 use super::*;
@@ -100,7 +100,7 @@ impl ExecutorBuilder for ArrangeExecutorBuilder {
         let table = node.get_table()?;
 
         // FIXME: Lookup is now implemented without cell-based table API and relies on all vnodes
-        // being `DEFAULT_VNODE`, so we need to make the Arrange a singleton.
+        // being `SINGLETON_VNODE`, so we need to make the Arrange a singleton.
         let vnodes = params.vnode_bitmap.map(Arc::new);
         let conflict_behavior =
             ConflictBehavior::from_protobuf(&table.handle_pk_conflict_behavior());

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,8 +22,8 @@ use risingwave_common::util::iter_util::ZipEqFast;
 
 use super::{GenericPlanNode, GenericPlanRef};
 use crate::expr::{
-    assert_input_ref, Expr, ExprDisplay, ExprImpl, ExprRewriter, ExprType, ExprVisitor,
-    FunctionCall, InputRef,
+    Expr, ExprDisplay, ExprImpl, ExprRewriter, ExprType, ExprVisitor, FunctionCall, InputRef,
+    assert_input_ref,
 };
 use crate::optimizer::optimizer_context::OptimizerContextRef;
 use crate::optimizer::property::FunctionalDependencySet;
@@ -58,6 +58,15 @@ pub struct Project<PlanRef> {
 }
 
 impl<PlanRef> Project<PlanRef> {
+    pub fn clone_with_input<OtherPlanRef>(&self, input: OtherPlanRef) -> Project<OtherPlanRef> {
+        Project {
+            exprs: self.exprs.clone(),
+            field_names: self.field_names.clone(),
+            input,
+            _private: (),
+        }
+    }
+
     pub(crate) fn rewrite_exprs(&mut self, r: &mut dyn ExprRewriter) {
         self.exprs = self
             .exprs
@@ -82,31 +91,28 @@ impl<PlanRef: GenericPlanRef> GenericPlanNode for Project<PlanRef> {
             .enumerate()
             .map(|(i, expr)| {
                 // Get field info from o2i.
-                let (name, sub_fields, type_name) = match o2i.try_map(i) {
+                let name = match o2i.try_map(i) {
                     Some(input_idx) => {
-                        let mut field = input_schema.fields()[input_idx].clone();
                         if let Some(name) = self.field_names.get(&i) {
-                            field.name.clone_from(name);
+                            name.clone()
+                        } else {
+                            input_schema.fields()[input_idx].name.clone()
                         }
-                        (field.name, field.sub_fields, field.type_name)
                     }
                     None => match expr {
-                        ExprImpl::InputRef(_) | ExprImpl::Literal(_) => (
-                            format!("{:?}", ExprDisplay { expr, input_schema }),
-                            vec![],
-                            String::new(),
-                        ),
+                        ExprImpl::InputRef(_) | ExprImpl::Literal(_) => {
+                            format!("{:?}", ExprDisplay { expr, input_schema })
+                        }
                         _ => {
-                            let name = if let Some(name) = self.field_names.get(&i) {
+                            if let Some(name) = self.field_names.get(&i) {
                                 name.clone()
                             } else {
                                 format!("$expr{}", ctx.next_expr_display_id())
-                            };
-                            (name, vec![], String::new())
+                            }
                         }
                     },
                 };
-                Field::with_struct(expr.return_type(), name, sub_fields, type_name)
+                Field::with_name(expr.return_type(), name)
             })
             .collect();
         Schema { fields }
@@ -210,7 +216,7 @@ impl<PlanRef: GenericPlanRef> Project<PlanRef> {
         let vnode_expr_idx = new_exprs.len() - 1;
 
         let mut new = Self::new(new_exprs, input);
-        new.field_names.insert(vnode_expr_idx, "_vnode".to_string());
+        new.field_names.insert(vnode_expr_idx, "_vnode".to_owned());
         new
     }
 
@@ -295,6 +301,41 @@ impl<PlanRef: GenericPlanRef> Project<PlanRef> {
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()
+    }
+
+    pub(crate) fn likely_produces_noop_updates(&self) -> bool {
+        struct HasJsonbAccess {
+            has: bool,
+        }
+
+        impl ExprVisitor for HasJsonbAccess {
+            fn visit_function_call(&mut self, func_call: &FunctionCall) {
+                if matches!(
+                    func_call.func_type(),
+                    ExprType::JsonbAccess
+                        | ExprType::JsonbAccessStr
+                        | ExprType::JsonbExtractPath
+                        | ExprType::JsonbExtractPathVariadic
+                        | ExprType::JsonbExtractPathText
+                        | ExprType::JsonbExtractPathTextVariadic
+                        | ExprType::JsonbPathExists
+                        | ExprType::JsonbPathMatch
+                        | ExprType::JsonbPathQueryArray
+                        | ExprType::JsonbPathQueryFirst
+                ) {
+                    self.has = true;
+                }
+            }
+        }
+
+        self.exprs.iter().any(|expr| {
+            // When there's a jsonb access in the `Project`, it's very likely that the query is
+            // extracting some fields from a jsonb payload column. In this case, a change from the
+            // input jsonb payload may not change the output of the `Project`.
+            let mut visitor = HasJsonbAccess { has: false };
+            visitor.visit_expr(expr);
+            visitor.has
+        })
     }
 }
 

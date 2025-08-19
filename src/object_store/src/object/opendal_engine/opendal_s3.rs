@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,15 +15,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use opendal::Operator;
 use opendal::layers::LoggingLayer;
 use opendal::raw::HttpClient;
 use opendal::services::S3;
-use opendal::Operator;
 use risingwave_common::config::ObjectStoreConfig;
 
-use super::{EngineType, OpendalObjectStore};
-use crate::object::object_metrics::ObjectStoreMetrics;
+use super::{MediaType, OpendalObjectStore};
 use crate::object::ObjectResult;
+use crate::object::object_metrics::ObjectStoreMetrics;
 
 impl OpendalObjectStore {
     /// create opendal s3 engine.
@@ -33,19 +33,18 @@ impl OpendalObjectStore {
         metrics: Arc<ObjectStoreMetrics>,
     ) -> ObjectResult<Self> {
         // Create s3 builder.
-        let mut builder = S3::default();
-        builder.bucket(&bucket);
+        let mut builder = S3::default().bucket(&bucket);
         // For AWS S3, there is no need to set an endpoint; for other S3 compatible object stores, it is necessary to set this field.
         if let Ok(endpoint_url) = std::env::var("RW_S3_ENDPOINT") {
-            builder.endpoint(&endpoint_url);
+            builder = builder.endpoint(&endpoint_url);
         }
 
         if std::env::var("RW_IS_FORCE_PATH_STYLE").is_err() {
-            builder.enable_virtual_host_style();
+            builder = builder.enable_virtual_host_style();
         }
 
         let http_client = Self::new_http_client(&config)?;
-        builder.http_client(http_client);
+        builder = builder.http_client(http_client);
 
         let op: Operator = Operator::new(builder)?
             .layer(LoggingLayer::default())
@@ -53,7 +52,7 @@ impl OpendalObjectStore {
 
         Ok(Self {
             op,
-            engine_type: EngineType::S3,
+            media_type: MediaType::S3,
             config,
             metrics,
         })
@@ -79,25 +78,21 @@ impl OpendalObjectStore {
             "http://"
         };
         let (address, bucket) = rest.split_once('/').unwrap();
-
-        let mut builder = S3::default();
-        builder
+        let builder = S3::default()
             .bucket(bucket)
             .region("custom")
             .access_key_id(access_key_id)
             .secret_access_key(secret_access_key)
-            .endpoint(&format!("{}{}", endpoint_prefix, address));
-
-        builder.disable_config_load();
-        let http_client = Self::new_http_client(&config)?;
-        builder.http_client(http_client);
+            .endpoint(&format!("{}{}", endpoint_prefix, address))
+            .disable_config_load()
+            .http_client(Self::new_http_client(&config)?);
         let op: Operator = Operator::new(builder)?
             .layer(LoggingLayer::default())
             .finish();
 
         Ok(Self {
             op,
-            engine_type: EngineType::Minio,
+            media_type: MediaType::Minio,
             config,
             metrics,
         })
@@ -115,40 +110,5 @@ impl OpendalObjectStore {
         }
 
         Ok(HttpClient::build(client_builder)?)
-    }
-
-    /// currently used by snowflake sink,
-    /// especially when sinking to the intermediate s3 bucket.
-    pub fn new_s3_engine_with_credentials(
-        bucket: &str,
-        config: Arc<ObjectStoreConfig>,
-        metrics: Arc<ObjectStoreMetrics>,
-        aws_access_key_id: &str,
-        aws_secret_access_key: &str,
-        aws_region: &str,
-    ) -> ObjectResult<Self> {
-        // Create s3 builder with credentials.
-        let mut builder = S3::default();
-
-        // set credentials for s3 sink
-        builder.bucket(bucket);
-        builder.access_key_id(aws_access_key_id);
-        builder.secret_access_key(aws_secret_access_key);
-        builder.region(aws_region);
-        builder.disable_config_load();
-
-        let http_client = Self::new_http_client(config.as_ref())?;
-        builder.http_client(http_client);
-
-        let op: Operator = Operator::new(builder)?
-            .layer(LoggingLayer::default())
-            .finish();
-
-        Ok(Self {
-            op,
-            engine_type: EngineType::S3,
-            config,
-            metrics,
-        })
     }
 }

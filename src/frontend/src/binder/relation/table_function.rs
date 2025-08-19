@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,9 +16,9 @@ use std::str::FromStr;
 
 use itertools::Itertools;
 use risingwave_common::bail_not_implemented;
-use risingwave_common::catalog::{Field, Schema, RW_INTERNAL_TABLE_FUNCTION_NAME};
+use risingwave_common::catalog::{Field, RW_INTERNAL_TABLE_FUNCTION_NAME, Schema};
 use risingwave_common::types::DataType;
-use risingwave_sqlparser::ast::{Function, FunctionArg, ObjectName, TableAlias};
+use risingwave_sqlparser::ast::{Function, FunctionArg, FunctionArgList, ObjectName, TableAlias};
 
 use super::watermark::is_watermark_func;
 use super::{Binder, Relation, Result, WindowTableFunctionKind};
@@ -35,9 +35,9 @@ impl Binder {
     /// `with_ordinality` is only supported for the `TableFunction` case now.
     pub(super) fn bind_table_function(
         &mut self,
-        name: ObjectName,
-        alias: Option<TableAlias>,
-        args: Vec<FunctionArg>,
+        name: &ObjectName,
+        alias: Option<&TableAlias>,
+        args: &[FunctionArg],
         with_ordinality: bool,
     ) -> Result<Relation> {
         let func_name = &name.0[0].real_value();
@@ -70,7 +70,7 @@ impl Binder {
         if is_watermark_func(func_name) {
             if with_ordinality {
                 return Err(ErrorCode::InvalidInputSyntax(
-                    "WITH ORDINALITY for watermark".to_string(),
+                    "WITH ORDINALITY for watermark".to_owned(),
                 )
                 .into());
             }
@@ -82,14 +82,11 @@ impl Binder {
         self.push_context();
         let mut clause = Some(Clause::From);
         std::mem::swap(&mut self.context.clause, &mut clause);
-        let func = self.bind_function(Function {
+        let func = self.bind_function(&Function {
             scalar_as_agg: false,
-            name,
-            args,
-            variadic: false,
+            name: name.clone(),
+            arg_list: FunctionArgList::args_only(args.to_vec()),
             over: None,
-            distinct: false,
-            order_by: vec![],
             filter: None,
             within_group: None,
         });
@@ -97,14 +94,14 @@ impl Binder {
         self.pop_context()?;
         let func = func?;
 
-        if let ExprImpl::TableFunction(func) = &func {
-            if func.args.iter().any(|arg| arg.has_subquery()) {
-                // Same error reports as DuckDB.
-                return Err(ErrorCode::InvalidInputSyntax(
+        if let ExprImpl::TableFunction(func) = &func
+            && func.args.iter().any(|arg| arg.has_subquery())
+        {
+            // Same error reports as DuckDB.
+            return Err(ErrorCode::InvalidInputSyntax(
                     format!("Only table-in-out functions can have subquery parameters. The table function has subquery parameters is {}", func.name()),
                 )
                     .into());
-            }
         }
 
         // bool indicates if the field is hidden

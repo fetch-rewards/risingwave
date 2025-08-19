@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn test_heap() {
-        let gauge = LabelGuardedIntGauge::<4>::test_int_gauge();
+        let gauge = LabelGuardedIntGauge::test_int_gauge::<4>();
         let mem_ctx = MemoryContext::root(gauge.clone(), u64::MAX);
 
         let mut heap = MemMonitoredHeap::<u8>::new_with(mem_ctx);
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn test_heap_drop() {
-        let gauge = LabelGuardedIntGauge::<4>::test_int_gauge();
+        let gauge = LabelGuardedIntGauge::test_int_gauge::<4>();
         let mem_ctx = MemoryContext::root(gauge.clone(), u64::MAX);
 
         let vec = {

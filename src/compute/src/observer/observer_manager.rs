@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,14 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use risingwave_common::license::LicenseManager;
 use risingwave_common::secret::LocalSecretManager;
 use risingwave_common::system_param::local_manager::LocalSystemParamsManagerRef;
 use risingwave_common_service::ObserverState;
-use risingwave_pb::meta::subscribe_response::{Info, Operation};
 use risingwave_pb::meta::SubscribeResponse;
+use risingwave_pb::meta::subscribe_response::{Info, Operation};
+use risingwave_rpc_client::ComputeClientPoolRef;
 
 pub struct ComputeObserverNode {
     system_params_manager: LocalSystemParamsManagerRef,
+    batch_client_pool: ComputeClientPoolRef,
 }
 
 impl ObserverState for ComputeObserverNode {
@@ -38,10 +41,23 @@ impl ObserverState for ComputeObserverNode {
                     Operation::Delete => {
                         LocalSecretManager::global().remove_secret(s.id);
                     }
+                    Operation::Update => {
+                        LocalSecretManager::global().update_secret(s.id, s.value);
+                    }
                     _ => {
                         panic!("error type notification");
                     }
                 },
+                Info::ComputeNodeTotalCpuCount(count) => {
+                    LicenseManager::get().update_cpu_core_count(count as _);
+                }
+                Info::Recovery(_) => {
+                    // Reset batch client pool on recovery is always unnecessary
+                    // when serving and streaming have been separated.
+                    // It can still be used as a method to manually trigger a reset of the batch client pool.
+                    // TODO: invalidate a single batch client on any connection issue.
+                    self.batch_client_pool.invalidate_all();
+                }
                 _ => {
                     panic!("error type notification");
                 }
@@ -54,13 +70,18 @@ impl ObserverState for ComputeObserverNode {
             unreachable!();
         };
         LocalSecretManager::global().init_secrets(snapshot.secrets);
+        LicenseManager::get().update_cpu_core_count(snapshot.compute_node_total_cpu_count as _);
     }
 }
 
 impl ComputeObserverNode {
-    pub fn new(system_params_manager: LocalSystemParamsManagerRef) -> Self {
+    pub fn new(
+        system_params_manager: LocalSystemParamsManagerRef,
+        batch_client_pool: ComputeClientPoolRef,
+    ) -> Self {
         Self {
             system_params_manager,
+            batch_client_pool,
         }
     }
 }

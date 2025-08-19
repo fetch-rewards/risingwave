@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::telemetry::report::report_event_common;
+use risingwave_common::telemetry::report_event_common;
 use risingwave_pb::telemetry::{PbTelemetryDatabaseObject, PbTelemetryEventStage};
 
 const TELEMETRY_COMPUTE_REPORT_TYPE: &str = "compute";
@@ -32,6 +32,6 @@ pub fn report_event(
         connector_name,
         component,
         attributes,
-        TELEMETRY_COMPUTE_REPORT_TYPE.to_string(),
+        TELEMETRY_COMPUTE_REPORT_TYPE.to_owned(),
     );
 }

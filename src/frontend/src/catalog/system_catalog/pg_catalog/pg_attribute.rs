@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,6 +28,10 @@ use risingwave_frontend_macro::system_catalog;
     "SELECT c.relation_id AS attrelid,
             c.name AS attname,
             c.type_oid AS atttypid,
+            CASE
+              WHEN c.udt_type = 'list' THEN 1::int2
+              ELSE 0::int2
+            END AS attndims,
             c.type_len AS attlen,
             c.position::smallint AS attnum,
             false AS attnotnull,
@@ -49,6 +53,7 @@ struct PgAttribute {
     attrelid: i32,
     attname: String,
     atttypid: i32,
+    attndims: i16,
     attlen: i16,
     attnum: i16,
     attnotnull: bool,

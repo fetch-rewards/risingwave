@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,11 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{anyhow, Context};
-use futures::future::try_join_all;
-use futures::prelude::future::FutureExt;
-use futures::prelude::TryFuture;
-use futures::TryFutureExt;
+use anyhow::anyhow;
 use google_cloud_gax::conn::Environment;
 use google_cloud_googleapis::pubsub::v1::PubsubMessage;
 use google_cloud_pubsub::apiv1;
@@ -26,40 +22,54 @@ use google_cloud_pubsub::client::google_cloud_auth::credentials::CredentialsFile
 use google_cloud_pubsub::client::google_cloud_auth::project;
 use google_cloud_pubsub::client::google_cloud_auth::token::DefaultTokenSourceProvider;
 use google_cloud_pubsub::client::{Client, ClientConfig};
-use google_cloud_pubsub::publisher::{Awaiter, Publisher};
+use google_cloud_pubsub::publisher::Publisher;
 use risingwave_common::array::StreamChunk;
 use risingwave_common::catalog::Schema;
-use risingwave_common::session_config::sink_decouple::SinkDecouple;
 use serde_derive::Deserialize;
 use serde_with::serde_as;
 use tonic::Status;
 use with_options::WithOptions;
 
-use super::catalog::desc::SinkDesc;
 use super::catalog::SinkFormatDesc;
 use super::formatter::SinkFormatterImpl;
 use super::log_store::DeliveryFutureManagerAddFuture;
 use super::writer::{
     AsyncTruncateLogSinkerOf, AsyncTruncateSinkWriter, AsyncTruncateSinkWriterExt, FormattedSink,
 };
-use super::{DummySinkCommitCoordinator, Result, Sink, SinkError, SinkParam, SinkWriterParam};
+use super::{Result, Sink, SinkError, SinkParam, SinkWriterParam};
 use crate::dispatch_sink_formatter_str_key_impl;
+use crate::enforce_secret::EnforceSecret;
 
 pub const PUBSUB_SINK: &str = "google_pubsub";
 const PUBSUB_SEND_FUTURE_BUFFER_MAX_SIZE: usize = 65536;
 
-fn may_delivery_future(awaiter: Vec<Awaiter>) -> GooglePubSubSinkDeliveryFuture {
-    try_join_all(awaiter.into_iter().map(|awaiter| {
-        awaiter.get().map(|result| {
-            result
-                .context("Google Pub/Sub sink error")
-                .map_err(SinkError::GooglePubSub)
-                .map(|_| ())
-        })
-    }))
-    .map_ok(|_: Vec<()>| ())
-    .boxed()
+mod delivery_future {
+    use anyhow::Context;
+    use futures::future::try_join_all;
+    use futures::{FutureExt, TryFuture, TryFutureExt};
+    use google_cloud_pubsub::publisher::Awaiter;
+
+    use crate::sink::SinkError;
+
+    pub type GooglePubSubSinkDeliveryFuture =
+        impl TryFuture<Ok = (), Error = SinkError> + Unpin + 'static;
+
+    #[define_opaque(GooglePubSubSinkDeliveryFuture)]
+    pub(super) fn may_delivery_future(awaiter: Vec<Awaiter>) -> GooglePubSubSinkDeliveryFuture {
+        try_join_all(awaiter.into_iter().map(|awaiter| {
+            awaiter.get().map(|result| {
+                result
+                    .context("Google Pub/Sub sink error")
+                    .map_err(SinkError::GooglePubSub)
+                    .map(|_| ())
+            })
+        }))
+        .map_ok(|_: Vec<()>| ())
+        .boxed()
+    }
 }
+
+use delivery_future::*;
 
 #[serde_as]
 #[derive(Clone, Debug, Deserialize, WithOptions)]
@@ -89,6 +99,12 @@ pub struct GooglePubSubConfig {
     pub credentials: Option<String>,
 }
 
+impl EnforceSecret for GooglePubSubConfig {
+    const ENFORCE_SECRET_PROPERTIES: phf::Set<&'static str> = phf::phf_set! {
+        "pubsub.credentials",
+    };
+}
+
 impl GooglePubSubConfig {
     fn from_btreemap(values: BTreeMap<String, String>) -> Result<Self> {
         serde_json::from_value::<GooglePubSubConfig>(serde_json::to_value(values).unwrap())
@@ -108,18 +124,20 @@ pub struct GooglePubSubSink {
     sink_from_name: String,
 }
 
+impl EnforceSecret for GooglePubSubSink {
+    fn enforce_secret<'a>(
+        prop_iter: impl Iterator<Item = &'a str>,
+    ) -> crate::error::ConnectorResult<()> {
+        for prop in prop_iter {
+            GooglePubSubConfig::enforce_one(prop)?;
+        }
+        Ok(())
+    }
+}
 impl Sink for GooglePubSubSink {
-    type Coordinator = DummySinkCommitCoordinator;
     type LogSinker = AsyncTruncateLogSinkerOf<GooglePubSubSinkWriter>;
 
     const SINK_NAME: &'static str = PUBSUB_SINK;
-
-    fn is_sink_decouple(_desc: &SinkDesc, user_specified: &SinkDecouple) -> Result<bool> {
-        match user_specified {
-            SinkDecouple::Default | SinkDecouple::Enable => Ok(true),
-            SinkDecouple::Disable => Ok(false),
-        }
-    }
 
     async fn validate(&self) -> Result<()> {
         if !self.is_append_only {
@@ -181,9 +199,6 @@ struct GooglePubSubPayloadWriter<'w> {
     add_future: DeliveryFutureManagerAddFuture<'w, GooglePubSubSinkDeliveryFuture>,
 }
 
-pub type GooglePubSubSinkDeliveryFuture =
-    impl TryFuture<Ok = (), Error = SinkError> + Unpin + 'static;
-
 impl GooglePubSubSinkWriter {
     pub async fn new(
         config: GooglePubSubConfig,
@@ -194,11 +209,9 @@ impl GooglePubSubSinkWriter {
         sink_from_name: String,
     ) -> Result<Self> {
         let environment = if let Some(ref cred) = config.credentials {
-            let auth_config = project::Config {
-                audience: Some(apiv1::conn_pool::AUDIENCE),
-                scopes: Some(&apiv1::conn_pool::SCOPES),
-                sub: None,
-            };
+            let mut auth_config = project::Config::default();
+            auth_config = auth_config.with_audience(apiv1::conn_pool::AUDIENCE);
+            auth_config = auth_config.with_scopes(&apiv1::conn_pool::SCOPES);
             let cred_file = CredentialsFile::new_from_str(cred).await.map_err(|e| {
                 SinkError::GooglePubSub(
                     anyhow!(e).context("Failed to create Google Cloud Pub/Sub credentials file"),
@@ -287,7 +300,7 @@ impl AsyncTruncateSinkWriter for GooglePubSubSinkWriter {
     }
 }
 
-impl<'w> GooglePubSubPayloadWriter<'w> {
+impl GooglePubSubPayloadWriter<'_> {
     pub async fn finish(&mut self) -> Result<()> {
         let message_vec = std::mem::take(&mut self.message_vec);
         let awaiters = self.publisher.publish_bulk(message_vec).await;
@@ -298,7 +311,7 @@ impl<'w> GooglePubSubPayloadWriter<'w> {
     }
 }
 
-impl<'w> FormattedSink for GooglePubSubPayloadWriter<'w> {
+impl FormattedSink for GooglePubSubPayloadWriter<'_> {
     type K = String;
     type V = Vec<u8>;
 

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,11 +17,12 @@ use fixedbitset::FixedBitSet;
 use futures::FutureExt;
 use paste::paste;
 use risingwave_common::array::ListValue;
-use risingwave_common::types::{DataType, Datum, JsonbVal, Scalar, ScalarImpl};
+use risingwave_common::types::{DataType, Datum, JsonbVal, MapType, Scalar, ScalarImpl};
 use risingwave_expr::aggregate::PbAggKind;
 use risingwave_expr::expr::build_from_prost;
 use risingwave_pb::expr::expr_node::RexNode;
 use risingwave_pb::expr::{ExprNode, ProjectSetSelectItem};
+use user_defined_function::UserDefinedFunctionDisplay;
 
 use crate::error::{ErrorCode, Result as RwResult};
 
@@ -51,13 +52,13 @@ mod type_inference;
 mod utils;
 
 pub use agg_call::AggCall;
-pub use correlated_input_ref::{CorrelatedId, CorrelatedInputRef, Depth};
+pub use correlated_input_ref::{CorrelatedId, CorrelatedInputRef, Depth, InputRefDepthRewriter};
 pub use expr_mutator::ExprMutator;
-pub use expr_rewriter::{default_rewrite_expr, ExprRewriter};
-pub use expr_visitor::{default_visit_expr, ExprVisitor};
-pub use function_call::{is_row_function, FunctionCall, FunctionCallDisplay};
+pub use expr_rewriter::{ExprRewriter, default_rewrite_expr};
+pub use expr_visitor::{ExprVisitor, default_visit_expr};
+pub use function_call::{FunctionCall, FunctionCallDisplay, is_row_function};
 pub use function_call_with_lambda::FunctionCallWithLambda;
-pub use input_ref::{input_ref_to_column_indices, InputRef, InputRefDisplay};
+pub use input_ref::{InputRef, InputRefDisplay, input_ref_to_column_indices};
 pub use literal::Literal;
 pub use now::{InlineNowProcTime, Now, NowProcTimeFinder};
 pub use parameter::Parameter;
@@ -66,10 +67,7 @@ pub use risingwave_pb::expr::expr_node::Type as ExprType;
 pub use session_timezone::{SessionTimezone, TimestamptzExprFinder};
 pub use subquery::{Subquery, SubqueryKind};
 pub use table_function::{TableFunction, TableFunctionType};
-pub use type_inference::{
-    align_types, cast_map_array, cast_ok, cast_sigs, infer_some_all, infer_type, infer_type_name,
-    infer_type_with_sigmap, least_restrictive, CastContext, CastSig, FuncSign,
-};
+pub use type_inference::*;
 pub use user_defined_function::UserDefinedFunction;
 pub use utils::*;
 pub use window_function::WindowFunction;
@@ -83,8 +81,14 @@ pub trait Expr: Into<ExprImpl> {
     /// Get the return type of the expr
     fn return_type(&self) -> DataType;
 
-    /// Serialize the expression
-    fn to_expr_proto(&self) -> ExprNode;
+    /// Try to serialize the expression, returning an error if it's impossible.
+    fn try_to_expr_proto(&self) -> Result<ExprNode, String>;
+
+    /// Serialize the expression. Panic if it's impossible.
+    fn to_expr_proto(&self) -> ExprNode {
+        self.try_to_expr_proto()
+            .expect("failed to serialize expression to protobuf")
+    }
 }
 
 macro_rules! impl_expr_impl {
@@ -116,9 +120,9 @@ macro_rules! impl_expr_impl {
                 }
             }
 
-            fn to_expr_proto(&self) -> ExprNode {
+            fn try_to_expr_proto(&self) -> Result<ExprNode, String> {
                 match self {
-                    $(ExprImpl::$t(expr) => expr.to_expr_proto(),)*
+                    $(ExprImpl::$t(expr) => expr.try_to_expr_proto(),)*
                 }
             }
         }
@@ -264,30 +268,30 @@ impl ExprImpl {
     }
 
     /// Shorthand to create cast expr to `target` type in implicit context.
-    pub fn cast_implicit(mut self, target: DataType) -> Result<ExprImpl, CastError> {
+    pub fn cast_implicit(mut self, target: &DataType) -> Result<ExprImpl, CastError> {
         FunctionCall::cast_mut(&mut self, target, CastContext::Implicit)?;
         Ok(self)
     }
 
     /// Shorthand to create cast expr to `target` type in assign context.
-    pub fn cast_assign(mut self, target: DataType) -> Result<ExprImpl, CastError> {
+    pub fn cast_assign(mut self, target: &DataType) -> Result<ExprImpl, CastError> {
         FunctionCall::cast_mut(&mut self, target, CastContext::Assign)?;
         Ok(self)
     }
 
     /// Shorthand to create cast expr to `target` type in explicit context.
-    pub fn cast_explicit(mut self, target: DataType) -> Result<ExprImpl, CastError> {
+    pub fn cast_explicit(mut self, target: &DataType) -> Result<ExprImpl, CastError> {
         FunctionCall::cast_mut(&mut self, target, CastContext::Explicit)?;
         Ok(self)
     }
 
     /// Shorthand to inplace cast expr to `target` type in implicit context.
-    pub fn cast_implicit_mut(&mut self, target: DataType) -> Result<(), CastError> {
+    pub fn cast_implicit_mut(&mut self, target: &DataType) -> Result<(), CastError> {
         FunctionCall::cast_mut(self, target, CastContext::Implicit)
     }
 
     /// Shorthand to inplace cast expr to `target` type in explicit context.
-    pub fn cast_explicit_mut(&mut self, target: DataType) -> Result<(), CastError> {
+    pub fn cast_explicit_mut(&mut self, target: &DataType) -> Result<(), CastError> {
         FunctionCall::cast_mut(self, target, CastContext::Explicit)
     }
 
@@ -299,8 +303,8 @@ impl ExprImpl {
                 FunctionCall::new_unchecked(ExprType::CastRegclass, vec![self], DataType::Int32),
             ))),
             DataType::Int32 => Ok(self),
-            dt if dt.is_int() => Ok(self.cast_explicit(DataType::Int32)?),
-            _ => Err(CastError("Unsupported input type".to_string())),
+            dt if dt.is_int() => Ok(self.cast_explicit(&DataType::Int32)?),
+            _ => bail_cast_error!("unsupported input type"),
         }
     }
 
@@ -324,10 +328,23 @@ impl ExprImpl {
         }
     }
 
+    /// Ensure the return type of this expression is a map of some type.
+    pub fn try_into_map_type(&self) -> Result<MapType, ErrorCode> {
+        if self.is_untyped() {
+            return Err(ErrorCode::BindError(
+                "could not determine polymorphic type because input has type unknown".into(),
+            ));
+        }
+        match self.return_type() {
+            DataType::Map(m) => Ok(m),
+            t => Err(ErrorCode::BindError(format!("expects map but got {t}"))),
+        }
+    }
+
     /// Shorthand to enforce implicit cast to boolean
     pub fn enforce_bool_clause(self, clause: &str) -> RwResult<ExprImpl> {
         if self.is_untyped() {
-            let inner = self.cast_implicit(DataType::Boolean)?;
+            let inner = self.cast_implicit(&DataType::Boolean)?;
             return Ok(inner);
         }
         let return_type = self.return_type();
@@ -357,7 +374,7 @@ impl ExprImpl {
         }
         // Use normal cast for other types. Both `assign` and `explicit` can pass the castability
         // check and there is no difference.
-        self.cast_assign(DataType::Varchar)
+        self.cast_assign(&DataType::Varchar)
             .map_err(|err| err.into())
     }
 
@@ -421,7 +438,7 @@ macro_rules! impl_has_variant {
     };
 }
 
-impl_has_variant! {InputRef, Literal, FunctionCall, FunctionCallWithLambda, AggCall, Subquery, TableFunction, WindowFunction, Now}
+impl_has_variant! {InputRef, Literal, FunctionCall, FunctionCallWithLambda, AggCall, Subquery, TableFunction, WindowFunction, UserDefinedFunction, Now}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InequalityInputPair {
@@ -453,7 +470,7 @@ impl ExprImpl {
     ///
     /// When an expr contains a [`CorrelatedInputRef`] with lower depth, the whole expr is still
     /// considered to be uncorrelated, and can be checked with [`ExprImpl::has_subquery`] as well.
-    /// See examples on [`crate::binder::BoundQuery::is_correlated`] for details.
+    /// See examples on [`crate::binder::BoundQuery::is_correlated_by_depth`] for details.
     ///
     /// This is a placeholder to trigger a compiler error when a trivial implementation checking for
     /// enum variant is generated by accident. It cannot be called either because you cannot pass
@@ -464,7 +481,7 @@ impl ExprImpl {
 
     /// Used to check whether the expression has [`CorrelatedInputRef`].
     ///
-    /// This is the core logic that supports [`crate::binder::BoundQuery::is_correlated`]. Check the
+    /// This is the core logic that supports [`crate::binder::BoundQuery::is_correlated_by_depth`]. Check the
     /// doc of it for examples of `depth` being equal, less or greater.
     // We need to traverse inside subqueries.
     pub fn has_correlated_input_ref_by_depth(&self, depth: Depth) -> bool {
@@ -481,35 +498,7 @@ impl ExprImpl {
             }
 
             fn visit_subquery(&mut self, subquery: &Subquery) {
-                self.depth += 1;
-                self.visit_bound_set_expr(&subquery.query.body);
-                self.depth -= 1;
-            }
-        }
-
-        impl Has {
-            fn visit_bound_set_expr(&mut self, set_expr: &BoundSetExpr) {
-                match set_expr {
-                    BoundSetExpr::Select(select) => {
-                        select.exprs().for_each(|expr| self.visit_expr(expr));
-                        match select.from.as_ref() {
-                            Some(from) => from.is_correlated(self.depth),
-                            None => false,
-                        };
-                    }
-                    BoundSetExpr::Values(values) => {
-                        values.exprs().for_each(|expr| self.visit_expr(expr))
-                    }
-                    BoundSetExpr::Query(query) => {
-                        self.depth += 1;
-                        self.visit_bound_set_expr(&query.body);
-                        self.depth -= 1;
-                    }
-                    BoundSetExpr::SetOperation { left, right, .. } => {
-                        self.visit_bound_set_expr(left);
-                        self.visit_bound_set_expr(right);
-                    }
-                };
+                self.has |= subquery.is_correlated_by_depth(self.depth);
             }
         }
 
@@ -532,25 +521,7 @@ impl ExprImpl {
             }
 
             fn visit_subquery(&mut self, subquery: &Subquery) {
-                self.visit_bound_set_expr(&subquery.query.body);
-            }
-        }
-
-        impl Has {
-            fn visit_bound_set_expr(&mut self, set_expr: &BoundSetExpr) {
-                match set_expr {
-                    BoundSetExpr::Select(select) => {
-                        select.exprs().for_each(|expr| self.visit_expr(expr))
-                    }
-                    BoundSetExpr::Values(values) => {
-                        values.exprs().for_each(|expr| self.visit_expr(expr));
-                    }
-                    BoundSetExpr::Query(query) => self.visit_bound_set_expr(&query.body),
-                    BoundSetExpr::SetOperation { left, right, .. } => {
-                        self.visit_bound_set_expr(left);
-                        self.visit_bound_set_expr(right);
-                    }
-                }
+                self.has |= subquery.is_correlated_by_correlated_id(self.correlated_id);
             }
         }
 
@@ -587,39 +558,12 @@ impl ExprImpl {
             }
 
             fn visit_subquery(&mut self, subquery: &mut Subquery) {
-                self.depth += 1;
-                self.visit_bound_set_expr(&mut subquery.query.body);
-                self.depth -= 1;
-            }
-        }
-
-        impl Collector {
-            fn visit_bound_set_expr(&mut self, set_expr: &mut BoundSetExpr) {
-                match set_expr {
-                    BoundSetExpr::Select(select) => {
-                        select.exprs_mut().for_each(|expr| self.visit_expr(expr));
-                        if let Some(from) = select.from.as_mut() {
-                            self.correlated_indices.extend(
-                                from.collect_correlated_indices_by_depth_and_assign_id(
-                                    self.depth,
-                                    self.correlated_id,
-                                ),
-                            );
-                        };
-                    }
-                    BoundSetExpr::Values(values) => {
-                        values.exprs_mut().for_each(|expr| self.visit_expr(expr))
-                    }
-                    BoundSetExpr::Query(query) => {
-                        self.depth += 1;
-                        self.visit_bound_set_expr(&mut query.body);
-                        self.depth -= 1;
-                    }
-                    BoundSetExpr::SetOperation { left, right, .. } => {
-                        self.visit_bound_set_expr(&mut *left);
-                        self.visit_bound_set_expr(&mut *right);
-                    }
-                }
+                self.correlated_indices.extend(
+                    subquery.collect_correlated_indices_by_depth_and_assign_id(
+                        self.depth,
+                        self.correlated_id,
+                    ),
+                );
             }
         }
 
@@ -629,6 +573,8 @@ impl ExprImpl {
             correlated_id,
         };
         collector.visit_expr(self);
+        collector.correlated_indices.sort();
+        collector.correlated_indices.dedup();
         collector.correlated_indices
     }
 
@@ -869,8 +815,8 @@ impl ExprImpl {
                             // Currently we will return `None` for non-literal because the result of the expression might be '1 day'. However, there will definitely exist false positives such as '1 second + 1 second'.
                             // We will treat the expression as an input offset when rhs is `null`.
                             if rhs.return_type() == DataType::Interval
-                                && rhs.as_literal().map_or(true, |literal| {
-                                    literal.get_data().as_ref().map_or(false, |scalar| {
+                                && rhs.as_literal().is_none_or(|literal| {
+                                    literal.get_data().as_ref().is_some_and(|scalar| {
                                         let interval = scalar.as_interval();
                                         interval.months() != 0 || interval.days() != 0
                                     })
@@ -975,10 +921,9 @@ impl ExprImpl {
                 _ => return None,
             };
             let list: Vec<_> = inputs
-                .map(|expr| {
+                .inspect(|expr| {
                     // Non constant IN will be bound to OR
                     assert!(expr.is_const());
-                    expr
                 })
                 .collect();
 
@@ -1129,7 +1074,16 @@ impl std::fmt::Debug for ExprDisplay<'_> {
                 // TODO: WindowFunctionCallVerboseDisplay
                 write!(f, "{:?}", x)
             }
-            ExprImpl::UserDefinedFunction(x) => write!(f, "{:?}", x),
+            ExprImpl::UserDefinedFunction(x) => {
+                write!(
+                    f,
+                    "{:?}",
+                    UserDefinedFunctionDisplay {
+                        func_call: x,
+                        input_schema: self.input_schema
+                    }
+                )
+            }
             ExprImpl::Parameter(x) => write!(f, "{:?}", x),
             ExprImpl::Now(x) => write!(f, "{:?}", x),
         }
@@ -1159,8 +1113,6 @@ use risingwave_common::bail;
 use risingwave_common::catalog::Schema;
 use risingwave_common::row::OwnedRow;
 
-use self::function_call::CastError;
-use crate::binder::BoundSetExpr;
 use crate::utils::Condition;
 
 #[cfg(test)]

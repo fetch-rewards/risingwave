@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,12 +11,17 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 use std::num::NonZeroU32;
 use std::ops::DerefMut;
+use std::sync::Arc;
+
+use risingwave_pb::catalog::PbVectorIndexInfo;
 
 pub mod plan_node;
 
-pub use plan_node::{Explain, PlanRef};
+use plan_node::StreamFilter;
+pub use plan_node::{Explain, LogicalPlanRef, PlanRef};
 
 pub mod property;
 
@@ -24,24 +29,24 @@ mod delta_join_solver;
 mod heuristic_optimizer;
 mod plan_rewriter;
 
-pub use plan_rewriter::PlanRewriter;
-
 mod plan_visitor;
 
 pub use plan_visitor::{
-    ExecutionModeDecider, PlanVisitor, RelationCollectorVisitor, SysTableVisitor,
+    ExecutionModeDecider, PlanVisitor, ReadStorageTableVisitor, RelationCollectorVisitor,
+    SysTableVisitor,
 };
-use risingwave_sqlparser::ast::OnConflict;
 
+pub mod backfill_order_strategy;
 mod logical_optimization;
 mod optimizer_context;
 pub mod plan_expr_rewriter;
 mod plan_expr_visitor;
 mod rule;
 
-use std::assert_matches::assert_matches;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::marker::PhantomData;
 
+use educe::Educe;
 use fixedbitset::FixedBitSet;
 use itertools::Itertools as _;
 pub use logical_optimization::*;
@@ -49,37 +54,39 @@ pub use optimizer_context::*;
 use plan_expr_rewriter::ConstEvalRewriter;
 use property::Order;
 use risingwave_common::bail;
-use risingwave_common::catalog::{
-    ColumnCatalog, ColumnDesc, ColumnId, ConflictBehavior, Field, Schema, TableId,
-};
+use risingwave_common::catalog::{ColumnCatalog, ColumnDesc, ConflictBehavior, Field, Schema};
 use risingwave_common::types::DataType;
 use risingwave_common::util::column_index_mapping::ColIndexMapping;
 use risingwave_common::util::iter_util::ZipEqDebug;
+use risingwave_connector::WithPropertiesExt;
 use risingwave_connector::sink::catalog::SinkFormatDesc;
-use risingwave_pb::catalog::WatermarkDesc;
 use risingwave_pb::stream_plan::StreamScanType;
 
 use self::heuristic_optimizer::ApplyOrder;
 use self::plan_node::generic::{self, PhysicalPlanRef};
 use self::plan_node::{
-    stream_enforce_eowc_requirement, BatchProject, Convention, LogicalProject, LogicalSource,
-    PartitionComputeInfo, StreamDml, StreamMaterialize, StreamProject, StreamRowIdGen, StreamSink,
-    StreamWatermarkFilter, ToStreamContext,
+    BatchProject, LogicalProject, LogicalSource, PartitionComputeInfo, StreamDml,
+    StreamMaterialize, StreamProject, StreamRowIdGen, StreamSink, StreamWatermarkFilter,
+    ToStreamContext, stream_enforce_eowc_requirement,
 };
 #[cfg(debug_assertions)]
 use self::plan_visitor::InputRefValidator;
-use self::plan_visitor::{has_batch_exchange, CardinalityVisitor, StreamKeyChecker};
+use self::plan_visitor::{CardinalityVisitor, StreamKeyChecker, has_batch_exchange};
 use self::property::{Cardinality, RequiredDist};
 use self::rule::*;
-use crate::catalog::table_catalog::{TableType, TableVersion};
+use crate::TableCatalog;
+use crate::catalog::table_catalog::TableType;
+use crate::catalog::{DatabaseId, SchemaId};
 use crate::error::{ErrorCode, Result};
 use crate::expr::TimestamptzExprFinder;
-use crate::optimizer::plan_node::generic::{SourceNodeKind, Union};
+use crate::handler::create_table::{CreateTableInfo, CreateTableProps};
+use crate::optimizer::plan_node::generic::{GenericPlanRef, SourceNodeKind, Union};
 use crate::optimizer::plan_node::{
-    BatchExchange, PlanNodeType, PlanTreeNode, RewriteExprsRecursive, StreamExchange, StreamUnion,
-    ToStream, VisitExprsRecursive,
+    Batch, BatchExchange, BatchPlanNodeType, BatchPlanRef, ConventionMarker, PlanTreeNode, Stream,
+    StreamExchange, StreamPlanRef, StreamUnion, StreamVectorIndexWrite, ToStream,
+    VisitExprsRecursive,
 };
-use crate::optimizer::plan_visitor::TemporalJoinValidator;
+use crate::optimizer::plan_visitor::{RwTimestampValidator, TemporalJoinValidator};
 use crate::optimizer::property::Distribution;
 use crate::utils::{ColIndexMappingRewriteExt, WithOptionsSecResolved};
 
@@ -93,12 +100,14 @@ use crate::utils::{ColIndexMappingRewriteExt, WithOptionsSecResolved};
 /// the plan will return two columns (id, v1), and the required order column is id. the id
 /// column is required in optimization, but the final generated plan will remove the unnecessary
 /// column in the result.
-#[derive(Debug, Clone)]
-pub struct PlanRoot {
+#[derive(Educe)]
+#[educe(Debug, Clone)]
+pub struct PlanRoot<P: PlanPhase> {
     // The current plan node.
-    plan: PlanRef,
+    pub plan: PlanRef<P::Convention>,
     // The phase of the plan.
-    phase: PlanPhase,
+    #[educe(Debug(ignore), Clone(method(PhantomData::clone)))]
+    _phase: PhantomData<P>,
     required_dist: RequiredDist,
     required_order: Order,
     out_fields: FixedBitSet,
@@ -110,55 +119,62 @@ pub struct PlanRoot {
 /// Typical phase transformation are:
 /// - `Logical` -> `OptimizedLogicalForBatch` -> `Batch`
 /// - `Logical` -> `OptimizedLogicalForStream` -> `Stream`
-#[derive(Debug, Clone, PartialEq)]
-pub enum PlanPhase {
-    Logical,
-    OptimizedLogicalForBatch,
-    OptimizedLogicalForStream,
-    Batch,
-    Stream,
+pub trait PlanPhase {
+    type Convention: ConventionMarker;
 }
 
-impl PlanRoot {
+macro_rules! for_all_phase {
+    () => {
+        for_all_phase! {
+            { Logical, $crate::optimizer::plan_node::Logical },
+            { BatchOptimizedLogical, $crate::optimizer::plan_node::Logical },
+            { StreamOptimizedLogical, $crate::optimizer::plan_node::Stream },
+            { Batch, $crate::optimizer::plan_node::Batch },
+            { Stream, $crate::optimizer::plan_node::Stream }
+        }
+    };
+    ($({$phase:ident, $convention:ty}),+ $(,)?) => {
+        $(
+            paste::paste! {
+                pub struct [< PlanPhase$phase >];
+                impl PlanPhase for [< PlanPhase$phase >] {
+                    type Convention = $convention;
+                }
+                pub type [< $phase PlanRoot >] = PlanRoot<[< PlanPhase$phase >]>;
+            }
+        )+
+    }
+}
+
+for_all_phase!();
+
+impl LogicalPlanRoot {
     pub fn new_with_logical_plan(
-        plan: PlanRef,
+        plan: LogicalPlanRef,
         required_dist: RequiredDist,
         required_order: Order,
         out_fields: FixedBitSet,
         out_names: Vec<String>,
     ) -> Self {
-        assert_eq!(plan.convention(), Convention::Logical);
-        Self::new_inner(
-            plan,
-            PlanPhase::Logical,
-            required_dist,
-            required_order,
-            out_fields,
-            out_names,
-        )
+        Self::new_inner(plan, required_dist, required_order, out_fields, out_names)
     }
+}
 
+impl BatchPlanRoot {
     pub fn new_with_batch_plan(
-        plan: PlanRef,
+        plan: BatchPlanRef,
         required_dist: RequiredDist,
         required_order: Order,
         out_fields: FixedBitSet,
         out_names: Vec<String>,
     ) -> Self {
-        assert_eq!(plan.convention(), Convention::Batch);
-        Self::new_inner(
-            plan,
-            PlanPhase::Batch,
-            required_dist,
-            required_order,
-            out_fields,
-            out_names,
-        )
+        Self::new_inner(plan, required_dist, required_order, out_fields, out_names)
     }
+}
 
+impl<P: PlanPhase> PlanRoot<P> {
     fn new_inner(
-        plan: PlanRef,
-        phase: PlanPhase,
+        plan: PlanRef<P::Convention>,
         required_dist: RequiredDist,
         required_order: Order,
         out_fields: FixedBitSet,
@@ -170,11 +186,22 @@ impl PlanRoot {
 
         Self {
             plan,
-            phase,
+            _phase: PhantomData,
             required_dist,
             required_order,
             out_fields,
             out_names,
+        }
+    }
+
+    fn into_phase<P2: PlanPhase>(self, plan: PlanRef<P2::Convention>) -> PlanRoot<P2> {
+        PlanRoot {
+            plan,
+            _phase: PhantomData,
+            required_dist: self.required_dist,
+            required_order: self.required_order,
+            out_fields: self.out_fields,
+            out_names: self.out_names,
         }
     }
 
@@ -185,7 +212,7 @@ impl PlanRoot {
     pub fn set_out_names(&mut self, out_names: Vec<String>) -> Result<()> {
         if out_names.len() != self.out_fields.count_ones(..) {
             Err(ErrorCode::InvalidInputSyntax(
-                "number of column names does not match number of columns".to_string(),
+                "number of column names does not match number of columns".to_owned(),
             ))?
         }
         self.out_names = out_names;
@@ -209,13 +236,13 @@ impl PlanRoot {
                 .collect(),
         }
     }
+}
 
+impl LogicalPlanRoot {
     /// Transform the [`PlanRoot`] back to a [`PlanRef`] suitable to be used as a subplan, for
     /// example as insert source or subquery. This ignores Order but retains post-Order pruning
     /// (`out_fields`).
-    pub fn into_unordered_subplan(self) -> PlanRef {
-        assert_eq!(self.phase, PlanPhase::Logical);
-        assert_eq!(self.plan.convention(), Convention::Logical);
+    pub fn into_unordered_subplan(self) -> LogicalPlanRef {
         if self.out_fields.count_ones(..) == self.out_fields.len() {
             return self.plan;
         }
@@ -225,7 +252,7 @@ impl PlanRoot {
     /// Transform the [`PlanRoot`] wrapped in an array-construction subquery to a [`PlanRef`]
     /// supported by `ARRAY_AGG`. Similar to the unordered version, this abstracts away internal
     /// `self.plan` which is further modified by `self.required_order` then `self.out_fields`.
-    pub fn into_array_agg(self) -> Result<PlanRef> {
+    pub fn into_array_agg(self) -> Result<LogicalPlanRef> {
         use generic::Agg;
         use plan_node::PlanAggCall;
         use risingwave_common::types::ListValue;
@@ -234,8 +261,6 @@ impl PlanRoot {
         use crate::expr::{ExprImpl, ExprType, FunctionCall, InputRef};
         use crate::utils::{Condition, IndexSet};
 
-        assert_eq!(self.phase, PlanPhase::Logical);
-        assert_eq!(self.plan.convention(), Convention::Logical);
         let Ok(select_idx) = self.out_fields.ones().exactly_one() else {
             bail!("subquery must return only one column");
         };
@@ -243,7 +268,7 @@ impl PlanRoot {
         let return_type = DataType::List(input_column_type.clone().into());
         let agg = Agg::new(
             vec![PlanAggCall {
-                agg_kind: PbAggKind::ArrayAgg.into(),
+                agg_type: PbAggKind::ArrayAgg.into(),
                 return_type: return_type.clone(),
                 inputs: vec![InputRef::new(select_idx, input_column_type.clone())],
                 distinct: false,
@@ -256,63 +281,55 @@ impl PlanRoot {
         );
         Ok(LogicalProject::create(
             agg.into(),
-            vec![FunctionCall::new(
-                ExprType::Coalesce,
-                vec![
-                    InputRef::new(0, return_type).into(),
-                    ExprImpl::literal_list(ListValue::empty(&input_column_type), input_column_type),
-                ],
-            )
-            .unwrap()
-            .into()],
+            vec![
+                FunctionCall::new(
+                    ExprType::Coalesce,
+                    vec![
+                        InputRef::new(0, return_type).into(),
+                        ExprImpl::literal_list(
+                            ListValue::empty(&input_column_type),
+                            input_column_type,
+                        ),
+                    ],
+                )
+                .unwrap()
+                .into(),
+            ],
         ))
     }
 
     /// Apply logical optimization to the plan for stream.
-    pub fn gen_optimized_logical_plan_for_stream(&mut self) -> Result<PlanRef> {
-        assert_eq!(self.phase, PlanPhase::Logical);
-        assert_eq!(self.plan.convention(), Convention::Logical);
+    pub fn gen_optimized_logical_plan_for_stream(mut self) -> Result<LogicalPlanRoot> {
         self.plan = LogicalOptimizer::gen_optimized_logical_plan_for_stream(self.plan.clone())?;
-        self.phase = PlanPhase::OptimizedLogicalForStream;
-        assert_eq!(self.plan.convention(), Convention::Logical);
-        Ok(self.plan.clone())
+        Ok(self)
     }
 
     /// Apply logical optimization to the plan for batch.
-    pub fn gen_optimized_logical_plan_for_batch(&mut self) -> Result<PlanRef> {
-        assert_eq!(self.phase, PlanPhase::Logical);
-        assert_eq!(self.plan.convention(), Convention::Logical);
-        self.plan = LogicalOptimizer::gen_optimized_logical_plan_for_batch(self.plan.clone())?;
-        self.phase = PlanPhase::OptimizedLogicalForBatch;
-        assert_eq!(self.plan.convention(), Convention::Logical);
-        Ok(self.plan.clone())
+    pub fn gen_optimized_logical_plan_for_batch(self) -> Result<BatchOptimizedLogicalPlanRoot> {
+        let plan = LogicalOptimizer::gen_optimized_logical_plan_for_batch(self.plan.clone())?;
+        Ok(self.into_phase(plan))
     }
 
-    /// Optimize and generate a singleton batch physical plan without exchange nodes.
-    pub fn gen_batch_plan(&mut self) -> Result<PlanRef> {
-        assert_eq!(self.plan.convention(), Convention::Logical);
-        let mut plan = match self.phase {
-            PlanPhase::Logical => {
-                // Logical optimization
-                self.gen_optimized_logical_plan_for_batch()?
-            }
-            PlanPhase::OptimizedLogicalForBatch => self.plan.clone(),
-            PlanPhase::Batch | PlanPhase::OptimizedLogicalForStream | PlanPhase::Stream => {
-                panic!("unexpected phase")
-            }
-        };
+    pub fn gen_batch_plan(self) -> Result<BatchPlanRoot> {
+        self.gen_optimized_logical_plan_for_batch()?
+            .gen_batch_plan()
+    }
+}
 
-        if TemporalJoinValidator::exist_dangling_temporal_scan(plan.clone()) {
+impl BatchOptimizedLogicalPlanRoot {
+    /// Optimize and generate a singleton batch physical plan without exchange nodes.
+    pub fn gen_batch_plan(self) -> Result<BatchPlanRoot> {
+        if TemporalJoinValidator::exist_dangling_temporal_scan(self.plan.clone()) {
             return Err(ErrorCode::NotSupported(
-                "do not support temporal join for batch queries".to_string(),
-                "please use temporal join in streaming queries".to_string(),
+                "do not support temporal join for batch queries".to_owned(),
+                "please use temporal join in streaming queries".to_owned(),
             )
             .into());
         }
 
-        let ctx = plan.ctx();
+        let ctx = self.plan.ctx();
         // Inline session timezone mainly for rewriting now()
-        plan = inline_session_timezone_in_exprs(ctx.clone(), plan)?;
+        let mut plan = inline_session_timezone_in_exprs(ctx.clone(), self.plan.clone())?;
 
         // Const eval of exprs at the last minute, but before `to_batch` to make functional index selection happy.
         plan = const_eval_exprs(plan)?;
@@ -323,17 +340,17 @@ impl PlanRoot {
         }
 
         // Convert to physical plan node
-        plan = plan.to_batch_with_order_required(&self.required_order)?;
+        let mut plan = plan.to_batch_with_order_required(&self.required_order)?;
         if ctx.is_explain_trace() {
             ctx.trace("To Batch Plan:");
             ctx.trace(plan.explain_to_string());
         }
 
-        plan = plan.optimize_by_rules(&OptimizationStage::new(
+        plan = plan.optimize_by_rules(&OptimizationStage::<Batch>::new(
             "Merge BatchProject",
             vec![BatchProjectMergeRule::create()],
             ApplyOrder::BottomUp,
-        ));
+        ))?;
 
         // Inline session timezone
         plan = inline_session_timezone_in_exprs(ctx.clone(), plan)?;
@@ -362,16 +379,13 @@ impl PlanRoot {
             ctx.trace(plan.explain_to_string());
         }
 
-        self.plan = plan;
-        self.phase = PlanPhase::Batch;
-        assert_eq!(self.plan.convention(), Convention::Batch);
-        Ok(self.plan.clone())
+        Ok(self.into_phase(plan))
     }
+}
 
+impl BatchPlanRoot {
     /// Optimize and generate a batch query plan for distributed execution.
-    pub fn gen_batch_distributed_plan(mut self) -> Result<PlanRef> {
-        assert_eq!(self.phase, PlanPhase::Batch);
-        assert_eq!(self.plan.convention(), Convention::Batch);
+    pub fn gen_batch_distributed_plan(mut self) -> Result<BatchPlanRef> {
         self.required_dist = RequiredDist::single();
         let mut plan = self.plan;
 
@@ -399,16 +413,27 @@ impl PlanRoot {
             "Push Limit To Scan",
             vec![BatchPushLimitToScanRule::create()],
             ApplyOrder::BottomUp,
-        ));
+        ))?;
 
-        assert_eq!(plan.convention(), Convention::Batch);
+        let plan = plan.optimize_by_rules(&OptimizationStage::new(
+            "Iceberg Count Star",
+            vec![BatchIcebergCountStar::create()],
+            ApplyOrder::TopDown,
+        ))?;
+
+        // For iceberg scan, we do iceberg predicate pushdown
+        // BatchFilter -> BatchIcebergScan
+        let plan = plan.optimize_by_rules(&OptimizationStage::new(
+            "Iceberg Predicate Pushdown",
+            vec![BatchIcebergPredicatePushDownRule::create()],
+            ApplyOrder::BottomUp,
+        ))?;
+
         Ok(plan)
     }
 
     /// Optimize and generate a batch query plan for local execution.
-    pub fn gen_batch_local_plan(self) -> Result<PlanRef> {
-        assert_eq!(self.phase, PlanPhase::Batch);
-        assert_eq!(self.plan.convention(), Convention::Batch);
+    pub fn gen_batch_local_plan(self) -> Result<BatchPlanRef> {
         let mut plan = self.plan;
 
         // Convert to local plan node
@@ -442,17 +467,27 @@ impl PlanRoot {
             "Push Limit To Scan",
             vec![BatchPushLimitToScanRule::create()],
             ApplyOrder::BottomUp,
-        ));
+        ))?;
 
-        assert_eq!(plan.convention(), Convention::Batch);
+        let plan = plan.optimize_by_rules(&OptimizationStage::new(
+            "Iceberg Count Star",
+            vec![BatchIcebergCountStar::create()],
+            ApplyOrder::TopDown,
+        ))?;
         Ok(plan)
     }
+}
 
+impl LogicalPlanRoot {
     /// Generate optimized stream plan
-    fn gen_optimized_stream_plan(&mut self, emit_on_window_close: bool) -> Result<PlanRef> {
-        assert_eq!(self.phase, PlanPhase::Logical);
-        assert_eq!(self.plan.convention(), Convention::Logical);
-        let stream_scan_type = if self.should_use_arrangement_backfill() {
+    fn gen_optimized_stream_plan(
+        self,
+        emit_on_window_close: bool,
+        allow_snapshot_backfill: bool,
+    ) -> Result<StreamOptimizedLogicalPlanRoot> {
+        let stream_scan_type = if allow_snapshot_backfill && self.should_use_snapshot_backfill() {
+            StreamScanType::SnapshotBackfill
+        } else if self.should_use_arrangement_backfill() {
             StreamScanType::ArrangementBackfill
         } else {
             StreamScanType::Backfill
@@ -461,22 +496,46 @@ impl PlanRoot {
     }
 
     fn gen_optimized_stream_plan_inner(
-        &mut self,
+        self,
         emit_on_window_close: bool,
         stream_scan_type: StreamScanType,
-    ) -> Result<PlanRef> {
-        assert_eq!(self.phase, PlanPhase::Logical);
-        assert_eq!(self.plan.convention(), Convention::Logical);
+    ) -> Result<StreamOptimizedLogicalPlanRoot> {
         let ctx = self.plan.ctx();
         let _explain_trace = ctx.is_explain_trace();
 
-        let mut plan = self.gen_stream_plan(emit_on_window_close, stream_scan_type)?;
+        let optimized_plan = self.gen_stream_plan(emit_on_window_close, stream_scan_type)?;
 
-        plan = plan.optimize_by_rules(&OptimizationStage::new(
-            "Merge StreamProject",
-            vec![StreamProjectMergeRule::create()],
-            ApplyOrder::BottomUp,
-        ));
+        let mut plan = optimized_plan
+            .plan
+            .clone()
+            .optimize_by_rules(&OptimizationStage::new(
+                "Merge StreamProject",
+                vec![StreamProjectMergeRule::create()],
+                ApplyOrder::BottomUp,
+            ))?;
+
+        if ctx
+            .session_ctx()
+            .config()
+            .streaming_separate_consecutive_join()
+        {
+            plan = plan.optimize_by_rules(&OptimizationStage::new(
+                "Separate consecutive StreamHashJoin by no-shuffle StreamExchange",
+                vec![SeparateConsecutiveJoinRule::create()],
+                ApplyOrder::BottomUp,
+            ))?;
+        }
+
+        // Add Logstore for Unaligned join
+        // Apply this BEFORE delta join rule, because delta join removes
+        // the join
+        if ctx.session_ctx().config().streaming_enable_unaligned_join() {
+            plan = plan.optimize_by_rules(&OptimizationStage::new(
+                "Add Logstore for Unaligned join",
+                vec![AddLogstoreRule::create()],
+                ApplyOrder::BottomUp,
+            ))?;
+        }
 
         if ctx.session_ctx().config().streaming_enable_delta_join() {
             // TODO: make it a logical optimization.
@@ -485,9 +544,8 @@ impl PlanRoot {
                 "To IndexDeltaJoin",
                 vec![IndexDeltaJoinRule::create()],
                 ApplyOrder::BottomUp,
-            ));
+            ))?;
         }
-
         // Inline session timezone
         plan = inline_session_timezone_in_exprs(ctx.clone(), plan)?;
 
@@ -509,30 +567,32 @@ impl PlanRoot {
 
         if TemporalJoinValidator::exist_dangling_temporal_scan(plan.clone()) {
             return Err(ErrorCode::NotSupported(
-                "exist dangling temporal scan".to_string(),
-                "please check your temporal join syntax e.g. consider removing the right outer join if it is being used.".to_string(),
+                "exist dangling temporal scan".to_owned(),
+                "please check your temporal join syntax e.g. consider removing the right outer join if it is being used.".to_owned(),
             ).into());
         }
 
-        self.plan = plan;
-        self.phase = PlanPhase::Stream;
-        assert_eq!(self.plan.convention(), Convention::Stream);
-        Ok(self.plan.clone())
+        if RwTimestampValidator::select_rw_timestamp_in_stream_query(plan.clone()) {
+            return Err(ErrorCode::NotSupported(
+                "selecting `_rw_timestamp` in a streaming query is not allowed".to_owned(),
+                "please run the sql in batch mode or remove the column `_rw_timestamp` from the streaming query".to_owned(),
+            ).into());
+        }
+
+        Ok(optimized_plan.into_phase(plan))
     }
 
     /// Generate create index or create materialize view plan.
     fn gen_stream_plan(
-        &mut self,
+        self,
         emit_on_window_close: bool,
         stream_scan_type: StreamScanType,
-    ) -> Result<PlanRef> {
-        assert_eq!(self.phase, PlanPhase::Logical);
-        assert_eq!(self.plan.convention(), Convention::Logical);
+    ) -> Result<StreamOptimizedLogicalPlanRoot> {
         let ctx = self.plan.ctx();
         let explain_trace = ctx.is_explain_trace();
 
-        let plan = match self.plan.convention() {
-            Convention::Logical => {
+        let plan = {
+            {
                 if !ctx
                     .session_ctx()
                     .config()
@@ -542,13 +602,14 @@ impl PlanRoot {
                     return Err(ErrorCode::NotSupported(
                         err,
                         "Using JSONB columns as part of the join or aggregation keys can severely impair performance. \
-                        If you intend to proceed, force to enable it with: `set rw_streaming_allow_jsonb_in_stream_key to true`".to_string(),
+                        If you intend to proceed, force to enable it with: `set rw_streaming_allow_jsonb_in_stream_key to true`".to_owned(),
                     ).into());
                 }
-                let plan = self.gen_optimized_logical_plan_for_stream()?;
+                let mut optimized_plan = self.gen_optimized_logical_plan_for_stream()?;
                 let (plan, out_col_change) = {
-                    let (plan, out_col_change) =
-                        plan.logical_rewrite_for_stream(&mut Default::default())?;
+                    let (plan, out_col_change) = optimized_plan
+                        .plan
+                        .logical_rewrite_for_stream(&mut Default::default())?;
                     if out_col_change.is_injective() {
                         (plan, out_col_change)
                     } else {
@@ -581,27 +642,29 @@ impl PlanRoot {
                     ctx.trace(plan.explain_to_string());
                 }
 
-                self.required_dist =
-                    out_col_change.rewrite_required_distribution(&self.required_dist);
-                self.required_order = out_col_change
-                    .rewrite_required_order(&self.required_order)
+                optimized_plan.required_dist =
+                    out_col_change.rewrite_required_distribution(&optimized_plan.required_dist);
+                optimized_plan.required_order = out_col_change
+                    .rewrite_required_order(&optimized_plan.required_order)
                     .unwrap();
-                self.out_fields = out_col_change.rewrite_bitset(&self.out_fields);
-                let plan = plan.to_stream_with_dist_required(
-                    &self.required_dist,
+                optimized_plan.out_fields =
+                    out_col_change.rewrite_bitset(&optimized_plan.out_fields);
+                let mut plan = plan.to_stream_with_dist_required(
+                    &optimized_plan.required_dist,
                     &mut ToStreamContext::new_with_stream_scan_type(
                         emit_on_window_close,
                         stream_scan_type,
                     ),
                 )?;
-                stream_enforce_eowc_requirement(ctx.clone(), plan, emit_on_window_close)
+                plan = stream_enforce_eowc_requirement(ctx.clone(), plan, emit_on_window_close)?;
+                optimized_plan.into_phase(plan)
             }
-            _ => unreachable!(),
-        }?;
+        };
 
         if explain_trace {
             ctx.trace("To Stream Plan:");
-            ctx.trace(plan.explain_to_string());
+            // TODO: can be `plan.plan.explain_to_string()`, but should explicitly specify the type due to some limitation of rust compiler
+            ctx.trace(<PlanRef<Stream> as Explain>::explain_to_string(&plan.plan));
         }
         Ok(plan)
     }
@@ -610,33 +673,35 @@ impl PlanRoot {
     ///
     /// Panics if not called on a logical plan.
     fn compute_cardinality(&self) -> Cardinality {
-        assert_matches!(self.plan.convention(), Convention::Logical);
         CardinalityVisitor.visit(self.plan.clone())
     }
 
     /// Optimize and generate a create table plan.
-    #[allow(clippy::too_many_arguments)]
     pub fn gen_table_plan(
-        mut self,
+        self,
         context: OptimizerContextRef,
         table_name: String,
-        columns: Vec<ColumnCatalog>,
-        definition: String,
-        pk_column_ids: Vec<ColumnId>,
-        row_id_index: Option<usize>,
-        append_only: bool,
-        on_conflict: Option<OnConflict>,
-        with_version_column: Option<String>,
-        watermark_descs: Vec<WatermarkDesc>,
-        version: Option<TableVersion>,
-        with_external_source: bool,
-        retention_seconds: Option<NonZeroU32>,
+        database_id: DatabaseId,
+        schema_id: SchemaId,
+        CreateTableInfo {
+            columns,
+            pk_column_ids,
+            row_id_index,
+            watermark_descs,
+            source_catalog,
+            version,
+        }: CreateTableInfo,
+        CreateTableProps {
+            definition,
+            append_only,
+            on_conflict,
+            with_version_column,
+            webhook_info,
+            engine,
+        }: CreateTableProps,
     ) -> Result<StreamMaterialize> {
-        assert_eq!(self.phase, PlanPhase::Logical);
-        assert_eq!(self.plan.convention(), Convention::Logical);
-        let stream_plan = self.gen_optimized_stream_plan(false)?;
-        assert_eq!(self.phase, PlanPhase::Stream);
-        assert_eq!(stream_plan.convention(), Convention::Stream);
+        // Snapshot backfill is not allowed for create table
+        let stream_plan = self.gen_optimized_stream_plan(false, false)?;
 
         assert!(!pk_column_ids.is_empty() || row_id_index.is_some());
 
@@ -654,8 +719,8 @@ impl PlanRoot {
 
         fn inject_project_for_generated_column_if_needed(
             columns: &[ColumnCatalog],
-            node: PlanRef,
-        ) -> Result<PlanRef> {
+            node: StreamPlanRef,
+        ) -> Result<StreamPlanRef> {
             let exprs = LogicalSource::derive_output_exprs_from_generated_columns(columns)?;
             if let Some(exprs) = exprs {
                 let logical_project = generic::Project::new(exprs, node);
@@ -667,52 +732,62 @@ impl PlanRoot {
         #[derive(PartialEq, Debug, Copy, Clone)]
         enum PrimaryKeyKind {
             UserDefinedPrimaryKey,
-            RowIdAsPrimaryKey,
-            AppendOnly,
+            NonAppendOnlyRowIdPk,
+            AppendOnlyRowIdPk,
         }
 
         fn inject_dml_node(
             columns: &[ColumnCatalog],
             append_only: bool,
-            stream_plan: PlanRef,
+            stream_plan: StreamPlanRef,
             pk_column_indices: &[usize],
             kind: PrimaryKeyKind,
             column_descs: Vec<ColumnDesc>,
-        ) -> Result<PlanRef> {
+        ) -> Result<StreamPlanRef> {
             let mut dml_node = StreamDml::new(stream_plan, append_only, column_descs).into();
 
             // Add generated columns.
             dml_node = inject_project_for_generated_column_if_needed(columns, dml_node)?;
 
             dml_node = match kind {
-                PrimaryKeyKind::UserDefinedPrimaryKey | PrimaryKeyKind::RowIdAsPrimaryKey => {
+                PrimaryKeyKind::UserDefinedPrimaryKey | PrimaryKeyKind::NonAppendOnlyRowIdPk => {
                     RequiredDist::hash_shard(pk_column_indices)
-                        .enforce_if_not_satisfies(dml_node, &Order::any())?
+                        .streaming_enforce_if_not_satisfies(dml_node)?
                 }
-                PrimaryKeyKind::AppendOnly => StreamExchange::new_no_shuffle(dml_node).into(),
+                PrimaryKeyKind::AppendOnlyRowIdPk => {
+                    StreamExchange::new_no_shuffle(dml_node).into()
+                }
             };
 
             Ok(dml_node)
         }
 
-        let kind = if append_only {
-            assert!(row_id_index.is_some());
-            PrimaryKeyKind::AppendOnly
-        } else if let Some(row_id_index) = row_id_index {
+        let kind = if let Some(row_id_index) = row_id_index {
             assert_eq!(
                 pk_column_indices.iter().exactly_one().copied().unwrap(),
                 row_id_index
             );
-            PrimaryKeyKind::RowIdAsPrimaryKey
+            if append_only {
+                PrimaryKeyKind::AppendOnlyRowIdPk
+            } else {
+                PrimaryKeyKind::NonAppendOnlyRowIdPk
+            }
         } else {
             PrimaryKeyKind::UserDefinedPrimaryKey
         };
 
-        let column_descs = columns
+        let column_descs: Vec<ColumnDesc> = columns
             .iter()
-            .filter(|&c| (!c.is_generated()))
+            .filter(|&c| c.can_dml())
             .map(|c| c.column_desc.clone())
             .collect();
+
+        let mut not_null_idxs = vec![];
+        for (idx, column) in column_descs.iter().enumerate() {
+            if !column.nullable {
+                not_null_idxs.push(idx);
+            }
+        }
 
         let version_column_index = if let Some(version_column) = with_version_column {
             find_version_column_index(&columns, version_column)?
@@ -720,17 +795,18 @@ impl PlanRoot {
             None
         };
 
+        let with_external_source = source_catalog.is_some();
         let union_inputs = if with_external_source {
-            let mut external_source_node = stream_plan;
+            let mut external_source_node = stream_plan.plan;
             external_source_node =
                 inject_project_for_generated_column_if_needed(&columns, external_source_node)?;
             external_source_node = match kind {
                 PrimaryKeyKind::UserDefinedPrimaryKey => {
                     RequiredDist::hash_shard(&pk_column_indices)
-                        .enforce_if_not_satisfies(external_source_node, &Order::any())?
+                        .streaming_enforce_if_not_satisfies(external_source_node)?
                 }
 
-                PrimaryKeyKind::RowIdAsPrimaryKey | PrimaryKeyKind::AppendOnly => {
+                PrimaryKeyKind::NonAppendOnlyRowIdPk | PrimaryKeyKind::AppendOnlyRowIdPk => {
                     StreamExchange::new_no_shuffle(external_source_node).into()
                 }
             };
@@ -759,7 +835,7 @@ impl PlanRoot {
             let dml_node = inject_dml_node(
                 &columns,
                 append_only,
-                stream_plan,
+                stream_plan.plan,
                 &pk_column_indices,
                 kind,
                 column_descs,
@@ -806,7 +882,7 @@ impl PlanRoot {
                 PrimaryKeyKind::UserDefinedPrimaryKey => {
                     unreachable!()
                 }
-                PrimaryKeyKind::RowIdAsPrimaryKey | PrimaryKeyKind::AppendOnly => {
+                PrimaryKeyKind::NonAppendOnlyRowIdPk | PrimaryKeyKind::AppendOnlyRowIdPk => {
                     stream_plan = StreamRowIdGen::new_with_dist(
                         stream_plan,
                         row_id_index,
@@ -817,25 +893,17 @@ impl PlanRoot {
             }
         }
 
-        let conflict_behavior = match on_conflict {
-            Some(on_conflict) => match on_conflict {
-                OnConflict::OverWrite => ConflictBehavior::Overwrite,
-                OnConflict::Ignore => ConflictBehavior::IgnoreConflict,
-                OnConflict::DoUpdateIfNotNull => ConflictBehavior::DoUpdateIfNotNull,
-            },
-            None => match append_only {
-                true => ConflictBehavior::NoCheck,
-                false => ConflictBehavior::Overwrite,
-            },
-        };
+        let conflict_behavior = on_conflict.to_behavior(append_only, row_id_index.is_some())?;
 
         if let ConflictBehavior::IgnoreConflict = conflict_behavior
             && version_column_index.is_some()
         {
             Err(ErrorCode::InvalidParameterValue(
-                "The with version column syntax cannot be used with the ignore behavior of on conflict".to_string(),
+                "The with version column syntax cannot be used with the ignore behavior of on conflict".to_owned(),
             ))?
         }
+
+        let retention_seconds = context.with_options().retention_seconds();
 
         let table_required_dist = {
             let mut bitset = FixedBitSet::with_capacity(columns.len());
@@ -845,11 +913,33 @@ impl PlanRoot {
             RequiredDist::ShardByKey(bitset)
         };
 
-        let stream_plan = inline_session_timezone_in_exprs(context, stream_plan)?;
+        let mut stream_plan = inline_session_timezone_in_exprs(context, stream_plan)?;
+
+        if !not_null_idxs.is_empty() {
+            stream_plan =
+                StreamFilter::filter_out_any_null_rows(stream_plan.clone(), &not_null_idxs);
+        }
+
+        // Determine if the table should be refreshable based on the connector type
+        let refreshable = source_catalog
+            .as_ref()
+            .map(|catalog| catalog.with_properties.is_batch_connector())
+            .unwrap_or(false);
+
+        // Validate that refreshable tables have a user-defined primary key (i.e., does not have rowid)
+        if refreshable && row_id_index.is_some() {
+            return Err(crate::error::ErrorCode::BindError(
+                "Refreshable tables must have a PRIMARY KEY. Please define a primary key for the table."
+                    .to_owned(),
+            )
+            .into());
+        }
 
         StreamMaterialize::create_for_table(
             stream_plan,
             table_name,
+            database_id,
+            schema_id,
             table_required_dist,
             Order::any(),
             columns,
@@ -860,29 +950,28 @@ impl PlanRoot {
             row_id_index,
             version,
             retention_seconds,
+            webhook_info,
+            engine,
+            refreshable,
         )
     }
 
     /// Optimize and generate a create materialized view plan.
     pub fn gen_materialize_plan(
-        mut self,
+        self,
+        database_id: DatabaseId,
+        schema_id: SchemaId,
         mv_name: String,
         definition: String,
         emit_on_window_close: bool,
     ) -> Result<StreamMaterialize> {
         let cardinality = self.compute_cardinality();
-        assert_eq!(self.phase, PlanPhase::Logical);
-        assert_eq!(self.plan.convention(), Convention::Logical);
-        let stream_plan = self.gen_optimized_stream_plan(emit_on_window_close)?;
-        assert_eq!(self.phase, PlanPhase::Stream);
-        assert_eq!(stream_plan.convention(), Convention::Stream);
+        let stream_plan = self.gen_optimized_stream_plan(emit_on_window_close, true)?;
         StreamMaterialize::create(
             stream_plan,
             mv_name,
-            self.required_dist.clone(),
-            self.required_order.clone(),
-            self.out_fields.clone(),
-            self.out_names.clone(),
+            database_id,
+            schema_id,
             definition,
             TableType::MaterializedView,
             cardinality,
@@ -892,25 +981,21 @@ impl PlanRoot {
 
     /// Optimize and generate a create index plan.
     pub fn gen_index_plan(
-        mut self,
+        self,
         index_name: String,
+        database_id: DatabaseId,
+        schema_id: SchemaId,
         definition: String,
         retention_seconds: Option<NonZeroU32>,
     ) -> Result<StreamMaterialize> {
         let cardinality = self.compute_cardinality();
-        assert_eq!(self.phase, PlanPhase::Logical);
-        assert_eq!(self.plan.convention(), Convention::Logical);
-        let stream_plan = self.gen_optimized_stream_plan(false)?;
-        assert_eq!(self.phase, PlanPhase::Stream);
-        assert_eq!(stream_plan.convention(), Convention::Stream);
+        let stream_plan = self.gen_optimized_stream_plan(false, false)?;
 
         StreamMaterialize::create(
             stream_plan,
             index_name,
-            self.required_dist.clone(),
-            self.required_order.clone(),
-            self.out_fields.clone(),
-            self.out_names.clone(),
+            database_id,
+            schema_id,
             definition,
             TableType::Index,
             cardinality,
@@ -918,10 +1003,34 @@ impl PlanRoot {
         )
     }
 
+    pub fn gen_vector_index_plan(
+        self,
+        index_name: String,
+        database_id: DatabaseId,
+        schema_id: SchemaId,
+        definition: String,
+        retention_seconds: Option<NonZeroU32>,
+        vector_index_info: PbVectorIndexInfo,
+    ) -> Result<StreamVectorIndexWrite> {
+        let cardinality = self.compute_cardinality();
+        let stream_plan = self.gen_optimized_stream_plan(false, false)?;
+
+        StreamVectorIndexWrite::create(
+            stream_plan,
+            index_name,
+            database_id,
+            schema_id,
+            definition,
+            cardinality,
+            retention_seconds,
+            vector_index_info,
+        )
+    }
+
     /// Optimize and generate a create sink plan.
     #[allow(clippy::too_many_arguments)]
     pub fn gen_sink_plan(
-        &mut self,
+        self,
         sink_name: String,
         definition: String,
         properties: WithOptionsSecResolved,
@@ -930,39 +1039,54 @@ impl PlanRoot {
         sink_from_table_name: String,
         format_desc: Option<SinkFormatDesc>,
         without_backfill: bool,
-        target_table: Option<TableId>,
+        target_table: Option<Arc<TableCatalog>>,
         partition_info: Option<PartitionComputeInfo>,
+        user_specified_columns: bool,
+        auto_refresh_schema_from_table: Option<Arc<TableCatalog>>,
     ) -> Result<StreamSink> {
         let stream_scan_type = if without_backfill {
             StreamScanType::UpstreamOnly
+        } else if target_table.is_none() && self.should_use_snapshot_backfill() {
+            // Snapshot backfill on sink-into-table is not allowed
+            StreamScanType::SnapshotBackfill
         } else if self.should_use_arrangement_backfill() {
             StreamScanType::ArrangementBackfill
         } else {
             StreamScanType::Backfill
         };
-        assert_eq!(self.phase, PlanPhase::Logical);
-        assert_eq!(self.plan.convention(), Convention::Logical);
+        if auto_refresh_schema_from_table.is_some()
+            && stream_scan_type != StreamScanType::ArrangementBackfill
+        {
+            return Err(ErrorCode::InvalidInputSyntax(format!(
+                "auto schema change only support for ArrangementBackfill, but got: {:?}",
+                stream_scan_type
+            ))
+            .into());
+        }
         let stream_plan =
             self.gen_optimized_stream_plan_inner(emit_on_window_close, stream_scan_type)?;
-        assert_eq!(self.phase, PlanPhase::Stream);
-        assert_eq!(stream_plan.convention(), Convention::Stream);
+        let target_columns_to_plan_mapping = target_table.as_ref().map(|t| {
+            let columns = t.columns_without_rw_timestamp();
+            stream_plan.target_columns_to_plan_mapping(&columns, user_specified_columns)
+        });
+
         StreamSink::create(
             stream_plan,
             sink_name,
             db_name,
             sink_from_table_name,
             target_table,
-            self.required_dist.clone(),
-            self.required_order.clone(),
-            self.out_fields.clone(),
-            self.out_names.clone(),
+            target_columns_to_plan_mapping,
             definition,
             properties,
             format_desc,
             partition_info,
+            auto_refresh_schema_from_table,
         )
     }
+}
 
+impl<P: PlanPhase> PlanRoot<P> {
     pub fn should_use_arrangement_backfill(&self) -> bool {
         let ctx = self.plan.ctx();
         let session_ctx = ctx.session_ctx();
@@ -972,6 +1096,47 @@ impl PlanRoot {
             .developer
             .enable_arrangement_backfill;
         arrangement_backfill_enabled && session_ctx.config().streaming_use_arrangement_backfill()
+    }
+
+    pub fn should_use_snapshot_backfill(&self) -> bool {
+        self.plan
+            .ctx()
+            .session_ctx()
+            .config()
+            .streaming_use_snapshot_backfill()
+    }
+
+    /// used when the plan has a target relation such as DML and sink into table, return the mapping from table's columns to the plan's schema
+    pub fn target_columns_to_plan_mapping(
+        &self,
+        tar_cols: &[ColumnCatalog],
+        user_specified_columns: bool,
+    ) -> Vec<Option<usize>> {
+        #[allow(clippy::disallowed_methods)]
+        let visible_cols: Vec<(usize, String)> = self
+            .out_fields
+            .ones()
+            .zip_eq(self.out_names.iter().cloned())
+            .collect_vec();
+
+        let visible_col_idxes = visible_cols.iter().map(|(i, _)| *i).collect_vec();
+        let visible_col_idxes_by_name = visible_cols
+            .iter()
+            .map(|(i, name)| (name.as_ref(), *i))
+            .collect::<BTreeMap<_, _>>();
+
+        tar_cols
+            .iter()
+            .enumerate()
+            .filter(|(_, tar_col)| tar_col.can_dml())
+            .map(|(tar_i, tar_col)| {
+                if user_specified_columns {
+                    visible_col_idxes_by_name.get(tar_col.name()).cloned()
+                } else {
+                    (tar_i < visible_col_idxes.len()).then(|| visible_cols[tar_i].0)
+                }
+            })
+            .collect()
     }
 }
 
@@ -988,18 +1153,18 @@ fn find_version_column_index(
             | &DataType::Boolean = column.data_type()
             {
                 Err(ErrorCode::InvalidParameterValue(
-                    "The specified version column data type is invalid.".to_string(),
+                    "The specified version column data type is invalid.".to_owned(),
                 ))?
             }
             return Ok(Some(index));
         }
     }
     Err(ErrorCode::InvalidParameterValue(
-        "The specified version column name is not in the current columns.".to_string(),
+        "The specified version column name is not in the current columns.".to_owned(),
     ))?
 }
 
-fn const_eval_exprs(plan: PlanRef) -> Result<PlanRef> {
+fn const_eval_exprs<C: ConventionMarker>(plan: PlanRef<C>) -> Result<PlanRef<C>> {
     let mut const_eval_rewriter = ConstEvalRewriter { error: None };
 
     let plan = plan.rewrite_exprs_recursive(&mut const_eval_rewriter);
@@ -1009,7 +1174,10 @@ fn const_eval_exprs(plan: PlanRef) -> Result<PlanRef> {
     Ok(plan)
 }
 
-fn inline_session_timezone_in_exprs(ctx: OptimizerContextRef, plan: PlanRef) -> Result<PlanRef> {
+fn inline_session_timezone_in_exprs<C: ConventionMarker>(
+    ctx: OptimizerContextRef,
+    plan: PlanRef<C>,
+) -> Result<PlanRef<C>> {
     let mut v = TimestamptzExprFinder::default();
     plan.visit_exprs_recursive(&mut v);
     if v.has() {
@@ -1019,8 +1187,11 @@ fn inline_session_timezone_in_exprs(ctx: OptimizerContextRef, plan: PlanRef) -> 
     }
 }
 
-fn exist_and_no_exchange_before(plan: &PlanRef, is_candidate: fn(&PlanRef) -> bool) -> bool {
-    if plan.node_type() == PlanNodeType::BatchExchange {
+fn exist_and_no_exchange_before(
+    plan: &BatchPlanRef,
+    is_candidate: fn(&BatchPlanRef) -> bool,
+) -> bool {
+    if plan.node_type() == BatchPlanNodeType::BatchExchange {
         return false;
     }
     is_candidate(plan)
@@ -1035,31 +1206,31 @@ fn exist_and_no_exchange_before(plan: &PlanRef, is_candidate: fn(&PlanRef) -> bo
 /// stage.
 ///
 /// Returns `true` if we must insert an additional exchange to ensure this.
-fn require_additional_exchange_on_root_in_distributed_mode(plan: PlanRef) -> bool {
-    fn is_user_table(plan: &PlanRef) -> bool {
-        plan.node_type() == PlanNodeType::BatchSeqScan
+fn require_additional_exchange_on_root_in_distributed_mode(plan: BatchPlanRef) -> bool {
+    fn is_user_table(plan: &BatchPlanRef) -> bool {
+        plan.node_type() == BatchPlanNodeType::BatchSeqScan
     }
 
-    fn is_log_table(plan: &PlanRef) -> bool {
-        plan.node_type() == PlanNodeType::BatchLogSeqScan
+    fn is_log_table(plan: &BatchPlanRef) -> bool {
+        plan.node_type() == BatchPlanNodeType::BatchLogSeqScan
     }
 
-    fn is_source(plan: &PlanRef) -> bool {
-        plan.node_type() == PlanNodeType::BatchSource
-            || plan.node_type() == PlanNodeType::BatchKafkaScan
-            || plan.node_type() == PlanNodeType::BatchIcebergScan
+    fn is_source(plan: &BatchPlanRef) -> bool {
+        plan.node_type() == BatchPlanNodeType::BatchSource
+            || plan.node_type() == BatchPlanNodeType::BatchKafkaScan
+            || plan.node_type() == BatchPlanNodeType::BatchIcebergScan
     }
 
-    fn is_insert(plan: &PlanRef) -> bool {
-        plan.node_type() == PlanNodeType::BatchInsert
+    fn is_insert(plan: &BatchPlanRef) -> bool {
+        plan.node_type() == BatchPlanNodeType::BatchInsert
     }
 
-    fn is_update(plan: &PlanRef) -> bool {
-        plan.node_type() == PlanNodeType::BatchUpdate
+    fn is_update(plan: &BatchPlanRef) -> bool {
+        plan.node_type() == BatchPlanNodeType::BatchUpdate
     }
 
-    fn is_delete(plan: &PlanRef) -> bool {
-        plan.node_type() == PlanNodeType::BatchDelete
+    fn is_delete(plan: &BatchPlanRef) -> bool {
+        plan.node_type() == BatchPlanNodeType::BatchDelete
     }
 
     assert_eq!(plan.distribution(), &Distribution::Single);
@@ -1073,19 +1244,19 @@ fn require_additional_exchange_on_root_in_distributed_mode(plan: PlanRef) -> boo
 
 /// The purpose is same as `require_additional_exchange_on_root_in_distributed_mode`. We separate
 /// them for the different requirement of plan node in different execute mode.
-fn require_additional_exchange_on_root_in_local_mode(plan: PlanRef) -> bool {
-    fn is_user_table(plan: &PlanRef) -> bool {
-        plan.node_type() == PlanNodeType::BatchSeqScan
+fn require_additional_exchange_on_root_in_local_mode(plan: BatchPlanRef) -> bool {
+    fn is_user_table(plan: &BatchPlanRef) -> bool {
+        plan.node_type() == BatchPlanNodeType::BatchSeqScan
     }
 
-    fn is_source(plan: &PlanRef) -> bool {
-        plan.node_type() == PlanNodeType::BatchSource
-            || plan.node_type() == PlanNodeType::BatchKafkaScan
-            || plan.node_type() == PlanNodeType::BatchIcebergScan
+    fn is_source(plan: &BatchPlanRef) -> bool {
+        plan.node_type() == BatchPlanNodeType::BatchSource
+            || plan.node_type() == BatchPlanNodeType::BatchKafkaScan
+            || plan.node_type() == BatchPlanNodeType::BatchIcebergScan
     }
 
-    fn is_insert(plan: &PlanRef) -> bool {
-        plan.node_type() == PlanNodeType::BatchInsert
+    fn is_insert(plan: &BatchPlanRef) -> bool {
+        plan.node_type() == BatchPlanNodeType::BatchInsert
     }
 
     assert_eq!(plan.distribution(), &Distribution::Single);

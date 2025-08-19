@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -59,6 +59,7 @@ fn generate_hash_values(
             .iter()
             .map(|idx| *idx as usize)
             .collect::<Vec<_>>(),
+        consistent_hash_info.vmap.len(),
     );
 
     let hash_values = vnodes

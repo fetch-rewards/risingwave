@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,12 +16,11 @@ use risingwave_common::types::DataType;
 use risingwave_pb::expr::table_function::PbType as PbTableFuncType;
 
 use crate::expr::{Expr, ExprRewriter};
-use crate::optimizer::plan_node::{generic, LogicalNow};
-use crate::optimizer::rule::{BoxedRule, Rule};
-use crate::PlanRef;
+use crate::optimizer::plan_node::{LogicalNow, generic};
+use crate::optimizer::rule::prelude::{PlanRef, *};
 
 pub struct GenerateSeriesWithNowRule {}
-impl Rule for GenerateSeriesWithNowRule {
+impl Rule<Logical> for GenerateSeriesWithNowRule {
     fn apply(&self, plan: PlanRef) -> Option<PlanRef> {
         let ctx = plan.ctx();
         let table_func = plan.as_logical_table_function()?.table_function();

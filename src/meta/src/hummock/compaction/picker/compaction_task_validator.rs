@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use risingwave_common::config::default::compaction_config;
+use risingwave_common::config::meta::default::compaction_config;
 use risingwave_pb::hummock::CompactionConfig;
 
 use super::{CompactionInput, LocalPickerStatistic};
@@ -77,6 +77,10 @@ impl CompactionTaskValidator {
         } else {
             true
         }
+    }
+
+    pub fn is_enable(&self) -> bool {
+        !self.validation_rules.is_empty()
     }
 }
 
@@ -153,7 +157,7 @@ impl CompactionTaskValidationRule for IntraCompactionTaskValidationRule {
             let level_select_size = select_level
                 .table_infos
                 .iter()
-                .map(|sst| sst.file_size)
+                .map(|sst| sst.sst_size)
                 .sum::<u64>();
 
             max_level_size = std::cmp::max(max_level_size, level_select_size);

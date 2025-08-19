@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 RisingWave Labs
+ * Copyright 2025 RisingWave Labs
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,7 +35,6 @@ import Title from "../components/Title"
 import useFetch from "../lib/api/fetch"
 import {
   Relation,
-  StreamingJob,
   getDatabases,
   getSchemas,
   getUsers,
@@ -60,7 +59,7 @@ export const dependentsColumn: Column<Relation> = {
   name: "Depends",
   width: 1,
   content: (r) => (
-    <Link href={`/dependency_graph/?id=${r.id}`}>
+    <Link href={`/relation_graph/?id=${r.id}`}>
       <Button
         size="sm"
         aria-label="view dependents"
@@ -73,7 +72,7 @@ export const dependentsColumn: Column<Relation> = {
   ),
 }
 
-export const fragmentsColumn: Column<StreamingJob> = {
+export const fragmentsColumn: Column<Relation> = {
   name: "Fragments",
   width: 1,
   content: (r) => (
@@ -100,6 +99,33 @@ export const primaryKeyColumn: Column<RwTable> = {
       .map((col) => extractColumnInfo(col))
       .join(", "),
 }
+
+export const vnodeCountColumn: Column<RwTable> = {
+  name: "Vnode Count",
+  width: 1,
+  // The table catalogs retrieved here are constructed from SQL models,
+  // where the `vnode_count` column has already been populated during migration.
+  // Therefore, it should always be present and no need to specify a fallback.
+  content: (r) => r.maybeVnodeCount ?? "?",
+}
+
+// Helper function to format bytes into human readable format
+function formatBytes(bytes: number | undefined): string {
+  if (bytes === undefined) return "unknown"
+  if (bytes === 0) return "0 B"
+  const k = 1024
+  const sizes = ["B", "KB", "MB", "GB", "TB"]
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + " " + sizes[i]
+}
+
+export const dataSizeColumn: Column<Relation> = {
+  name: "Data Size",
+  width: 2,
+  content: (r) => formatBytes(r.totalSizeBytes),
+}
+
+export const tableColumns = [primaryKeyColumn, vnodeCountColumn, dataSizeColumn]
 
 export const connectorColumnSource: Column<RwSource> = {
   name: "Connector",
@@ -145,6 +171,12 @@ export function Relations<R extends Relation>(
   const table = (
     <Box p={3}>
       <Title>{title}</Title>
+      {relationList && (
+        <Box mb={3} fontSize="sm" color="gray.600">
+          Total: {relationList.length}{" "}
+          {relationList.length === 1 ? "item" : "items"}
+        </Box>
+      )}
       <TableContainer>
         <Table variant="simple" size="sm" maxWidth="full">
           <Thead>

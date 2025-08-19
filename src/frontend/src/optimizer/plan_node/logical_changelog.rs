@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,19 +15,19 @@
 use itertools::Itertools;
 
 use super::expr_visitable::ExprVisitable;
-use super::generic::{GenericPlanRef, CHANGELOG_OP, _CHANGELOG_ROW_ID};
+use super::generic::{_CHANGELOG_ROW_ID, CHANGELOG_OP, GenericPlanRef};
 use super::utils::impl_distill_by_unit;
 use super::{
-    gen_filter_and_pushdown, generic, ColPrunable, ColumnPruningContext, ExprRewritable, Logical,
-    LogicalProject, PlanBase, PlanTreeNodeUnary, PredicatePushdown, RewriteStreamContext,
-    StreamChangeLog, StreamRowIdGen, ToBatch, ToStream, ToStreamContext,
+    BatchPlanRef, ColPrunable, ColumnPruningContext, ExprRewritable, Logical,
+    LogicalPlanRef as PlanRef, LogicalProject, PlanBase, PlanTreeNodeUnary, PredicatePushdown,
+    RewriteStreamContext, StreamChangeLog, StreamPlanRef, StreamRowIdGen, ToBatch, ToStream,
+    ToStreamContext, gen_filter_and_pushdown, generic,
 };
 use crate::error::ErrorCode::BindError;
 use crate::error::Result;
 use crate::expr::{ExprImpl, InputRef};
 use crate::optimizer::property::Distribution;
 use crate::utils::{ColIndexMapping, Condition};
-use crate::PlanRef;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LogicalChangeLog {
@@ -51,7 +51,7 @@ impl LogicalChangeLog {
     }
 }
 
-impl PlanTreeNodeUnary for LogicalChangeLog {
+impl PlanTreeNodeUnary<Logical> for LogicalChangeLog {
     fn input(&self) -> PlanRef {
         self.core.input.clone()
     }
@@ -87,10 +87,10 @@ impl PlanTreeNodeUnary for LogicalChangeLog {
     }
 }
 
-impl_plan_tree_node_for_unary! {LogicalChangeLog}
+impl_plan_tree_node_for_unary! { Logical, LogicalChangeLog}
 impl_distill_by_unit!(LogicalChangeLog, core, "LogicalChangeLog");
 
-impl ExprRewritable for LogicalChangeLog {}
+impl ExprRewritable<Logical> for LogicalChangeLog {}
 
 impl ExprVisitable for LogicalChangeLog {}
 
@@ -134,18 +134,17 @@ impl ColPrunable for LogicalChangeLog {
 }
 
 impl ToBatch for LogicalChangeLog {
-    fn to_batch(&self) -> Result<PlanRef> {
-        Err(BindError("With changelog cte only support with create mv/sink".to_string()).into())
+    fn to_batch(&self) -> Result<BatchPlanRef> {
+        Err(BindError("With changelog cte only support with create mv/sink".to_owned()).into())
     }
 }
 
 impl ToStream for LogicalChangeLog {
-    fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<PlanRef> {
+    fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<StreamPlanRef> {
         let new_input = self.input().to_stream(ctx)?;
 
-        let mut new_logical = self.core.clone();
-        new_logical.input = new_input;
-        let plan = StreamChangeLog::new(new_logical).into();
+        let core = self.core.clone_with_input(new_input);
+        let plan = StreamChangeLog::new(core).into();
         let row_id_index = self.schema().fields().len() - 1;
         let plan = StreamRowIdGen::new_with_dist(
             plan,

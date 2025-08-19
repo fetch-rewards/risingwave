@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,26 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
 use criterion::async_executor::FuturesExecutor;
-use criterion::{criterion_group, criterion_main, Criterion};
-use foyer::{CacheContext, HybridCacheBuilder};
+use criterion::{Criterion, criterion_group, criterion_main};
+use foyer::{CacheBuilder, Engine, Hint, HybridCacheBuilder, LargeEngineOptions};
 use risingwave_common::catalog::{ColumnDesc, ColumnId, TableId};
 use risingwave_common::config::{MetricLevel, ObjectStoreConfig};
 use risingwave_common::hash::VirtualNode;
 use risingwave_common::row::OwnedRow;
 use risingwave_common::types::DataType;
-use risingwave_common::util::value_encoding::column_aware_row_encoding::ColumnAwareSerde;
 use risingwave_common::util::value_encoding::ValueRowSerializer;
+use risingwave_common::util::value_encoding::column_aware_row_encoding::ColumnAwareSerde;
 use risingwave_hummock_sdk::key::FullKey;
 use risingwave_hummock_sdk::key_range::KeyRange;
 use risingwave_hummock_sdk::sstable_info::SstableInfo;
 use risingwave_object_store::object::object_metrics::ObjectStoreMetrics;
 use risingwave_object_store::object::{InMemObjectStore, ObjectStore, ObjectStoreImpl};
-use risingwave_pb::hummock::compact_task::PbTaskType;
 use risingwave_pb::hummock::PbTableSchema;
+use risingwave_pb::hummock::compact_task::PbTaskType;
+use risingwave_storage::compaction_catalog_manager::CompactionCatalogAgent;
 use risingwave_storage::hummock::compactor::compactor_runner::compact_and_build_sst;
 use risingwave_storage::hummock::compactor::{
     ConcatSstableIterator, DummyCompactionFilter, TaskConfig, TaskProgress,
@@ -50,27 +52,27 @@ use risingwave_storage::hummock::{
     SstableStoreConfig, SstableWriterOptions, Xor16FilterBuilder,
 };
 use risingwave_storage::monitor::{
-    global_hummock_state_store_metrics, CompactorMetrics, StoreLocalStatistic,
+    CompactorMetrics, StoreLocalStatistic, global_hummock_state_store_metrics,
 };
 
 pub async fn mock_sstable_store() -> SstableStoreRef {
-    let store = InMemObjectStore::new().monitored(
+    let store = InMemObjectStore::for_test().monitored(
         Arc::new(ObjectStoreMetrics::unused()),
         Arc::new(ObjectStoreConfig::default()),
     );
     let store = Arc::new(ObjectStoreImpl::InMem(store));
-    let path = "test".to_string();
+    let path = "test".to_owned();
     let meta_cache = HybridCacheBuilder::new()
         .memory(64 << 20)
         .with_shards(2)
-        .storage()
+        .storage(Engine::Large(LargeEngineOptions::new()))
         .build()
         .await
         .unwrap();
     let block_cache = HybridCacheBuilder::new()
         .memory(128 << 20)
         .with_shards(2)
-        .storage()
+        .storage(Engine::Large(LargeEngineOptions::new()))
         .build()
         .await
         .unwrap();
@@ -86,6 +88,8 @@ pub async fn mock_sstable_store() -> SstableStoreRef {
 
         meta_cache,
         block_cache,
+        vector_meta_cache: CacheBuilder::new(1 << 10).build(),
+        vector_block_cache: CacheBuilder::new(1 << 10).build(),
     }))
 }
 
@@ -93,7 +97,7 @@ pub fn default_writer_opts() -> SstableWriterOptions {
     SstableWriterOptions {
         capacity_hint: None,
         tracker: None,
-        policy: CachePolicy::Fill(CacheContext::Default),
+        policy: CachePolicy::Fill(Hint::Normal),
     }
 }
 
@@ -130,11 +134,18 @@ async fn build_table(
         SstableWriterOptions {
             capacity_hint: None,
             tracker: None,
-            policy: CachePolicy::Fill(CacheContext::Default),
+            policy: CachePolicy::Fill(Hint::Normal),
         },
     );
-    let mut builder =
-        SstableBuilder::<_, Xor16FilterBuilder>::for_test(sstable_object_id, writer, opt);
+    let table_id_to_vnode = HashMap::from_iter(vec![(0, VirtualNode::COUNT_FOR_TEST)]);
+    let table_id_to_watermark_serde = HashMap::from_iter(vec![(0, None)]);
+    let mut builder = SstableBuilder::<_, Xor16FilterBuilder>::for_test(
+        sstable_object_id,
+        writer,
+        opt,
+        table_id_to_vnode,
+        table_id_to_watermark_serde,
+    );
     let value = b"1234567890123456789";
     let mut full_key = test_key_of(0, epoch, TableId::new(0));
     let table_key_len = full_key.user_key.table_key.len();
@@ -174,11 +185,20 @@ async fn build_table_2(
         SstableWriterOptions {
             capacity_hint: None,
             tracker: None,
-            policy: CachePolicy::Fill(CacheContext::Default),
+            policy: CachePolicy::Fill(Hint::Normal),
         },
     );
-    let mut builder =
-        SstableBuilder::<_, Xor16FilterBuilder>::for_test(sstable_object_id, writer, opt);
+
+    let table_id_to_vnode = HashMap::from_iter(vec![(table_id, VirtualNode::COUNT_FOR_TEST)]);
+    let table_id_to_watermark_serde = HashMap::from_iter(vec![(0, None)]);
+
+    let mut builder = SstableBuilder::<_, Xor16FilterBuilder>::for_test(
+        sstable_object_id,
+        writer,
+        opt,
+        table_id_to_vnode,
+        table_id_to_watermark_serde,
+    );
     let mut full_key = test_key_of(0, epoch, TableId::new(table_id));
     let table_key_len = full_key.user_key.table_key.len();
 
@@ -217,7 +237,7 @@ async fn scan_all_table(info: &SstableInfo, sstable_store: SstableStoreRef) {
     let default_read_options = Arc::new(SstableIteratorReadOptions::default());
     // warm up to make them all in memory. I do not use CachePolicy::Fill because it will fetch
     // block from meta.
-    let mut iter = SstableIterator::new(table, sstable_store.clone(), default_read_options);
+    let mut iter = SstableIterator::new(table, sstable_store.clone(), default_read_options, info);
     iter.rewind().await.unwrap();
     while iter.is_valid() {
         iter.next().await.unwrap();
@@ -273,14 +293,16 @@ async fn compact<I: HummockIterator<Direction = Forward>>(
         bloom_false_positive: 0.001,
         ..Default::default()
     };
-    let mut builder =
-        CapacitySplitTableBuilder::for_test(LocalTableBuilderFactory::new(32, sstable_store, opt));
+    let compaction_catalog_agent_ref = CompactionCatalogAgent::for_test(vec![0]);
+    let mut builder = CapacitySplitTableBuilder::for_test(
+        LocalTableBuilderFactory::new(32, sstable_store, opt),
+        compaction_catalog_agent_ref,
+    );
 
     let task_config = task_config.unwrap_or_else(|| TaskConfig {
         key_range: KeyRange::inf(),
         cache_policy: CachePolicy::Disable,
         gc_delete_keys: false,
-        watermark: 0,
         stats_target_table_ids: None,
         task_type: PbTaskType::Dynamic,
         use_block_based_filter: true,
@@ -330,7 +352,7 @@ fn bench_merge_iterator_compactor(c: &mut Criterion) {
     });
     let level2 = vec![info1, info2];
     let read_options = Arc::new(SstableIteratorReadOptions {
-        cache_policy: CachePolicy::Fill(CacheContext::Default),
+        cache_policy: CachePolicy::Fill(Hint::Normal),
         prefetch_for_large_query: false,
         must_iterated_end_user_key: None,
         max_preload_retry_times: 0,
@@ -432,7 +454,6 @@ fn bench_drop_column_compaction_impl(c: &mut Criterion, column_num: usize) {
         key_range: KeyRange::inf(),
         cache_policy: CachePolicy::Disable,
         gc_delete_keys: false,
-        watermark: 0,
         stats_target_table_ids: None,
         task_type: PbTaskType::Dynamic,
         use_block_based_filter: true,

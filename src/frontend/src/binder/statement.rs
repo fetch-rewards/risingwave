@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,9 +14,11 @@
 
 use risingwave_common::bail_not_implemented;
 use risingwave_common::catalog::Field;
-use risingwave_sqlparser::ast::Statement;
+use risingwave_sqlparser::ast::{DeclareCursor, Statement};
 
+use super::declare_cursor::{BoundDeclareCursor, BoundDeclareSubscriptionCursor};
 use super::delete::BoundDelete;
+use super::fetch_cursor::BoundFetchCursor;
 use super::update::BoundUpdate;
 use crate::binder::create_view::BoundCreateView;
 use crate::binder::{Binder, BoundInsert, BoundQuery};
@@ -29,6 +31,9 @@ pub enum BoundStatement {
     Delete(Box<BoundDelete>),
     Update(Box<BoundUpdate>),
     Query(Box<BoundQuery>),
+    DeclareCursor(Box<BoundDeclareCursor>),
+    DeclareSubscriptionCursor(Box<BoundDeclareSubscriptionCursor>),
+    FetchCursor(Box<BoundFetchCursor>),
     CreateView(Box<BoundCreateView>),
 }
 
@@ -48,6 +53,12 @@ impl BoundStatement {
                 .as_ref()
                 .map_or(vec![], |s| s.fields().into()),
             BoundStatement::Query(q) => q.schema().fields().into(),
+            BoundStatement::DeclareCursor(_) => vec![],
+            BoundStatement::DeclareSubscriptionCursor(_) => vec![],
+            BoundStatement::FetchCursor(f) => f
+                .returning_schema
+                .as_ref()
+                .map_or(vec![], |s| s.fields().into()),
             BoundStatement::CreateView(_) => vec![],
         }
     }
@@ -84,7 +95,30 @@ impl Binder {
                     .into(),
             )),
 
-            Statement::Query(q) => Ok(BoundStatement::Query(self.bind_query(*q)?.into())),
+            Statement::Query(q) => Ok(BoundStatement::Query(self.bind_query(&q)?.into())),
+
+            Statement::DeclareCursor { stmt } => match stmt.declare_cursor {
+                DeclareCursor::Query(body) => {
+                    let query = self.bind_query(&body)?;
+                    Ok(BoundStatement::DeclareCursor(
+                        BoundDeclareCursor {
+                            cursor_name: stmt.cursor_name,
+                            query: query.into(),
+                        }
+                        .into(),
+                    ))
+                }
+                DeclareCursor::Subscription(subscription_name, rw_timestamp) => {
+                    Ok(BoundStatement::DeclareSubscriptionCursor(
+                        BoundDeclareSubscriptionCursor {
+                            cursor_name: stmt.cursor_name,
+                            subscription_name,
+                            rw_timestamp,
+                        }
+                        .into(),
+                    ))
+                }
+            },
 
             // Note(eric): Can I just bind CreateView to Query??
             Statement::CreateView {
@@ -97,7 +131,7 @@ impl Binder {
                 emit_mode,
                 with_options,
             } => {
-                let query = self.bind_query(*query)?;
+                let query = self.bind_query(&query)?;
                 let create_view = BoundCreateView::new(
                     or_replace,
                     materialized,
@@ -127,6 +161,9 @@ impl RewriteExprsRecursive for BoundStatement {
             BoundStatement::Delete(inner) => inner.rewrite_exprs_recursive(rewriter),
             BoundStatement::Update(inner) => inner.rewrite_exprs_recursive(rewriter),
             BoundStatement::Query(inner) => inner.rewrite_exprs_recursive(rewriter),
+            BoundStatement::DeclareCursor(inner) => inner.rewrite_exprs_recursive(rewriter),
+            BoundStatement::FetchCursor(_) => {}
+            BoundStatement::DeclareSubscriptionCursor(_) => {}
             BoundStatement::CreateView(inner) => inner.rewrite_exprs_recursive(rewriter),
         }
     }

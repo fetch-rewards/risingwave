@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,14 +14,14 @@
 
 use std::sync::Arc;
 
+use opendal::Operator;
 use opendal::layers::LoggingLayer;
 use opendal::services::Gcs;
-use opendal::Operator;
 use risingwave_common::config::ObjectStoreConfig;
 
-use super::{EngineType, OpendalObjectStore};
-use crate::object::object_metrics::ObjectStoreMetrics;
+use super::{MediaType, OpendalObjectStore};
 use crate::object::ObjectResult;
+use crate::object::object_metrics::ObjectStoreMetrics;
 
 impl OpendalObjectStore {
     /// create opendal gcs engine.
@@ -32,16 +32,12 @@ impl OpendalObjectStore {
         metrics: Arc<ObjectStoreMetrics>,
     ) -> ObjectResult<Self> {
         // Create gcs backend builder.
-        let mut builder = Gcs::default();
-
-        builder.bucket(&bucket);
-
-        builder.root(&root);
+        let mut builder = Gcs::default().bucket(&bucket).root(&root);
 
         // if credential env is set, use it. Otherwise, ADC will be used.
         let cred = std::env::var("GOOGLE_APPLICATION_CREDENTIALS");
         if let Ok(cred) = cred {
-            builder.credential(&cred);
+            builder = builder.credential(&cred);
         }
 
         let op: Operator = Operator::new(builder)?
@@ -49,7 +45,7 @@ impl OpendalObjectStore {
             .finish();
         Ok(Self {
             op,
-            engine_type: EngineType::Gcs,
+            media_type: MediaType::Gcs,
             config,
             metrics,
         })

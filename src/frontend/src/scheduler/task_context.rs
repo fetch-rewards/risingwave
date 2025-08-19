@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,14 +16,14 @@ use std::sync::Arc;
 
 use prometheus::core::Atomic;
 use risingwave_batch::error::Result;
-use risingwave_batch::monitor::BatchMetricsWithTaskLabels;
+use risingwave_batch::monitor::BatchMetrics;
 use risingwave_batch::task::{BatchTaskContext, TaskOutput, TaskOutputId};
 use risingwave_batch::worker_manager::worker_node_manager::WorkerNodeManagerRef;
 use risingwave_common::catalog::SysCatalogReaderRef;
 use risingwave_common::config::BatchConfig;
 use risingwave_common::memory::MemoryContext;
 use risingwave_common::metrics::TrAdderAtomic;
-use risingwave_common::util::addr::{is_local_address, HostAddr};
+use risingwave_common::util::addr::{HostAddr, is_local_address};
 use risingwave_connector::source::monitor::SourceMetrics;
 use risingwave_rpc_client::ComputeClientPoolRef;
 
@@ -39,13 +39,13 @@ pub struct FrontendBatchTaskContext {
 }
 
 impl FrontendBatchTaskContext {
-    pub fn new(session: Arc<SessionImpl>) -> Self {
+    pub fn create(session: Arc<SessionImpl>) -> Arc<dyn BatchTaskContext> {
         let mem_context =
             MemoryContext::new(Some(session.env().mem_context()), TrAdderAtomic::new(0));
-        Self {
+        Arc::new(Self {
             session,
             mem_context,
-        }
+        })
     }
 }
 
@@ -73,7 +73,7 @@ impl BatchTaskContext for FrontendBatchTaskContext {
         unimplemented!("not supported in local mode")
     }
 
-    fn batch_metrics(&self) -> Option<BatchMetricsWithTaskLabels> {
+    fn batch_metrics(&self) -> Option<BatchMetrics> {
         None
     }
 

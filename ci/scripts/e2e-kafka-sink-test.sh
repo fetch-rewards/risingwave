@@ -11,6 +11,7 @@ rpk topic create test-rw-sink-upsert-schema
 rpk topic create test-rw-sink-debezium
 rpk topic create test-rw-sink-without-snapshot
 rpk topic create test-rw-sink-text-key-id
+rpk topic create test-rw-sink-bytes-key-id
 
 sqllogictest -p 4566 -d dev 'e2e_test/sink/kafka/create_sink.slt'
 sleep 2
@@ -147,23 +148,13 @@ rpk topic delete test-rw-sink-debezium
 
 # test different encoding
 echo "preparing confluent schema registry"
-python3 -m pip install --break-system-packages requests confluent-kafka
+python3 -m pip install --break-system-packages -r e2e_test/requirements.txt
 
 echo "testing protobuf"
-cp src/connector/src/test_data/proto_recursive/recursive.pb ./proto-recursive
-rpk topic create test-rw-sink-append-only-protobuf
-rpk topic create test-rw-sink-append-only-protobuf-csr-a
-rpk topic create test-rw-sink-append-only-protobuf-csr-hi
-python3 e2e_test/sink/kafka/register_schema.py 'http://schemaregistry:8082' 'test-rw-sink-append-only-protobuf-csr-a-value' src/connector/src/test_data/test-index-array.proto
-python3 e2e_test/sink/kafka/register_schema.py 'http://schemaregistry:8082' 'test-rw-sink-append-only-protobuf-csr-hi-value' src/connector/src/test_data/test-index-array.proto
-sqllogictest -p 4566 -d dev 'e2e_test/sink/kafka/protobuf.slt'
-rpk topic delete test-rw-sink-append-only-protobuf
-rpk topic delete test-rw-sink-append-only-protobuf-csr-a
-rpk topic delete test-rw-sink-append-only-protobuf-csr-hi
+risedev slt 'e2e_test/sink/kafka/protobuf.slt'
 
 echo "testing avro"
-python3 e2e_test/sink/kafka/register_schema.py 'http://schemaregistry:8082' 'test-rw-sink-upsert-avro-value' src/connector/src/test_data/all-types.avsc
-python3 e2e_test/sink/kafka/register_schema.py 'http://schemaregistry:8082' 'test-rw-sink-upsert-avro-key' src/connector/src/test_data/all-types.avsc 'string_field,int32_field'
-rpk topic create test-rw-sink-upsert-avro
-sqllogictest -p 4566 -d dev 'e2e_test/sink/kafka/avro.slt'
-rpk topic delete test-rw-sink-upsert-avro
+risedev slt 'e2e_test/sink/kafka/avro.slt'
+
+echo "testing avro-decimal"
+risedev slt 'e2e_test/sink/kafka/avro-decimal.slt'

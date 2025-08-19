@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
 //! Handle creation of logical (non-materialized) views.
 
 use either::Either;
-use itertools::Itertools;
 use pgwire::pg_response::{PgResponse, StatementType};
 use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_pb::catalog::PbView;
@@ -35,8 +34,8 @@ pub async fn handle_create_view(
     query: Query,
 ) -> Result<RwPgResponse> {
     let session = handler_args.session.clone();
-    let db_name = session.database();
-    let (schema_name, view_name) = Binder::resolve_schema_qualified_name(db_name, name.clone())?;
+    let db_name = &session.database();
+    let (schema_name, view_name) = Binder::resolve_schema_qualified_name(db_name, &name)?;
 
     let (database_id, schema_id) = session.get_database_and_schema_id_for_create(schema_name)?;
 
@@ -71,7 +70,7 @@ pub async fn handle_create_view(
     } else {
         if columns.len() != schema.fields().len() {
             return Err(crate::error::ErrorCode::InternalError(
-                "view has different number of columns than the query's columns".to_string(),
+                "view has different number of columns than the query's columns".to_owned(),
             )
             .into());
         }
@@ -87,10 +86,11 @@ pub async fn handle_create_view(
             .collect()
     };
 
-    let (properties, secret_refs) = properties.into_parts();
-    if !secret_refs.is_empty() {
+    let (properties, secret_refs, connection_refs) = properties.into_parts();
+    if !secret_refs.is_empty() || !connection_refs.is_empty() {
         return Err(crate::error::ErrorCode::InvalidParameterValue(
-            "Secret reference is not allowed in create view options".to_string(),
+            "Secret reference and Connection reference are not allowed in create view options"
+                .to_owned(),
         )
         .into());
     }
@@ -102,16 +102,20 @@ pub async fn handle_create_view(
         name: view_name,
         properties,
         owner: session.user_id(),
-        dependent_relations: dependent_relations
-            .into_iter()
-            .map(|t| t.table_id)
-            .collect_vec(),
         sql: format!("{}", query),
         columns: columns.into_iter().map(|f| f.to_prost()).collect(),
     };
 
     let catalog_writer = session.catalog_writer()?;
-    catalog_writer.create_view(view).await?;
+    catalog_writer
+        .create_view(
+            view,
+            dependent_relations
+                .into_iter()
+                .map(|t| t.table_id)
+                .collect(),
+        )
+        .await?;
 
     Ok(PgResponse::empty_result(StatementType::CREATE_VIEW))
 }

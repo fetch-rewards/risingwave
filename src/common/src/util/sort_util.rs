@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -241,7 +241,7 @@ impl fmt::Display for OrderType {
 /// (`Vec<ColumnOrder>`).
 ///
 /// Corresponds to protobuf [`PbColumnOrder`].
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Copy)]
 pub struct ColumnOrder {
     pub column_index: usize,
     pub order_type: OrderType,
@@ -269,7 +269,7 @@ impl ColumnOrder {
         }
     }
 
-    pub fn to_protobuf(&self) -> PbColumnOrder {
+    pub fn to_protobuf(self) -> PbColumnOrder {
         PbColumnOrder {
             column_index: self.column_index as _,
             order_type: Some(self.order_type.to_protobuf()),
@@ -579,7 +579,7 @@ mod tests {
     use super::*;
     use crate::array::{ListValue, StructValue};
     use crate::row::OwnedRow;
-    use crate::types::{DataType, Datum, ScalarImpl};
+    use crate::types::{DataType, Datum, ScalarImpl, StructType};
 
     #[test]
     fn test_order_type() {
@@ -720,7 +720,7 @@ mod tests {
                 DataType::Date,
                 DataType::Timestamp,
                 DataType::Time,
-                DataType::new_struct(vec![DataType::Int32, DataType::Float32], vec![]),
+                StructType::unnamed(vec![DataType::Int32, DataType::Float32]).into(),
                 DataType::List(Box::new(DataType::Int32)),
             ],
         );

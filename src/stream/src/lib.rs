@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,10 +17,7 @@
 #![feature(trait_alias)]
 #![feature(type_alias_impl_trait)]
 #![feature(more_qualified_paths)]
-#![feature(lint_reasons)]
 #![feature(let_chains)]
-#![feature(hash_extract_if)]
-#![feature(extract_if)]
 #![feature(coroutines)]
 #![feature(iter_from_coroutine)]
 #![feature(proc_macro_hygiene)]
@@ -29,18 +26,15 @@
 #![feature(map_try_insert)]
 #![feature(never_type)]
 #![feature(btreemap_alloc)]
-#![feature(lazy_cell)]
 #![feature(error_generic_member_access)]
 #![feature(btree_extract_if)]
 #![feature(iter_order_by)]
 #![feature(exact_size_is_empty)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(test)]
-#![feature(is_sorted)]
 #![feature(btree_cursors)]
 #![feature(assert_matches)]
 #![feature(try_blocks)]
-#![feature(result_flattening)] // required by `capture_context`
 
 use std::sync::Arc;
 
@@ -65,7 +59,7 @@ tokio::task_local! {
 }
 
 mod config {
-    use risingwave_common::config::default;
+    use risingwave_common::config::streaming::default;
 
     pub(crate) fn chunk_size() -> usize {
         let res = crate::CONFIG.try_with(|config| config.developer.chunk_size);
@@ -81,7 +75,7 @@ mod consistency {
 
     use std::sync::LazyLock;
 
-    use risingwave_common::config::default;
+    use risingwave_common::config::streaming::default;
     use risingwave_common::util::env_var::env_var_is_true;
 
     static INSANE_MODE: LazyLock<bool> =

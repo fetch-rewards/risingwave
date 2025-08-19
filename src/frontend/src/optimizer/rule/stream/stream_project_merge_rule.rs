@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::prelude::*;
 use crate::expr::{ExprImpl, ExprRewriter, ExprVisitor};
 use crate::optimizer::plan_expr_visitor::InputRefCounter;
-use crate::optimizer::plan_node::{generic, PlanTreeNodeUnary, StreamProject};
-use crate::optimizer::{BoxedRule, PlanRef, Rule};
+use crate::optimizer::plan_node::{PlanTreeNodeUnary, StreamProject, generic};
 use crate::utils::Substitute;
 
 /// Merge contiguous [`StreamProject`] nodes.
 pub struct StreamProjectMergeRule {}
-impl Rule for StreamProjectMergeRule {
+impl Rule<Stream> for StreamProjectMergeRule {
     fn apply(&self, plan: PlanRef) -> Option<PlanRef> {
         let outer_project = plan.as_stream_project()?;
         let input = outer_project.input();

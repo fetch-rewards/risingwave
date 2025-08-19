@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,9 @@ use risingwave_common::catalog::UserId;
 use risingwave_sqlparser::ast::CreateSubscriptionStatement;
 
 use super::{HandlerArgs, RwPgResponse};
-use crate::catalog::subscription_catalog::{SubscriptionCatalog, SubscriptionId};
+use crate::catalog::subscription_catalog::{
+    SubscriptionCatalog, SubscriptionId, SubscriptionState,
+};
 use crate::error::Result;
 use crate::scheduler::streaming_manager::CreatingStreamingJobInfo;
 use crate::session::SessionImpl;
@@ -31,11 +33,11 @@ pub fn create_subscription_catalog(
     context: OptimizerContextRef,
     stmt: CreateSubscriptionStatement,
 ) -> Result<SubscriptionCatalog> {
-    let db_name = session.database();
+    let db_name = &session.database();
     let (subscription_schema_name, subscription_name) =
-        Binder::resolve_schema_qualified_name(db_name, stmt.subscription_name.clone())?;
+        Binder::resolve_schema_qualified_name(db_name, &stmt.subscription_name)?;
     let (table_schema_name, subscription_from_table_name) =
-        Binder::resolve_schema_qualified_name(db_name, stmt.subscription_from.clone())?;
+        Binder::resolve_schema_qualified_name(db_name, &stmt.subscription_from)?;
     let (table_database_id, table_schema_id) =
         session.get_database_and_schema_id_for_create(table_schema_name.clone())?;
     let (subscription_database_id, subscription_schema_id) =
@@ -62,6 +64,7 @@ pub fn create_subscription_catalog(
         created_at_epoch: None,
         created_at_cluster_version: None,
         initialized_at_cluster_version: None,
+        subscription_state: SubscriptionState::Init,
     };
 
     subscription_catalog.set_retention_seconds(context.with_options())?;

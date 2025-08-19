@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,17 +14,17 @@
 
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
-use risingwave_common::types::{DataType, Datum, ScalarImpl};
+use risingwave_common::types::{DataType, ScalarImpl};
 use risingwave_common::util::sort_util::{ColumnOrder, OrderType};
-use risingwave_common::{bail_not_implemented, not_implemented};
-use risingwave_expr::aggregate::{agg_kinds, AggKind, PbAggKind};
+use risingwave_common::{bail, bail_not_implemented, not_implemented};
+use risingwave_expr::aggregate::{AggType, PbAggKind, agg_types};
 
 use super::generic::{self, Agg, GenericPlanRef, PlanAggCall, ProjectBuilder};
 use super::utils::impl_distill_by_unit;
 use super::{
-    BatchHashAgg, BatchSimpleAgg, ColPrunable, ExprRewritable, Logical, PlanBase, PlanRef,
-    PlanTreeNodeUnary, PredicatePushdown, StreamHashAgg, StreamProject, StreamShare,
-    StreamSimpleAgg, StreamStatelessSimpleAgg, ToBatch, ToStream,
+    BatchHashAgg, BatchSimpleAgg, ColPrunable, ExprRewritable, Logical, LogicalPlanRef as PlanRef,
+    PlanBase, PlanTreeNodeUnary, PredicatePushdown, StreamHashAgg, StreamPlanRef, StreamProject,
+    StreamShare, StreamSimpleAgg, StreamStatelessSimpleAgg, ToBatch, ToStream,
 };
 use crate::error::{ErrorCode, Result, RwError};
 use crate::expr::{
@@ -34,11 +34,11 @@ use crate::expr::{
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_node::generic::GenericPlanNode;
 use crate::optimizer::plan_node::stream_global_approx_percentile::StreamGlobalApproxPercentile;
-use crate::optimizer::plan_node::stream_keyed_merge::StreamKeyedMerge;
 use crate::optimizer::plan_node::stream_local_approx_percentile::StreamLocalApproxPercentile;
+use crate::optimizer::plan_node::stream_row_merge::StreamRowMerge;
 use crate::optimizer::plan_node::{
-    gen_filter_and_pushdown, BatchSortAgg, ColumnPruningContext, LogicalDedup, LogicalProject,
-    PredicatePushdownContext, RewriteStreamContext, ToStreamContext,
+    BatchSortAgg, ColumnPruningContext, LogicalDedup, LogicalProject, PredicatePushdownContext,
+    RewriteStreamContext, ToStreamContext, gen_filter_and_pushdown,
 };
 use crate::optimizer::property::{Distribution, Order, RequiredDist};
 use crate::utils::{
@@ -71,35 +71,28 @@ pub struct LogicalAgg {
 impl LogicalAgg {
     /// Generate plan for stateless 2-phase streaming agg.
     /// Should only be used iff input is distributed. Input must be converted to stream form.
-    fn gen_stateless_two_phase_streaming_agg_plan(&self, stream_input: PlanRef) -> Result<PlanRef> {
+    fn gen_stateless_two_phase_streaming_agg_plan(
+        &self,
+        stream_input: StreamPlanRef,
+    ) -> Result<StreamPlanRef> {
         debug_assert!(self.group_key().is_empty());
-        let mut core = self.core.clone();
 
         // ====== Handle approx percentile aggs
-        let SeparatedAggInfo { normal, approx } = self.separate_normal_and_special_agg();
+        let (
+            non_approx_percentile_col_mapping,
+            approx_percentile_col_mapping,
+            approx_percentile,
+            core,
+        ) = self.prepare_approx_percentile(stream_input.clone())?;
 
-        let AggInfo {
-            calls: non_approx_percentile_agg_calls,
-            col_mapping: non_approx_percentile_col_mapping,
-        } = normal;
-        let AggInfo {
-            calls: approx_percentile_agg_calls,
-            col_mapping: approx_percentile_col_mapping,
-        } = approx;
+        if core.agg_calls.is_empty() {
+            if let Some(approx_percentile) = approx_percentile {
+                return Ok(approx_percentile);
+            };
+            bail!("expected at least one agg call");
+        }
 
-        let needs_keyed_merge = (!non_approx_percentile_agg_calls.is_empty()
-            && !approx_percentile_agg_calls.is_empty())
-            || approx_percentile_agg_calls.len() >= 2;
-        core.input = if needs_keyed_merge {
-            // If there's keyed merge, we need to share the input.
-            StreamShare::new_from_input(stream_input.clone()).into()
-        } else {
-            stream_input
-        };
-        core.agg_calls = non_approx_percentile_agg_calls;
-
-        let approx_percentile =
-            self.build_approx_percentile_aggs(core.input.clone(), &approx_percentile_agg_calls)?;
+        let need_row_merge: bool = Self::need_row_merge(&approx_percentile);
 
         // ====== Handle normal aggs
         let total_agg_calls = core
@@ -110,28 +103,23 @@ impl LogicalAgg {
                 agg_call.partial_to_total_agg_call(partial_output_idx)
             })
             .collect_vec();
-        let local_agg = StreamStatelessSimpleAgg::new(core);
+        let local_agg = StreamStatelessSimpleAgg::new(core)?;
         let exchange =
-            RequiredDist::single().enforce_if_not_satisfies(local_agg.into(), &Order::any())?;
-        let global_agg =
-            new_stream_simple_agg(Agg::new(total_agg_calls, IndexSet::empty(), exchange));
+            RequiredDist::single().streaming_enforce_if_not_satisfies(local_agg.into())?;
+
+        let must_output_per_barrier = need_row_merge;
+        let global_agg = new_stream_simple_agg(
+            Agg::new(total_agg_calls, IndexSet::empty(), exchange),
+            must_output_per_barrier,
+        )?;
 
         // ====== Merge approx percentile and normal aggs
-        if let Some(approx_percentile) = approx_percentile {
-            if needs_keyed_merge {
-                let keyed_merge = StreamKeyedMerge::new(
-                    approx_percentile,
-                    global_agg.into(),
-                    approx_percentile_col_mapping,
-                    non_approx_percentile_col_mapping,
-                )?;
-                Ok(keyed_merge.into())
-            } else {
-                Ok(approx_percentile)
-            }
-        } else {
-            Ok(global_agg.into())
-        }
+        Self::add_row_merge_if_needed(
+            approx_percentile,
+            global_agg.into(),
+            approx_percentile_col_mapping,
+            non_approx_percentile_col_mapping,
+        )
     }
 
     /// Generate plan for stateless/stateful 2-phase streaming agg.
@@ -139,13 +127,27 @@ impl LogicalAgg {
     /// Input must be converted to stream form.
     fn gen_vnode_two_phase_streaming_agg_plan(
         &self,
-        stream_input: PlanRef,
+        stream_input: StreamPlanRef,
         dist_key: &[usize],
-    ) -> Result<PlanRef> {
-        let input_col_num = stream_input.schema().len();
+    ) -> Result<StreamPlanRef> {
+        let (
+            non_approx_percentile_col_mapping,
+            approx_percentile_col_mapping,
+            approx_percentile,
+            core,
+        ) = self.prepare_approx_percentile(stream_input.clone())?;
+
+        if core.agg_calls.is_empty() {
+            if let Some(approx_percentile) = approx_percentile {
+                return Ok(approx_percentile);
+            };
+            bail!("expected at least one agg call");
+        }
+        let need_row_merge = Self::need_row_merge(&approx_percentile);
 
         // Generate vnode via project
         // TODO(kwannoel): We should apply Project optimization rules here.
+        let input_col_num = stream_input.schema().len(); // get schema len before moving `stream_input`.
         let project = StreamProject::new(generic::Project::with_vnode_col(stream_input, dist_key));
         let vnode_col_idx = project.base.schema().len() - 1;
 
@@ -154,9 +156,9 @@ impl LogicalAgg {
         local_group_key.insert(vnode_col_idx);
         let n_local_group_key = local_group_key.len();
         let local_agg = new_stream_hash_agg(
-            Agg::new(self.agg_calls().to_vec(), local_group_key, project.into()),
+            Agg::new(core.agg_calls.to_vec(), local_group_key, project.into()),
             Some(vnode_col_idx),
-        );
+        )?;
         // Global group key excludes vnode.
         let local_agg_group_key_cardinality = local_agg.group_key().len();
         let local_group_key_without_vnode =
@@ -167,29 +169,36 @@ impl LogicalAgg {
             .expect("some input group key could not be mapped");
 
         // Generate global agg step
-        if self.group_key().is_empty() {
+        let global_agg = if self.group_key().is_empty() {
             let exchange =
-                RequiredDist::single().enforce_if_not_satisfies(local_agg.into(), &Order::any())?;
-            let global_agg = new_stream_simple_agg(Agg::new(
-                self.agg_calls()
-                    .iter()
-                    .enumerate()
-                    .map(|(partial_output_idx, agg_call)| {
-                        agg_call.partial_to_total_agg_call(n_local_group_key + partial_output_idx)
-                    })
-                    .collect(),
-                global_group_key.into_iter().collect(),
-                exchange,
-            ));
-            Ok(global_agg.into())
+                RequiredDist::single().streaming_enforce_if_not_satisfies(local_agg.into())?;
+            let must_output_per_barrier = need_row_merge;
+            let global_agg = new_stream_simple_agg(
+                Agg::new(
+                    core.agg_calls
+                        .iter()
+                        .enumerate()
+                        .map(|(partial_output_idx, agg_call)| {
+                            agg_call
+                                .partial_to_total_agg_call(n_local_group_key + partial_output_idx)
+                        })
+                        .collect(),
+                    global_group_key.into_iter().collect(),
+                    exchange,
+                ),
+                must_output_per_barrier,
+            )?;
+            global_agg.into()
         } else {
+            // the `RowMergeExec` has not supported keyed merge
+            assert!(!need_row_merge);
             let exchange = RequiredDist::shard_by_key(input_col_num, &global_group_key)
-                .enforce_if_not_satisfies(local_agg.into(), &Order::any())?;
+                .streaming_enforce_if_not_satisfies(local_agg.into())?;
             // Local phase should have reordered the group keys into their required order.
             // we can just follow it.
             let global_agg = new_stream_hash_agg(
                 Agg::new(
-                    self.agg_calls()
+                    core.agg_calls
                         .iter()
                         .enumerate()
                         .map(|(partial_output_idx, agg_call)| {
@@ -201,29 +210,33 @@ impl LogicalAgg {
                     exchange,
                 ),
                 None,
-            );
-            Ok(global_agg.into())
-        }
+            )?;
+            global_agg.into()
+        };
+        Self::add_row_merge_if_needed(
+            approx_percentile,
+            global_agg,
+            approx_percentile_col_mapping,
+            non_approx_percentile_col_mapping,
+        )
     }
 
-    fn gen_single_plan(&self, stream_input: PlanRef) -> Result<PlanRef> {
-        let mut core = self.core.clone();
-        let input = RequiredDist::single().enforce_if_not_satisfies(stream_input, &Order::any())?;
-        core.input = input;
-        Ok(new_stream_simple_agg(core).into())
+    fn gen_single_plan(&self, stream_input: StreamPlanRef) -> Result<StreamPlanRef> {
+        let input = RequiredDist::single().streaming_enforce_if_not_satisfies(stream_input)?;
+        let core = self.core.clone_with_input(input);
+        Ok(new_stream_simple_agg(core, false)?.into())
     }
 
-    fn gen_shuffle_plan(&self, stream_input: PlanRef) -> Result<PlanRef> {
+    fn gen_shuffle_plan(&self, stream_input: StreamPlanRef) -> Result<StreamPlanRef> {
         let input =
             RequiredDist::shard_by_key(stream_input.schema().len(), &self.group_key().to_vec())
-                .enforce_if_not_satisfies(stream_input, &Order::any())?;
-        let mut core = self.core.clone();
-        core.input = input;
-        Ok(new_stream_hash_agg(core, None).into())
+                .streaming_enforce_if_not_satisfies(stream_input)?;
+        let core = self.core.clone_with_input(input);
+        Ok(new_stream_hash_agg(core, None)?.into())
     }
 
     /// Generates distributed stream plan.
-    fn gen_dist_stream_agg_plan(&self, stream_input: PlanRef) -> Result<PlanRef> {
+    fn gen_dist_stream_agg_plan(&self, stream_input: StreamPlanRef) -> Result<StreamPlanRef> {
         use super::stream::prelude::*;
 
         let input_dist = stream_input.distribution();
@@ -270,7 +283,7 @@ impl LogicalAgg {
                     stream_input.schema().len(),
                     stream_input.expect_stream_key(),
                 )
-                .enforce_if_not_satisfies(stream_input, &Order::any())?
+                .streaming_enforce_if_not_satisfies(stream_input)?
             } else {
                 stream_input
             };
@@ -298,6 +311,89 @@ impl LogicalAgg {
         }
     }
 
+    /// Prepares metadata and the `approx_percentile` plan, if there's one present.
+    /// It may modify `core.agg_calls` to separate normal agg and approx percentile agg,
+    /// and `core.input` to share the input via `StreamShare`,
+    /// to both approx percentile agg and normal agg.
+    fn prepare_approx_percentile(
+        &self,
+        stream_input: StreamPlanRef,
+    ) -> Result<(
+        ColIndexMapping,
+        ColIndexMapping,
+        Option<StreamPlanRef>,
+        Agg<StreamPlanRef>,
+    )> {
+        let SeparatedAggInfo { normal, approx } = self.separate_normal_and_special_agg();
+
+        let AggInfo {
+            calls: non_approx_percentile_agg_calls,
+            col_mapping: non_approx_percentile_col_mapping,
+        } = normal;
+        let AggInfo {
+            calls: approx_percentile_agg_calls,
+            col_mapping: approx_percentile_col_mapping,
+        } = approx;
+        if !self.group_key().is_empty() && !approx_percentile_agg_calls.is_empty() {
+            bail_not_implemented!(
+                "two-phase streaming approx percentile aggregation with group key, \
+             please use single phase aggregation instead"
+            );
+        }
+
+        // Either we have approx percentile aggs and non_approx percentile aggs,
+        // or we have at least 2 approx percentile aggs.
+        let needs_row_merge = (!non_approx_percentile_agg_calls.is_empty()
+            && !approx_percentile_agg_calls.is_empty())
+            || approx_percentile_agg_calls.len() >= 2;
+        let input = if needs_row_merge {
+            // If there's row merge, we need to share the input.
+            StreamShare::new_from_input(stream_input.clone()).into()
+        } else {
+            stream_input
+        };
+        let mut core = self.core.clone_with_input(input);
+        core.agg_calls = non_approx_percentile_agg_calls;
+
+        let approx_percentile =
+            self.build_approx_percentile_aggs(core.input.clone(), &approx_percentile_agg_calls)?;
+        Ok((
+            non_approx_percentile_col_mapping,
+            approx_percentile_col_mapping,
+            approx_percentile,
+            core,
+        ))
+    }
+
+    fn need_row_merge(approx_percentile: &Option<StreamPlanRef>) -> bool {
+        approx_percentile.is_some()
+    }
+
+    /// Add `RowMerge` if needed
+    fn add_row_merge_if_needed(
+        approx_percentile: Option<StreamPlanRef>,
+        global_agg: StreamPlanRef,
+        approx_percentile_col_mapping: ColIndexMapping,
+        non_approx_percentile_col_mapping: ColIndexMapping,
+    ) -> Result<StreamPlanRef> {
+        // just for assert
+        let need_row_merge = Self::need_row_merge(&approx_percentile);
+
+        if let Some(approx_percentile) = approx_percentile {
+            assert!(need_row_merge);
+            let row_merge = StreamRowMerge::new(
+                approx_percentile,
+                global_agg,
+                approx_percentile_col_mapping,
+                non_approx_percentile_col_mapping,
+            )?;
+            Ok(row_merge.into())
+        } else {
+            assert!(!need_row_merge);
+            Ok(global_agg)
+        }
+    }
+
     fn separate_normal_and_special_agg(&self) -> SeparatedAggInfo {
         let estimated_len = self.agg_calls().len() - 1;
         let mut approx_percentile_agg_calls = Vec::with_capacity(estimated_len);
@@ -305,7 +401,7 @@ impl LogicalAgg {
         let mut approx_percentile_col_mapping = Vec::with_capacity(estimated_len);
         let mut non_approx_percentile_col_mapping = Vec::with_capacity(estimated_len);
         for (output_idx, agg_call) in self.agg_calls().iter().enumerate() {
-            if agg_call.agg_kind == AggKind::Builtin(PbAggKind::ApproxPercentile) {
+            if agg_call.agg_type == AggType::Builtin(PbAggKind::ApproxPercentile) {
                 approx_percentile_agg_calls.push(agg_call.clone());
                 approx_percentile_col_mapping.push(Some(output_idx));
             } else {
@@ -332,40 +428,39 @@ impl LogicalAgg {
 
     fn build_approx_percentile_agg(
         &self,
-        input: PlanRef,
+        input: StreamPlanRef,
         approx_percentile_agg_call: &PlanAggCall,
-    ) -> Result<PlanRef> {
+    ) -> Result<StreamPlanRef> {
         let local_approx_percentile =
-            StreamLocalApproxPercentile::new(input, approx_percentile_agg_call);
+            StreamLocalApproxPercentile::new(input, approx_percentile_agg_call)?;
         let exchange = RequiredDist::single()
-            .enforce_if_not_satisfies(local_approx_percentile.into(), &Order::any())?;
+            .streaming_enforce_if_not_satisfies(local_approx_percentile.into())?;
         let global_approx_percentile =
             StreamGlobalApproxPercentile::new(exchange, approx_percentile_agg_call);
         Ok(global_approx_percentile.into())
     }
 
     /// If only 1 approx percentile, just return it.
-    /// Otherwise build a tree of approx percentile with `KeyedMerge`.
+    /// Otherwise build a tree of approx percentile with `MergeProject`.
     /// e.g.
     /// ApproxPercentile(col1, 0.5) as x,
     /// ApproxPercentile(col2, 0.5) as y,
     /// ApproxPercentile(col3, 0.5) as z
     /// will be built as
-    ///        `KeyedMerge`
+    ///        `MergeProject`
     ///       /          \
-    ///  `KeyedMerge`       z
+    ///  `MergeProject`       z
     ///  /        \
     /// x          y
-
     fn build_approx_percentile_aggs(
         &self,
-        input: PlanRef,
+        input: StreamPlanRef,
         approx_percentile_agg_call: &[PlanAggCall],
-    ) -> Result<Option<PlanRef>> {
+    ) -> Result<Option<StreamPlanRef>> {
         if approx_percentile_agg_call.is_empty() {
             return Ok(None);
         }
-        let approx_percentile_plans: Vec<PlanRef> = approx_percentile_agg_call
+        let approx_percentile_plans: Vec<_> = approx_percentile_agg_call
             .iter()
             .map(|agg_call| self.build_approx_percentile_agg(input.clone(), agg_call))
             .try_collect()?;
@@ -374,14 +469,13 @@ impl LogicalAgg {
         let mut acc = iter.next().unwrap();
         for (current_size, plan) in iter.enumerate().map(|(i, p)| (i + 1, p)) {
             let new_size = current_size + 1;
-            let keyed_merge = StreamKeyedMerge::new(
+            let row_merge = StreamRowMerge::new(
                 acc,
                 plan,
                 ColIndexMapping::identity_or_none(current_size, new_size),
                 ColIndexMapping::new(vec![Some(current_size)], new_size),
-            )
-            .expect("failed to build keyed merge");
-            acc = keyed_merge.into();
+            )?;
+            acc = row_merge.into();
         }
         Ok(Some(acc))
     }
@@ -504,14 +598,13 @@ impl LogicalAggBuilder {
 
     /// check if the expression is a group by key, and try to return the group key
     pub fn try_as_group_expr(&self, expr: &ExprImpl) -> Option<usize> {
-        if let Some(input_index) = self.input_proj_builder.expr_index(expr) {
-            if let Some(index) = self
+        if let Some(input_index) = self.input_proj_builder.expr_index(expr)
+            && let Some(index) = self
                 .group_key
                 .indices()
                 .position(|group_key| group_key == input_index)
-            {
-                return Some(index);
-            }
+        {
+            return Some(index);
         }
         None
     }
@@ -526,9 +619,9 @@ impl LogicalAggBuilder {
         agg_call: AggCall,
         mut push_agg_call: impl FnMut(AggCall) -> Result<InputRef>,
     ) -> Result<ExprImpl> {
-        match agg_call.agg_kind {
+        match agg_call.agg_type {
             // Rewrite avg to cast(sum as avg_return_type) / count.
-            AggKind::Builtin(PbAggKind::Avg) => {
+            AggType::Builtin(PbAggKind::Avg) => {
                 assert_eq!(agg_call.args.len(), 1);
 
                 let sum = ExprImpl::from(push_agg_call(AggCall::new(
@@ -539,7 +632,7 @@ impl LogicalAggBuilder {
                     agg_call.filter.clone(),
                     agg_call.direct_args.clone(),
                 )?)?)
-                .cast_explicit(agg_call.return_type())?;
+                .cast_explicit(&agg_call.return_type())?;
 
                 let count = ExprImpl::from(push_agg_call(AggCall::new(
                     PbAggKind::Count.into(),
@@ -560,7 +653,7 @@ impl LogicalAggBuilder {
             // which is in a sense more general than the pow function, especially when calculating
             // covariances in the future. Also we don't have the sqrt function for rooting, so we
             // use pow(x, 0.5) to simulate
-            AggKind::Builtin(
+            AggType::Builtin(
                 kind @ (PbAggKind::StddevPop
                 | PbAggKind::StddevSamp
                 | PbAggKind::VarPop
@@ -580,7 +673,7 @@ impl LogicalAggBuilder {
                     agg_call.filter.clone(),
                     agg_call.direct_args.clone(),
                 )?)?)
-                .cast_explicit(agg_call.return_type())?;
+                .cast_explicit(&agg_call.return_type())?;
 
                 let sum = ExprImpl::from(push_agg_call(AggCall::new(
                     PbAggKind::Sum.into(),
@@ -590,7 +683,7 @@ impl LogicalAggBuilder {
                     agg_call.filter.clone(),
                     agg_call.direct_args.clone(),
                 )?)?)
-                .cast_explicit(agg_call.return_type())?;
+                .cast_explicit(&agg_call.return_type())?;
 
                 let count = ExprImpl::from(push_agg_call(AggCall::new(
                     PbAggKind::Count.into(),
@@ -601,17 +694,15 @@ impl LogicalAggBuilder {
                     agg_call.direct_args.clone(),
                 )?)?);
 
-                let one = ExprImpl::from(Literal::new(
-                    Datum::from(ScalarImpl::Int64(1)),
-                    DataType::Int64,
-                ));
+                let zero = ExprImpl::literal_int(0);
+                let one = ExprImpl::literal_int(1);
 
                 let squared_sum = ExprImpl::from(FunctionCall::new(
                     ExprType::Multiply,
                     vec![sum.clone(), sum],
                 )?);
 
-                let numerator = ExprImpl::from(FunctionCall::new(
+                let raw_numerator = ExprImpl::from(FunctionCall::new(
                     ExprType::Subtract,
                     vec![
                         sum_of_sq,
@@ -620,6 +711,13 @@ impl LogicalAggBuilder {
                             vec![squared_sum, count.clone()],
                         )?),
                     ],
+                )?);
+
+                // We need to check for potential accuracy issues that may occasionally lead to results less than 0.
+                let numerator_type = raw_numerator.return_type();
+                let numerator = ExprImpl::from(FunctionCall::new(
+                    ExprType::Greatest,
+                    vec![raw_numerator, zero.clone().cast_explicit(&numerator_type)?],
                 )?);
 
                 let denominator = match kind {
@@ -639,24 +737,23 @@ impl LogicalAggBuilder {
                     target = ExprImpl::from(FunctionCall::new(ExprType::Sqrt, vec![target])?);
                 }
 
-                match kind {
-                    PbAggKind::VarPop | PbAggKind::StddevPop => Ok(target),
-                    PbAggKind::StddevSamp | PbAggKind::VarSamp => {
-                        let case_cond = ExprImpl::from(FunctionCall::new(
-                            ExprType::LessThanOrEqual,
-                            vec![count, one],
-                        )?);
-                        let null = ExprImpl::from(Literal::new(None, agg_call.return_type()));
-
-                        Ok(ExprImpl::from(FunctionCall::new(
-                            ExprType::Case,
-                            vec![case_cond, null, target],
-                        )?))
+                let null = ExprImpl::from(Literal::new(None, agg_call.return_type()));
+                let case_cond = match kind {
+                    PbAggKind::VarPop | PbAggKind::StddevPop => {
+                        ExprImpl::from(FunctionCall::new(ExprType::Equal, vec![count, zero])?)
                     }
+                    PbAggKind::VarSamp | PbAggKind::StddevSamp => ExprImpl::from(
+                        FunctionCall::new(ExprType::LessThanOrEqual, vec![count, one])?,
+                    ),
                     _ => unreachable!(),
-                }
+                };
+
+                Ok(ExprImpl::from(FunctionCall::new(
+                    ExprType::Case,
+                    vec![case_cond, null, target],
+                )?))
             }
-            AggKind::Builtin(PbAggKind::ApproxPercentile) => {
+            AggType::Builtin(PbAggKind::ApproxPercentile) => {
                 if agg_call.order_by.sort_exprs[0].order_type == OrderType::descending() {
                     // Rewrite DESC into 1.0-percentile for approx_percentile.
                     let prev_percentile = agg_call.direct_args[0].clone();
@@ -694,7 +791,7 @@ impl LogicalAggBuilder {
     /// For existing agg calls, return an `InputRef` to the existing one.
     fn push_agg_call(&mut self, agg_call: AggCall) -> Result<InputRef> {
         let AggCall {
-            agg_kind,
+            agg_type,
             return_type,
             args,
             distinct,
@@ -731,7 +828,7 @@ impl LogicalAggBuilder {
             })?;
 
         let plan_agg_call = PlanAggCall {
-            agg_kind,
+            agg_type,
             return_type: return_type.clone(),
             inputs: args,
             distinct,
@@ -762,32 +859,32 @@ impl LogicalAggBuilder {
     ///
     /// Note that the rewriter does not traverse into inputs of agg calls.
     fn try_rewrite_agg_call(&mut self, mut agg_call: AggCall) -> Result<ExprImpl> {
-        if matches!(agg_call.agg_kind, agg_kinds::must_have_order_by!())
+        if matches!(agg_call.agg_type, agg_types::must_have_order_by!())
             && agg_call.order_by.sort_exprs.is_empty()
         {
             return Err(ErrorCode::InvalidInputSyntax(format!(
                 "Aggregation function {} requires ORDER BY clause",
-                agg_call.agg_kind
+                agg_call.agg_type
             ))
             .into());
         }
 
         // try ignore ORDER BY if it doesn't affect the result
         if matches!(
-            agg_call.agg_kind,
-            agg_kinds::result_unaffected_by_order_by!()
+            agg_call.agg_type,
+            agg_types::result_unaffected_by_order_by!()
         ) {
             agg_call.order_by = OrderBy::any();
         }
         // try ignore DISTINCT if it doesn't affect the result
         if matches!(
-            agg_call.agg_kind,
-            agg_kinds::result_unaffected_by_distinct!()
+            agg_call.agg_type,
+            agg_types::result_unaffected_by_distinct!()
         ) {
             agg_call.distinct = false;
         }
 
-        if matches!(agg_call.agg_kind, AggKind::Builtin(PbAggKind::Grouping)) {
+        if matches!(agg_call.agg_type, AggType::Builtin(PbAggKind::Grouping)) {
             if self.grouping_sets.is_empty() {
                 return Err(ErrorCode::NotSupported(
                     "GROUPING must be used in a query with grouping sets".into(),
@@ -896,7 +993,7 @@ impl ExprRewriter for LogicalAggBuilder {
     }
 
     fn rewrite_subquery(&mut self, subquery: crate::expr::Subquery) -> ExprImpl {
-        if subquery.is_correlated(0) {
+        if subquery.is_correlated_by_depth(0) {
             self.error = Some(
                 not_implemented!(
                     issue = 2275,
@@ -1034,7 +1131,7 @@ impl LogicalAgg {
     }
 }
 
-impl PlanTreeNodeUnary for LogicalAgg {
+impl PlanTreeNodeUnary<Logical> for LogicalAgg {
     fn input(&self) -> PlanRef {
         self.core.input.clone()
     }
@@ -1046,7 +1143,6 @@ impl PlanTreeNodeUnary for LogicalAgg {
             .into()
     }
 
-    #[must_use]
     fn rewrite_with_input(
         &self,
         input: PlanRef,
@@ -1056,10 +1152,10 @@ impl PlanTreeNodeUnary for LogicalAgg {
     }
 }
 
-impl_plan_tree_node_for_unary! {LogicalAgg}
+impl_plan_tree_node_for_unary! { Logical, LogicalAgg }
 impl_distill_by_unit!(LogicalAgg, core, "LogicalAgg");
 
-impl ExprRewritable for LogicalAgg {
+impl ExprRewritable<Logical> for LogicalAgg {
     fn has_rewritable_expr(&self) -> bool {
         true
     }
@@ -1201,18 +1297,18 @@ impl PredicatePushdown for LogicalAgg {
 }
 
 impl ToBatch for LogicalAgg {
-    fn to_batch(&self) -> Result<PlanRef> {
+    fn to_batch(&self) -> Result<crate::optimizer::plan_node::BatchPlanRef> {
         self.to_batch_with_order_required(&Order::any())
     }
 
     // TODO(rc): `to_batch_with_order_required` seems to be useless after we decide to use
     // `BatchSortAgg` only when input is already sorted
-    fn to_batch_with_order_required(&self, required_order: &Order) -> Result<PlanRef> {
+    fn to_batch_with_order_required(
+        &self,
+        required_order: &Order,
+    ) -> Result<crate::optimizer::plan_node::BatchPlanRef> {
         let input = self.input().to_batch()?;
-        let new_logical = Agg {
-            input,
-            ..self.core.clone()
-        };
+        let new_logical = self.core.clone_with_input(input);
         let agg_plan = if self.group_key().is_empty() {
             BatchSimpleAgg::new(new_logical).into()
         } else if self.ctx().session_ctx().config().batch_enable_sort_agg()
@@ -1226,7 +1322,7 @@ impl ToBatch for LogicalAgg {
     }
 }
 
-fn find_or_append_row_count(mut logical: Agg<PlanRef>) -> (Agg<PlanRef>, usize) {
+fn find_or_append_row_count(mut logical: Agg<StreamPlanRef>) -> (Agg<StreamPlanRef>, usize) {
     // `HashAgg`/`SimpleAgg` executors require a `count(*)` to correctly build changes, so
     // append a `count(*)` if not exists.
     let count_star = PlanAggCall::count_star();
@@ -1244,30 +1340,37 @@ fn find_or_append_row_count(mut logical: Agg<PlanRef>) -> (Agg<PlanRef>, usize) 
     (logical, row_count_idx)
 }
 
-fn new_stream_simple_agg(core: Agg<PlanRef>) -> StreamSimpleAgg {
+fn new_stream_simple_agg(
+    core: Agg<StreamPlanRef>,
+    must_output_per_barrier: bool,
+) -> Result<StreamSimpleAgg> {
     let (logical, row_count_idx) = find_or_append_row_count(core);
-    StreamSimpleAgg::new(logical, row_count_idx)
+    StreamSimpleAgg::new(logical, row_count_idx, must_output_per_barrier)
 }
 
-fn new_stream_hash_agg(core: Agg<PlanRef>, vnode_col_idx: Option<usize>) -> StreamHashAgg {
+fn new_stream_hash_agg(
+    core: Agg<StreamPlanRef>,
+    vnode_col_idx: Option<usize>,
+) -> Result<StreamHashAgg> {
     let (logical, row_count_idx) = find_or_append_row_count(core);
     StreamHashAgg::new(logical, vnode_col_idx, row_count_idx)
 }
 
 impl ToStream for LogicalAgg {
-    fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<PlanRef> {
+    fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<StreamPlanRef> {
         use super::stream::prelude::*;
 
         for agg_call in self.agg_calls() {
-            if matches!(agg_call.agg_kind, agg_kinds::unimplemented_in_stream!()) {
-                bail_not_implemented!("{} aggregation in materialized view", agg_call.agg_kind);
+            if matches!(agg_call.agg_type, agg_types::unimplemented_in_stream!()) {
+                bail_not_implemented!("{} aggregation in materialized view", agg_call.agg_type);
             }
         }
         let eowc = ctx.emit_on_window_close();
         let stream_input = self.input().to_stream(ctx)?;
 
         // Use Dedup operator, if possible.
-        if stream_input.append_only() && self.agg_calls().is_empty() {
+        if stream_input.append_only() && self.agg_calls().is_empty() && !self.group_key().is_empty()
+        {
             let input = if self.group_key().len() != self.input().schema().len() {
                 let cols = &self.group_key().to_vec();
                 LogicalProject::with_mapping(
@@ -1283,13 +1386,30 @@ impl ToStream for LogicalAgg {
             return logical_dedup.to_stream(ctx);
         }
 
+        if self.agg_calls().iter().any(|call| {
+            matches!(
+                call.agg_type,
+                AggType::Builtin(PbAggKind::ApproxCountDistinct)
+            )
+        }) {
+            if stream_input.append_only() {
+                self.core.ctx().session_ctx().notice_to_user(
+                    "Streaming `APPROX_COUNT_DISTINCT` is still a preview feature and subject to change. Please do not use it in production environment.",
+                );
+            } else {
+                bail_not_implemented!(
+                    "Streaming `APPROX_COUNT_DISTINCT` is only supported in append-only stream"
+                );
+            }
+        }
+
         let plan = self.gen_dist_stream_agg_plan(stream_input)?;
 
         let (plan, n_final_agg_calls) = if let Some(final_agg) = plan.as_stream_simple_agg() {
             if eowc {
                 return Err(ErrorCode::InvalidInputSyntax(
                     "`EMIT ON WINDOW CLOSE` cannot be used for aggregation without `GROUP BY`"
-                        .to_string(),
+                        .to_owned(),
                 )
                 .into());
             }
@@ -1307,22 +1427,24 @@ impl ToStream for LogicalAgg {
             if eowc {
                 return Err(ErrorCode::InvalidInputSyntax(
                     "`EMIT ON WINDOW CLOSE` cannot be used for aggregation without `GROUP BY`"
-                        .to_string(),
+                        .to_owned(),
                 )
                 .into());
             }
             (plan.clone(), 1)
-        } else if let Some(stream_keyed_merge) = plan.as_stream_keyed_merge() {
+        } else if let Some(stream_row_merge) = plan.as_stream_row_merge() {
             if eowc {
                 return Err(ErrorCode::InvalidInputSyntax(
                     "`EMIT ON WINDOW CLOSE` cannot be used for aggregation without `GROUP BY`"
-                        .to_string(),
+                        .to_owned(),
                 )
                 .into());
             }
-            (plan.clone(), stream_keyed_merge.base.schema().len())
+            (plan.clone(), stream_row_merge.base.schema().len())
         } else {
-            panic!("the root PlanNode must be StreamHashAgg, StreamSimpleAgg, StreamGlobalApproxPercentile, or StreamKeyedMerge");
+            panic!(
+                "the root PlanNode must be StreamHashAgg, StreamSimpleAgg, StreamGlobalApproxPercentile, or StreamRowMerge"
+            );
         };
 
         if self.agg_calls().len() == n_final_agg_calls {
@@ -1433,7 +1555,7 @@ mod tests {
             assert_eq_input_ref!(&exprs[1], 1);
 
             assert_eq!(agg_calls.len(), 1);
-            assert_eq!(agg_calls[0].agg_kind, PbAggKind::Min.into());
+            assert_eq!(agg_calls[0].agg_type, PbAggKind::Min.into());
             assert_eq!(input_ref_to_column_indices(&agg_calls[0].inputs), vec![1]);
             assert_eq!(group_key, vec![0].into());
         }
@@ -1476,9 +1598,9 @@ mod tests {
             }
 
             assert_eq!(agg_calls.len(), 2);
-            assert_eq!(agg_calls[0].agg_kind, PbAggKind::Min.into());
+            assert_eq!(agg_calls[0].agg_type, PbAggKind::Min.into());
             assert_eq!(input_ref_to_column_indices(&agg_calls[0].inputs), vec![1]);
-            assert_eq!(agg_calls[1].agg_kind, PbAggKind::Max.into());
+            assert_eq!(agg_calls[1].agg_type, PbAggKind::Max.into());
             assert_eq!(input_ref_to_column_indices(&agg_calls[1].inputs), vec![2]);
             assert_eq!(group_key, vec![0].into());
         }
@@ -1508,7 +1630,7 @@ mod tests {
             assert_eq_input_ref!(&exprs[1], 1);
 
             assert_eq!(agg_calls.len(), 1);
-            assert_eq!(agg_calls[0].agg_kind, PbAggKind::Min.into());
+            assert_eq!(agg_calls[0].agg_type, PbAggKind::Min.into());
             assert_eq!(input_ref_to_column_indices(&agg_calls[0].inputs), vec![1]);
             assert_eq!(group_key, vec![0].into());
         }
@@ -1525,7 +1647,7 @@ mod tests {
 
         let values = LogicalValues::new(vec![], Schema { fields }, ctx);
         let agg_call = PlanAggCall {
-            agg_kind: PbAggKind::Min.into(),
+            agg_type: PbAggKind::Min.into(),
             return_type: ty.clone(),
             inputs: vec![InputRef::new(2, ty.clone())],
             distinct: false,
@@ -1565,7 +1687,7 @@ mod tests {
 
         assert_eq!(agg_new.agg_calls().len(), 1);
         let agg_call_new = agg_new.agg_calls()[0].clone();
-        assert_eq!(agg_call_new.agg_kind, PbAggKind::Min.into());
+        assert_eq!(agg_call_new.agg_type, PbAggKind::Min.into());
         assert_eq!(input_ref_to_column_indices(&agg_call_new.inputs), vec![1]);
         assert_eq!(agg_call_new.return_type, ty);
 
@@ -1608,7 +1730,7 @@ mod tests {
 
         assert_eq!(agg_new.agg_calls().len(), 1);
         let agg_call_new = agg_new.agg_calls()[0].clone();
-        assert_eq!(agg_call_new.agg_kind, PbAggKind::Min.into());
+        assert_eq!(agg_call_new.agg_type, PbAggKind::Min.into());
         assert_eq!(input_ref_to_column_indices(&agg_call_new.inputs), vec![1]);
         assert_eq!(agg_call_new.return_type, ty);
 
@@ -1645,7 +1767,7 @@ mod tests {
             ctx,
         );
         let agg_call = PlanAggCall {
-            agg_kind: PbAggKind::Min.into(),
+            agg_type: PbAggKind::Min.into(),
             return_type: ty.clone(),
             inputs: vec![InputRef::new(2, ty.clone())],
             distinct: false,
@@ -1670,7 +1792,7 @@ mod tests {
 
         assert_eq!(agg_new.agg_calls().len(), 1);
         let agg_call_new = agg_new.agg_calls()[0].clone();
-        assert_eq!(agg_call_new.agg_kind, PbAggKind::Min.into());
+        assert_eq!(agg_call_new.agg_type, PbAggKind::Min.into());
         assert_eq!(input_ref_to_column_indices(&agg_call_new.inputs), vec![1]);
         assert_eq!(agg_call_new.return_type, ty);
 
@@ -1709,7 +1831,7 @@ mod tests {
 
         let agg_calls = vec![
             PlanAggCall {
-                agg_kind: PbAggKind::Min.into(),
+                agg_type: PbAggKind::Min.into(),
                 return_type: ty.clone(),
                 inputs: vec![InputRef::new(2, ty.clone())],
                 distinct: false,
@@ -1718,7 +1840,7 @@ mod tests {
                 direct_args: vec![],
             },
             PlanAggCall {
-                agg_kind: PbAggKind::Max.into(),
+                agg_type: PbAggKind::Max.into(),
                 return_type: ty.clone(),
                 inputs: vec![InputRef::new(1, ty.clone())],
                 distinct: false,
@@ -1744,7 +1866,7 @@ mod tests {
 
         assert_eq!(agg_new.agg_calls().len(), 1);
         let agg_call_new = agg_new.agg_calls()[0].clone();
-        assert_eq!(agg_call_new.agg_kind, PbAggKind::Max.into());
+        assert_eq!(agg_call_new.agg_type, PbAggKind::Max.into());
         assert_eq!(input_ref_to_column_indices(&agg_call_new.inputs), vec![0]);
         assert_eq!(agg_call_new.return_type, ty);
 

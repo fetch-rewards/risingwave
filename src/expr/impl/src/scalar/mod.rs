@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod ai_model;
 mod arithmetic_op;
 mod array;
 mod array_access;
 mod array_concat;
 mod array_contain;
 mod array_distinct;
+mod array_flatten;
 mod array_length;
 mod array_min_max;
 mod array_positions;
@@ -39,6 +41,7 @@ mod concat;
 mod concat_op;
 mod concat_ws;
 mod conjunction;
+mod date_bin;
 mod date_trunc;
 mod delay;
 mod encdec;
@@ -47,6 +50,7 @@ mod extract;
 mod field;
 mod format;
 mod format_type;
+mod hmac;
 mod in_;
 mod int256;
 mod jsonb_access;
@@ -62,10 +66,12 @@ mod jsonb_set;
 mod length;
 mod lower;
 mod make_time;
+mod map_filter;
 mod md5;
 mod overlay;
 mod position;
 mod proctime;
+mod random;
 pub mod regexp;
 mod repeat;
 mod replace;
@@ -77,6 +83,7 @@ mod string;
 mod string_to_array;
 mod substr;
 mod timestamptz;
+pub use timestamptz::{time_zone_err, timestamptz_interval_add_internal};
 mod to_char;
 mod to_jsonb;
 mod vnode;
@@ -84,7 +91,7 @@ pub use to_jsonb::*;
 mod encrypt;
 mod external;
 mod inet;
-mod test_license;
+mod license;
 mod to_timestamp;
 mod translate;
 mod trigonometric;
@@ -92,3 +99,4 @@ mod trim;
 mod trim_array;
 mod tumble;
 mod upper;
+mod vector;

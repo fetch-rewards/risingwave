@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,23 +20,22 @@ use std::sync::{Arc, LazyLock};
 
 use await_tree::InstrumentAwait;
 use bytes::Bytes;
-use foyer::CacheContext;
-use futures::future::{try_join, try_join_all};
-use futures::{stream, FutureExt, StreamExt, TryFutureExt};
+use foyer::Hint;
+use futures::future::try_join;
+use futures::{FutureExt, StreamExt, stream};
 use itertools::Itertools;
 use risingwave_common::catalog::TableId;
-use risingwave_hummock_sdk::compaction_group::StaticCompactionGroupId;
-use risingwave_hummock_sdk::key::{FullKey, FullKeyTracker, UserKey, EPOCH_LEN};
+use risingwave_hummock_sdk::key::{EPOCH_LEN, FullKey, FullKeyTracker, UserKey};
 use risingwave_hummock_sdk::key_range::KeyRange;
-use risingwave_hummock_sdk::{CompactionGroupId, EpochWithGap, LocalSstableInfo};
+use risingwave_hummock_sdk::{EpochWithGap, LocalSstableInfo};
 use risingwave_pb::hummock::compact_task;
 use thiserror_ext::AsReport;
 use tracing::{error, warn};
 
-use crate::filter_key_extractor::{FilterKeyExtractorImpl, FilterKeyExtractorManager};
+use crate::compaction_catalog_manager::{CompactionCatalogAgentRef, CompactionCatalogManagerRef};
 use crate::hummock::compactor::compaction_filter::DummyCompactionFilter;
-use crate::hummock::compactor::context::{await_tree_key, CompactorContext};
-use crate::hummock::compactor::{check_flush_result, CompactOutput, Compactor};
+use crate::hummock::compactor::context::{CompactorContext, await_tree_key};
+use crate::hummock::compactor::{CompactOutput, Compactor, check_flush_result};
 use crate::hummock::event_handler::uploader::UploadTaskOutput;
 use crate::hummock::iterator::{Forward, HummockIterator, MergeIterator, UserIterator};
 use crate::hummock::shared_buffer::shared_buffer_batch::{
@@ -46,59 +45,68 @@ use crate::hummock::shared_buffer::shared_buffer_batch::{
 use crate::hummock::utils::MemoryTracker;
 use crate::hummock::{
     BlockedXor16FilterBuilder, CachePolicy, GetObjectId, HummockError, HummockResult,
-    SstableBuilderOptions, SstableObjectIdManagerRef,
+    ObjectIdManagerRef, SstableBuilderOptions,
 };
 use crate::mem_table::ImmutableMemtable;
 use crate::opts::StorageOpts;
 
 const GC_DELETE_KEYS_FOR_FLUSH: bool = false;
-const GC_WATERMARK_FOR_FLUSH: u64 = 0;
 
 /// Flush shared buffer to level0. Resulted SSTs are grouped by compaction group.
 pub async fn compact(
     context: CompactorContext,
-    sstable_object_id_manager: SstableObjectIdManagerRef,
+    object_id_manager: ObjectIdManagerRef,
     payload: Vec<ImmutableMemtable>,
-    compaction_group_index: Arc<HashMap<TableId, CompactionGroupId>>,
-    filter_key_extractor_manager: FilterKeyExtractorManager,
+    compaction_catalog_manager_ref: CompactionCatalogManagerRef,
 ) -> HummockResult<UploadTaskOutput> {
-    let mut grouped_payload: HashMap<CompactionGroupId, Vec<ImmutableMemtable>> = HashMap::new();
-    for imm in &payload {
-        let compaction_group_id = match compaction_group_index.get(&imm.table_id) {
-            // compaction group id is used only as a hint for grouping different data.
-            // If the compaction group id is not found for the table id, we can assign a
-            // default compaction group id for the batch.
-            //
-            // On meta side, when we commit a new epoch, it is acceptable that the
-            // compaction group id provided from CN does not match the latest compaction
-            // group config.
-            None => StaticCompactionGroupId::StateDefault as CompactionGroupId,
-            Some(group_id) => *group_id,
-        };
-        grouped_payload
-            .entry(compaction_group_id)
-            .or_default()
-            .push(imm.clone());
+    let table_ids_with_old_value: HashSet<TableId> = payload
+        .iter()
+        .filter(|imm| imm.has_old_value())
+        .map(|imm| imm.table_id)
+        .collect();
+    let mut non_log_store_new_value_payload = Vec::with_capacity(payload.len());
+    let mut log_store_new_value_payload = Vec::with_capacity(payload.len());
+    let mut old_value_payload = Vec::with_capacity(payload.len());
+    for imm in payload {
+        if table_ids_with_old_value.contains(&imm.table_id) {
+            if imm.has_old_value() {
+                old_value_payload.push(imm.clone());
+            }
+            log_store_new_value_payload.push(imm);
+        } else {
+            assert!(!imm.has_old_value());
+            non_log_store_new_value_payload.push(imm);
+        }
     }
-
-    let mut new_value_futures = vec![];
-    for (id, group_payload) in grouped_payload {
-        new_value_futures.push(
+    let non_log_store_new_value_future = async {
+        if non_log_store_new_value_payload.is_empty() {
+            Ok(vec![])
+        } else {
             compact_shared_buffer::<true>(
                 context.clone(),
-                sstable_object_id_manager.clone(),
-                filter_key_extractor_manager.clone(),
-                group_payload,
+                object_id_manager.clone(),
+                compaction_catalog_manager_ref.clone(),
+                non_log_store_new_value_payload,
             )
-            .map_ok(move |results| results.into_iter())
-            .instrument_await(format!("shared_buffer_compact_compaction_group {}", id)),
-        );
-    }
+            .instrument_await("shared_buffer_compact_non_log_store_new_value")
+            .await
+        }
+    };
 
-    let old_value_payload = payload
-        .into_iter()
-        .filter(|imm| imm.has_old_value())
-        .collect_vec();
+    let log_store_new_value_future = async {
+        if log_store_new_value_payload.is_empty() {
+            Ok(vec![])
+        } else {
+            compact_shared_buffer::<true>(
+                context.clone(),
+                object_id_manager.clone(),
+                compaction_catalog_manager_ref.clone(),
+                log_store_new_value_payload,
+            )
+            .instrument_await("shared_buffer_compact_log_store_new_value")
+            .await
+        }
+    };
 
     let old_value_future = async {
         if old_value_payload.is_empty() {
@@ -106,19 +114,25 @@ pub async fn compact(
         } else {
             compact_shared_buffer::<false>(
                 context.clone(),
-                sstable_object_id_manager,
-                filter_key_extractor_manager,
+                object_id_manager.clone(),
+                compaction_catalog_manager_ref.clone(),
                 old_value_payload,
             )
+            .instrument_await("shared_buffer_compact_log_store_old_value")
             .await
         }
     };
 
     // Note that the output is reordered compared with input `payload`.
-    let (grouped_new_value_ssts, old_value_ssts) =
-        try_join(try_join_all(new_value_futures), old_value_future).await?;
+    let ((non_log_store_new_value_ssts, log_store_new_value_ssts), old_value_ssts) = try_join(
+        try_join(non_log_store_new_value_future, log_store_new_value_future),
+        old_value_future,
+    )
+    .await?;
 
-    let new_value_ssts = grouped_new_value_ssts.into_iter().flatten().collect_vec();
+    let mut new_value_ssts = non_log_store_new_value_ssts;
+    new_value_ssts.extend(log_store_new_value_ssts);
+
     Ok(UploadTaskOutput {
         new_value_ssts,
         old_value_ssts,
@@ -132,30 +146,27 @@ pub async fn compact(
 /// When `IS_NEW_VALUE` is false, we are compacting with old value, and the payload imms should have `old_values` not `None`
 async fn compact_shared_buffer<const IS_NEW_VALUE: bool>(
     context: CompactorContext,
-    sstable_object_id_manager: SstableObjectIdManagerRef,
-    filter_key_extractor_manager: FilterKeyExtractorManager,
+    object_id_manager: ObjectIdManagerRef,
+    compaction_catalog_manager_ref: CompactionCatalogManagerRef,
     mut payload: Vec<ImmutableMemtable>,
 ) -> HummockResult<Vec<LocalSstableInfo>> {
     if !IS_NEW_VALUE {
         assert!(payload.iter().all(|imm| imm.has_old_value()));
     }
     // Local memory compaction looks at all key ranges.
-
-    let mut existing_table_ids: HashSet<u32> = payload
+    let existing_table_ids: HashSet<u32> = payload
         .iter()
         .map(|imm| imm.table_id.table_id)
         .dedup()
         .collect();
     assert!(!existing_table_ids.is_empty());
 
-    let multi_filter_key_extractor = filter_key_extractor_manager
-        .acquire(existing_table_ids.clone())
+    let compaction_catalog_agent_ref = compaction_catalog_manager_ref
+        .acquire(existing_table_ids.iter().copied().collect())
         .await?;
-    if let FilterKeyExtractorImpl::Multi(multi) = &multi_filter_key_extractor {
-        existing_table_ids = multi.get_existing_table_ids();
-    }
-    let multi_filter_key_extractor = Arc::new(multi_filter_key_extractor);
-
+    let existing_table_ids = compaction_catalog_agent_ref
+        .table_ids()
+        .collect::<HashSet<_>>();
     payload.retain(|imm| {
         let ret = existing_table_ids.contains(&imm.table_id.table_id);
         if !ret {
@@ -184,14 +195,14 @@ async fn compact_shared_buffer<const IS_NEW_VALUE: bool>(
             sub_compaction_sstable_size as usize,
             table_vnode_partition.clone(),
             use_block_based_filter,
-            Box::new(sstable_object_id_manager.clone()),
+            object_id_manager.clone(),
         );
         let mut forward_iters = Vec::with_capacity(payload.len());
         for imm in &payload {
             forward_iters.push(imm.clone().into_directed_iter::<Forward, IS_NEW_VALUE>());
         }
         let compaction_executor = context.compaction_executor.clone();
-        let multi_filter_key_extractor = multi_filter_key_extractor.clone();
+        let compaction_catalog_agent_ref = compaction_catalog_agent_ref.clone();
         let handle = compaction_executor.spawn({
             static NEXT_SHARED_BUFFER_COMPACT_ID: LazyLock<AtomicUsize> =
                 LazyLock::new(|| AtomicUsize::new(0));
@@ -211,7 +222,7 @@ async fn compact_shared_buffer<const IS_NEW_VALUE: bool>(
             });
             let future = compactor.run(
                 MergeIterator::new(forward_iters),
-                multi_filter_key_extractor,
+                compaction_catalog_agent_ref,
             );
             if let Some(root) = tree_root {
                 root.instrument(future).left_future()
@@ -259,6 +270,7 @@ async fn compact_shared_buffer<const IS_NEW_VALUE: bool>(
                     .compactor_metrics
                     .write_build_l0_bytes
                     .inc_by(sst_info.file_size());
+
                 sst_infos.push(sst_info.sst_info.clone());
             }
             level0.extend(ssts);
@@ -543,7 +555,7 @@ impl SharedBufferCompactRunner {
         sub_compaction_sstable_size: usize,
         table_vnode_partition: BTreeMap<u32, u32>,
         use_block_based_filter: bool,
-        object_id_getter: Box<dyn GetObjectId>,
+        object_id_getter: Arc<dyn GetObjectId>,
     ) -> Self {
         let mut options: SstableBuilderOptions = context.storage_opts.as_ref().into();
         options.capacity = sub_compaction_sstable_size;
@@ -552,12 +564,11 @@ impl SharedBufferCompactRunner {
             options,
             super::TaskConfig {
                 key_range,
-                cache_policy: CachePolicy::Fill(CacheContext::Default),
+                cache_policy: CachePolicy::Fill(Hint::Normal),
                 gc_delete_keys: GC_DELETE_KEYS_FOR_FLUSH,
-                watermark: GC_WATERMARK_FOR_FLUSH,
+                retain_multiple_version: true,
                 stats_target_table_ids: None,
                 task_type: compact_task::TaskType::SharedBuffer,
-                is_target_l0_or_lbase: true,
                 table_vnode_partition,
                 use_block_based_filter,
                 table_schemas: Default::default(),
@@ -574,7 +585,7 @@ impl SharedBufferCompactRunner {
     pub async fn run(
         self,
         iter: impl HummockIterator<Direction = Forward>,
-        filter_key_extractor: Arc<FilterKeyExtractorImpl>,
+        compaction_catalog_agent_ref: CompactionCatalogAgentRef,
     ) -> HummockResult<CompactOutput> {
         let dummy_compaction_filter = DummyCompactionFilter {};
         let (ssts, table_stats_map) = self
@@ -582,7 +593,7 @@ impl SharedBufferCompactRunner {
             .compact_key_range(
                 iter,
                 dummy_compaction_filter,
-                filter_key_extractor,
+                compaction_catalog_agent_ref,
                 None,
                 None,
                 None,
@@ -600,7 +611,7 @@ mod tests {
     use risingwave_common::catalog::TableId;
     use risingwave_common::hash::VirtualNode;
     use risingwave_common::util::epoch::test_epoch;
-    use risingwave_hummock_sdk::key::{prefix_slice_with_vnode, TableKey};
+    use risingwave_hummock_sdk::key::{TableKey, prefix_slice_with_vnode};
 
     use crate::hummock::compactor::shared_buffer_compact::generate_splits;
     use crate::hummock::shared_buffer::shared_buffer_batch::SharedBufferValue;

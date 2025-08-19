@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,18 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::str::FromStr;
-
-use risingwave_common::catalog::{TableId, UserId, OBJECT_ID_PLACEHOLDER};
-use risingwave_common::types::Interval;
+use risingwave_common::catalog::{OBJECT_ID_PLACEHOLDER, TableId, UserId};
 use risingwave_common::util::epoch::Epoch;
-use risingwave_pb::catalog::subscription::PbSubscriptionState;
 use risingwave_pb::catalog::PbSubscription;
-use thiserror_ext::AsReport;
+use risingwave_pb::catalog::subscription::PbSubscriptionState;
 
 use super::OwnedByUserCatalog;
-use crate::error::{ErrorCode, Result};
 use crate::WithOptions;
+use crate::error::{ErrorCode, Result};
+use crate::handler::util::convert_interval_to_u64_seconds;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(test, derive(Default))]
@@ -57,6 +54,15 @@ pub struct SubscriptionCatalog {
 
     pub created_at_cluster_version: Option<String>,
     pub initialized_at_cluster_version: Option<String>,
+
+    pub subscription_state: SubscriptionState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub enum SubscriptionState {
+    #[default]
+    Init,
+    Created,
 }
 
 #[derive(Clone, Copy, Debug, Default, Hash, PartialOrd, PartialEq, Eq, Ord)]
@@ -84,17 +90,9 @@ impl SubscriptionId {
 impl SubscriptionCatalog {
     pub fn set_retention_seconds(&mut self, properties: &WithOptions) -> Result<()> {
         let retention_seconds_str = properties.get("retention").ok_or_else(|| {
-            ErrorCode::InternalError("Subscription retention time not set.".to_string())
+            ErrorCode::InternalError("Subscription retention time not set.".to_owned())
         })?;
-        let retention_seconds = (Interval::from_str(retention_seconds_str)
-            .map_err(|err| {
-                ErrorCode::InternalError(format!(
-                    "Retention needs to be set in Interval format: {:?}",
-                    err.to_report_string()
-                ))
-            })?
-            .epoch_in_micros()
-            / 1000000) as u64;
+        let retention_seconds = convert_interval_to_u64_seconds(retention_seconds_str)?;
         self.retention_seconds = retention_seconds;
         Ok(())
     }
@@ -117,7 +115,10 @@ impl SubscriptionCatalog {
             initialized_at_cluster_version: self.initialized_at_cluster_version.clone(),
             created_at_cluster_version: self.created_at_cluster_version.clone(),
             dependent_table_id: self.dependent_table_id.table_id,
-            subscription_state: PbSubscriptionState::Init.into(),
+            subscription_state: match self.subscription_state {
+                SubscriptionState::Init => PbSubscriptionState::Init.into(),
+                SubscriptionState::Created => PbSubscriptionState::Created.into(),
+            },
         }
     }
 }
@@ -137,6 +138,13 @@ impl From<&PbSubscription> for SubscriptionCatalog {
             initialized_at_epoch: prost.initialized_at_epoch.map(Epoch::from),
             created_at_cluster_version: prost.created_at_cluster_version.clone(),
             initialized_at_cluster_version: prost.initialized_at_cluster_version.clone(),
+            subscription_state: match PbSubscriptionState::try_from(prost.subscription_state)
+                .unwrap()
+            {
+                PbSubscriptionState::Init => SubscriptionState::Init,
+                PbSubscriptionState::Created => SubscriptionState::Created,
+                PbSubscriptionState::Unspecified => unreachable!(),
+            },
         }
     }
 }

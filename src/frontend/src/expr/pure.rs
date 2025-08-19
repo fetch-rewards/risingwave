@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -64,6 +64,7 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::SecToTimestamptz
             | Type::AtTimeZone
             | Type::DateTrunc
+            | Type::DateBin
             | Type::MakeDate
             | Type::MakeTime
             | Type::MakeTimestamp
@@ -104,6 +105,7 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::CharLength
             | Type::Repeat
             | Type::ConcatOp
+            | Type::ByteaConcatOp
             | Type::Concat
             | Type::ConcatVariadic
             | Type::BoolOut
@@ -138,6 +140,8 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::Acosd
             | Type::Atan
             | Type::Atan2
+            | Type::Atand
+            | Type::Atan2d
             | Type::Sqrt
             | Type::Cbrt
             | Type::Sign
@@ -181,6 +185,7 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::ArrayPosition
             | Type::ArrayContains
             | Type::ArrayContained
+            | Type::ArrayFlatten
             | Type::HexToInt256
             | Type::JsonbConcat
             | Type::JsonbAccess
@@ -204,6 +209,7 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::JsonbBuildArrayVariadic
             | Type::JsonbBuildObject
             | Type::JsonbPopulateRecord
+            | Type::JsonbToArray
             | Type::JsonbToRecord
             | Type::JsonbBuildObjectVariadic
             | Type::JsonbPathExists
@@ -211,6 +217,7 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::JsonbPathQueryArray
             | Type::JsonbPathQueryFirst
             | Type::JsonbSet
+            | Type::JsonbPopulateMap
             | Type::IsJson
             | Type::ToJsonb
             | Type::Sind
@@ -231,6 +238,8 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::Sha256
             | Type::Sha384
             | Type::Sha512
+            | Type::Hmac
+            | Type::SecureCompare
             | Type::Decrypt
             | Type::Encrypt
             | Type::Tand
@@ -249,7 +258,30 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::InetNtoa
             | Type::InetAton
             | Type::QuoteLiteral
-            | Type::QuoteNullable =>
+            | Type::QuoteNullable
+            | Type::MapFromEntries
+            | Type::MapAccess
+            | Type::MapKeys
+            | Type::MapValues
+            | Type::MapEntries
+            | Type::MapFromKeyValues
+            | Type::MapCat
+            | Type::MapContains
+            | Type::MapDelete
+            | Type::MapFilter
+            | Type::MapInsert
+            | Type::MapLength
+            | Type::L2Distance
+            | Type::CosineDistance
+            | Type::L1Distance
+            | Type::InnerProduct
+            | Type::VecConcat
+            | Type::L2Norm
+            | Type::L2Normalize
+            | Type::VnodeUser
+            | Type::RwEpochToTs
+            | Type::CheckNotNull
+            | Type::CompositeCast =>
             // expression output is deterministic(same result for the same input)
             {
                 func_call
@@ -258,8 +290,9 @@ impl ExprVisitor for ImpureAnalyzer {
                     .for_each(|expr| self.visit_expr(expr));
             }
             // expression output is not deterministic
-            Type::Vnode
-            | Type::TestPaidTier
+            Type::Vnode // obtain vnode count from the context
+            | Type::TestFeature
+            | Type::License
             | Type::Proctime
             | Type::PgSleep
             | Type::PgSleepFor
@@ -278,7 +311,12 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::HasSchemaPrivilege
             | Type::MakeTimestamptz
             | Type::PgIsInRecovery
-            | Type::RwRecoveryStatus => self.impure = true,
+            | Type::RwRecoveryStatus
+            | Type::PgTableIsVisible
+            | Type::HasFunctionPrivilege
+            | Type::OpenaiEmbedding
+            | Type::HasDatabasePrivilege
+            | Type::Random => self.impure = true,
         }
     }
 }
@@ -304,7 +342,7 @@ mod tests {
     use risingwave_common::types::DataType;
     use risingwave_pb::expr::expr_node::Type;
 
-    use crate::expr::{is_impure, is_pure, ExprImpl, FunctionCall, InputRef};
+    use crate::expr::{ExprImpl, FunctionCall, InputRef, is_impure, is_pure};
 
     fn expect_pure(expr: &ExprImpl) {
         assert!(is_pure(expr));

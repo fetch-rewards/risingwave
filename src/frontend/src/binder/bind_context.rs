@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,16 +21,17 @@ use either::Either;
 use parse_display::Display;
 use risingwave_common::catalog::{Field, Schema};
 use risingwave_common::types::DataType;
-use risingwave_sqlparser::ast::TableAlias;
+use risingwave_sqlparser::ast::{TableAlias, WindowSpec};
 
 use crate::binder::Relation;
 use crate::error::{ErrorCode, Result};
+use crate::expr::ExprImpl;
 
 type LiteResult<T> = std::result::Result<T, ErrorCode>;
 
-use super::statement::RewriteExprsRecursive;
 use super::BoundSetExpr;
-use crate::binder::{BoundQuery, ShareId, COLUMN_GROUP_PREFIX};
+use super::statement::RewriteExprsRecursive;
+use crate::binder::{BoundQuery, COLUMN_GROUP_PREFIX, ShareId};
 
 #[derive(Debug, Clone)]
 pub struct ColumnBinding {
@@ -158,6 +159,13 @@ pub struct BindContext {
     pub cte_to_relation: HashMap<String, Rc<RefCell<BindingCte>>>,
     /// Current lambda functions's arguments
     pub lambda_args: Option<HashMap<String, (usize, DataType)>>,
+    /// Whether the security invoker is set, currently only used for views.
+    pub disable_security_invoker: bool,
+    /// Named window definitions from the `WINDOW` clause
+    pub named_windows: HashMap<String, WindowSpec>,
+    /// Bound arguments for the current SQL UDF, if any.
+    // TODO: use enum for named or positional arguments
+    pub sql_udf_arguments: Option<HashMap<String, ExprImpl>>,
 }
 
 /// Holds the context for the `BindContext`'s `ColumnGroup`s.
@@ -218,7 +226,7 @@ impl BindContext {
                     self.get_indices_with_group_id(group_id, column_name)
                 } else {
                     Ok(vec![
-                        self.get_index_with_table_name(column_name, table_name)?
+                        self.get_index_with_table_name(column_name, table_name)?,
                     ])
                 }
             }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,14 +18,14 @@ use risingwave_common::types::DataType;
 
 use super::utils::impl_distill_by_unit;
 use super::{
-    gen_filter_and_pushdown, generic, BatchProjectSet, ColPrunable, ExprRewritable, Logical,
-    LogicalProject, PlanBase, PlanRef, PlanTreeNodeUnary, PredicatePushdown, StreamProjectSet,
-    ToBatch, ToStream,
+    BatchProjectSet, ColPrunable, ExprRewritable, Logical, LogicalPlanRef as PlanRef,
+    LogicalProject, PlanBase, PlanTreeNodeUnary, PredicatePushdown, StreamPlanRef,
+    StreamProjectSet, ToBatch, ToStream, gen_filter_and_pushdown, generic,
 };
 use crate::error::{ErrorCode, Result};
 use crate::expr::{
-    collect_input_refs, Expr, ExprImpl, ExprRewriter, ExprVisitor, FunctionCall, InputRef,
-    TableFunction,
+    Expr, ExprImpl, ExprRewriter, ExprVisitor, FunctionCall, InputRef, TableFunction,
+    collect_input_refs,
 };
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_node::generic::GenericPlanRef;
@@ -195,7 +195,7 @@ impl LogicalProjectSet {
     }
 }
 
-impl PlanTreeNodeUnary for LogicalProjectSet {
+impl PlanTreeNodeUnary<Logical> for LogicalProjectSet {
     fn input(&self) -> PlanRef {
         self.core.input.clone()
     }
@@ -204,7 +204,6 @@ impl PlanTreeNodeUnary for LogicalProjectSet {
         Self::new(input, self.select_list().clone())
     }
 
-    #[must_use]
     fn rewrite_with_input(
         &self,
         input: PlanRef,
@@ -223,7 +222,7 @@ impl PlanTreeNodeUnary for LogicalProjectSet {
     }
 }
 
-impl_plan_tree_node_for_unary! {LogicalProjectSet}
+impl_plan_tree_node_for_unary! { Logical, LogicalProjectSet}
 impl_distill_by_unit!(LogicalProjectSet, core, "LogicalProjectSet");
 // TODO: add verbose display like Project
 
@@ -295,7 +294,7 @@ impl ColPrunable for LogicalProjectSet {
     }
 }
 
-impl ExprRewritable for LogicalProjectSet {
+impl ExprRewritable<Logical> for LogicalProjectSet {
     fn has_rewritable_expr(&self) -> bool {
         true
     }
@@ -355,10 +354,10 @@ impl PredicatePushdown for LogicalProjectSet {
 }
 
 impl ToBatch for LogicalProjectSet {
-    fn to_batch(&self) -> Result<PlanRef> {
-        let mut new_logical = self.core.clone();
-        new_logical.input = self.input().to_batch()?;
-        Ok(BatchProjectSet::new(new_logical).into())
+    fn to_batch(&self) -> Result<crate::optimizer::plan_node::BatchPlanRef> {
+        let new_input = self.input().to_batch()?;
+        let core = self.core.clone_with_input(new_input);
+        Ok(BatchProjectSet::new(core).into())
     }
 }
 
@@ -399,21 +398,19 @@ impl ToStream for LogicalProjectSet {
 
     // TODO: implement to_stream_with_dist_required like LogicalProject
 
-    fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<PlanRef> {
+    fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<StreamPlanRef> {
         if self.select_list().iter().any(|item| item.has_now()) {
             // User may use `now()` in table function in a wrong way, because we allow `now()` in `FROM` clause.
             return Err(ErrorCode::NotSupported(
-                "General `now()` function in streaming queries".to_string(),
-                "Streaming `now()` is currently only supported in GenerateSeries and TemporalFilter patterns."
-                .to_string(),
+                "General `now()` function in streaming queries".to_owned(),
+                "Streaming `now()` is currently only supported in GenerateSeries and TemporalFilter patterns.".to_owned(),
             )
             .into());
         }
 
         let new_input = self.input().to_stream(ctx)?;
-        let mut new_logical = self.core.clone();
-        new_logical.input = new_input;
-        Ok(StreamProjectSet::new(new_logical).into())
+        let core = self.core.clone_with_input(new_input);
+        Ok(StreamProjectSet::new(core).into())
     }
 }
 

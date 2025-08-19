@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -47,6 +47,10 @@ impl DataChunkBuilder {
             array_builders: vec![],
             buffered_count: 0,
         }
+    }
+
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
     }
 
     /// Lazily create the array builders if absent
@@ -228,8 +232,8 @@ impl DataChunkBuilder {
         self.buffered_count
     }
 
-    pub fn can_append(&self, count: usize) -> bool {
-        self.buffered_count + count <= self.batch_size
+    pub fn can_append_update(&self) -> bool {
+        self.buffered_count + 2 <= self.batch_size
     }
 
     pub fn num_columns(&self) -> usize {

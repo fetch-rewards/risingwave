@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -40,7 +40,7 @@ impl SystemParamsDiff {
             ($({ $field:ident, $($rest:tt)* },)*) => {
                 $(
                     if curr.$field() != prev.$field() {
-                        diff.$field = Some(curr.$field().to_owned());
+                        diff.$field = Some(curr.$field().into());
                     }
                 )*
             };
@@ -57,7 +57,7 @@ impl SystemParamsDiff {
             ($({ $field:ident, $($rest:tt)* },)*) => {
                 Self {
                     $(
-                        $field: Some(initial.$field().to_owned()),
+                        $field: Some(initial.$field().into()),
                     )*
                 }
             };

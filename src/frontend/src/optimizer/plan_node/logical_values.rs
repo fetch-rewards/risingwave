@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,10 +21,10 @@ use risingwave_common::catalog::{Field, Schema};
 use risingwave_common::types::{DataType, ScalarImpl};
 
 use super::generic::GenericPlanRef;
-use super::utils::{childless_record, Distill};
+use super::utils::{Distill, childless_record};
 use super::{
-    BatchValues, ColPrunable, ExprRewritable, Logical, LogicalFilter, PlanBase, PlanRef,
-    PredicatePushdown, StreamValues, ToBatch, ToStream,
+    BatchValues, ColPrunable, ExprRewritable, Logical, LogicalFilter, LogicalPlanRef as PlanRef,
+    PlanBase, PredicatePushdown, StreamValues, ToBatch, ToStream,
 };
 use crate::error::Result;
 use crate::expr::{Expr, ExprImpl, ExprRewriter, ExprVisitor, Literal};
@@ -103,7 +103,7 @@ impl LogicalValues {
     }
 }
 
-impl_plan_tree_node_for_leaf! { LogicalValues }
+impl_plan_tree_node_for_leaf! { Logical, LogicalValues }
 impl Distill for LogicalValues {
     fn distill<'a>(&self) -> XmlNode<'a> {
         let data = self.rows_pretty();
@@ -112,7 +112,7 @@ impl Distill for LogicalValues {
     }
 }
 
-impl ExprRewritable for LogicalValues {
+impl ExprRewritable<Logical> for LogicalValues {
     fn has_rewritable_expr(&self) -> bool {
         true
     }
@@ -167,13 +167,16 @@ impl PredicatePushdown for LogicalValues {
 }
 
 impl ToBatch for LogicalValues {
-    fn to_batch(&self) -> Result<PlanRef> {
+    fn to_batch(&self) -> Result<crate::optimizer::plan_node::BatchPlanRef> {
         Ok(BatchValues::new(self.clone()).into())
     }
 }
 
 impl ToStream for LogicalValues {
-    fn to_stream(&self, _ctx: &mut ToStreamContext) -> Result<PlanRef> {
+    fn to_stream(
+        &self,
+        _ctx: &mut ToStreamContext,
+    ) -> Result<crate::optimizer::plan_node::StreamPlanRef> {
         Ok(StreamValues::new(self.clone()).into())
     }
 

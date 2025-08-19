@@ -1,4 +1,4 @@
-//  Copyright 2024 RisingWave Labs
+//  Copyright 2025 RisingWave Labs
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -18,13 +18,13 @@
 // (found in the LICENSE.Apache file in the root directory).
 use std::sync::Arc;
 
-use risingwave_hummock_sdk::level::Levels;
 use risingwave_hummock_sdk::HummockCompactionTaskId;
+use risingwave_hummock_sdk::level::Levels;
 use risingwave_pb::hummock::compact_task::PbTaskType;
 use risingwave_pb::hummock::{CompactionConfig, LevelType};
 
 use super::{
-    create_compaction_task, CompactionSelector, LevelCompactionPicker, TierCompactionPicker,
+    CompactionSelector, LevelCompactionPicker, TierCompactionPicker, create_compaction_task,
 };
 use crate::hummock::compaction::overlap_strategy::OverlapStrategy;
 use crate::hummock::compaction::picker::{
@@ -33,7 +33,7 @@ use crate::hummock::compaction::picker::{
 };
 use crate::hummock::compaction::selector::CompactionSelectorContext;
 use crate::hummock::compaction::{
-    create_overlap_strategy, CompactionDeveloperConfig, CompactionTask,
+    CompactionDeveloperConfig, CompactionTask, create_overlap_strategy,
 };
 use crate::hummock::level_handler::LevelHandler;
 
@@ -205,13 +205,30 @@ impl DynamicLevelSelectorCore {
     ) -> SelectContext {
         let mut ctx = self.calculate_level_base_size(levels);
 
-        let idle_file_count = levels
+        let l0_file_count = levels
             .l0
             .sub_levels
             .iter()
-            .map(|level| level.table_infos.len())
-            .sum::<usize>()
-            - handlers[0].get_pending_file_count();
+            .map(|sub_level| sub_level.table_infos.len())
+            .sum::<usize>();
+
+        let idle_file_count = match l0_file_count.checked_sub(handlers[0].pending_file_count()) {
+            Some(count) => count,
+            None => {
+                // If the number of files in L0 is less than the number of pending files, it means
+                // that may be encountered some issue, we can work around it.
+                tracing::warn!(
+                    "The number of files in L0 {} is less than the number of pending files {} group {} pending_tasks_ids {:?} compacting_files {:?}",
+                    l0_file_count,
+                    handlers[0].pending_file_count(),
+                    levels.group_id,
+                    handlers[0].pending_tasks_ids(),
+                    handlers[0].compacting_files()
+                );
+
+                0
+            }
+        };
 
         if idle_file_count > 0 {
             // trigger l0 compaction when the number of files is too large.
@@ -254,7 +271,7 @@ impl DynamicLevelSelectorCore {
                 })
                 .map(|level| level.total_file_size)
                 .sum::<u64>()
-                - handlers[0].get_pending_output_file_size(ctx.base_level as u32);
+                .saturating_sub(handlers[0].pending_output_file_size(ctx.base_level as u32));
             let base_level_size = levels.get_level(ctx.base_level).total_file_size;
             let base_level_sst_count = levels.get_level(ctx.base_level).table_infos.len() as u64;
 
@@ -305,7 +322,7 @@ impl DynamicLevelSelectorCore {
                 continue;
             }
             let output_file_size =
-                handlers[level_idx].get_pending_output_file_size(level.level_idx + 1);
+                handlers[level_idx].pending_output_file_size(level.level_idx + 1);
             let total_size = level.total_file_size.saturating_sub(output_file_size);
             if total_size == 0 {
                 continue;
@@ -478,6 +495,7 @@ pub mod tests {
     use risingwave_hummock_sdk::version::HummockVersionStateTableInfo;
     use risingwave_pb::hummock::compaction_config::CompactionMode;
 
+    use crate::hummock::compaction::CompactionDeveloperConfig;
     use crate::hummock::compaction::compaction_config::CompactionConfigBuilder;
     use crate::hummock::compaction::selector::tests::{
         assert_compaction_task, generate_l0_nonoverlapping_sublevels, generate_level,
@@ -486,7 +504,6 @@ pub mod tests {
     use crate::hummock::compaction::selector::{
         CompactionSelector, DynamicLevelSelector, DynamicLevelSelectorCore, LocalSelectorStatistic,
     };
-    use crate::hummock::compaction::CompactionDeveloperConfig;
     use crate::hummock::level_handler::LevelHandler;
     use crate::hummock::model::CompactionGroup;
     use crate::hummock::test_utils::compaction_selector_context;
@@ -528,7 +545,7 @@ pub mod tests {
         levels.levels[3].total_file_size = levels.levels[3]
             .table_infos
             .iter()
-            .map(|sst| sst.file_size)
+            .map(|sst| sst.sst_size)
             .sum::<u64>();
 
         let ctx = selector.calculate_level_base_size(&levels);
@@ -555,7 +572,7 @@ pub mod tests {
         levels.levels[0].total_file_size = levels.levels[0]
             .table_infos
             .iter()
-            .map(|sst| sst.file_size)
+            .map(|sst| sst.sst_size)
             .sum::<u64>();
 
         let ctx = selector.calculate_level_base_size(&levels);

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,43 +22,48 @@ use anyhow::anyhow;
 use async_recursion::async_recursion;
 use enum_as_inner::EnumAsInner;
 use futures::TryStreamExt;
+use iceberg::expr::Predicate as IcebergPredicate;
 use itertools::Itertools;
+use petgraph::{Directed, Graph};
 use pgwire::pg_server::SessionId;
 use risingwave_batch::error::BatchError;
 use risingwave_batch::worker_manager::worker_node_manager::WorkerNodeSelector;
-use risingwave_common::bail;
 use risingwave_common::bitmap::{Bitmap, BitmapBuilder};
-use risingwave_common::catalog::TableDesc;
+use risingwave_common::catalog::Schema;
 use risingwave_common::hash::table_distribution::TableDistribution;
-use risingwave_common::hash::{VirtualNode, WorkerSlotId, WorkerSlotMapping};
+use risingwave_common::hash::{WorkerSlotId, WorkerSlotMapping};
 use risingwave_common::util::scan_range::ScanRange;
 use risingwave_connector::source::filesystem::opendal_source::opendal_enumerator::OpendalEnumerator;
-use risingwave_connector::source::filesystem::opendal_source::{OpendalGcs, OpendalS3};
-use risingwave_connector::source::iceberg::{IcebergSplitEnumerator, IcebergTimeTravelInfo};
+use risingwave_connector::source::filesystem::opendal_source::{
+    BatchPosixFsEnumerator, OpendalAzblob, OpendalGcs, OpendalS3,
+};
+use risingwave_connector::source::iceberg::IcebergSplitEnumerator;
 use risingwave_connector::source::kafka::KafkaSplitEnumerator;
+use risingwave_connector::source::prelude::DatagenSplitEnumerator;
 use risingwave_connector::source::reader::reader::build_opendal_fs_list_for_batch;
 use risingwave_connector::source::{
     ConnectorProperties, SourceEnumeratorContext, SplitEnumerator, SplitImpl,
 };
+use risingwave_pb::batch_plan::iceberg_scan_node::IcebergScanType;
 use risingwave_pb::batch_plan::plan_node::NodeBody;
 use risingwave_pb::batch_plan::{ExchangeInfo, ScanRange as ScanRangeProto};
-use risingwave_pb::common::Buffer;
 use risingwave_pb::plan_common::Field as PbField;
 use risingwave_sqlparser::ast::AsOf;
-use serde::ser::SerializeStruct;
 use serde::Serialize;
+use serde::ser::SerializeStruct;
 use uuid::Uuid;
 
 use super::SchedulerError;
-use crate::catalog::catalog_service::CatalogReader;
+use crate::TableCatalog;
 use crate::catalog::TableId;
-use crate::error::RwError;
+use crate::catalog::catalog_service::CatalogReader;
 use crate::optimizer::plan_node::generic::{GenericPlanRef, PhysicalPlanRef};
+use crate::optimizer::plan_node::utils::to_iceberg_time_travel_as_of;
 use crate::optimizer::plan_node::{
-    BatchIcebergScan, BatchKafkaScan, BatchSource, PlanNodeId, PlanNodeType,
+    BatchIcebergScan, BatchKafkaScan, BatchPlanNodeType, BatchPlanRef as PlanRef, BatchSource,
+    PlanNodeId,
 };
 use crate::optimizer::property::Distribution;
-use crate::optimizer::PlanRef;
 use crate::scheduler::SchedulerResult;
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -84,7 +89,7 @@ pub type TaskId = u64;
 #[derive(Clone, Debug)]
 pub struct ExecutionPlanNode {
     pub plan_node_id: PlanNodeId,
-    pub plan_node_type: PlanNodeType,
+    pub plan_node_type: BatchPlanNodeType,
     pub node: NodeBody,
     pub schema: Vec<PbField>,
 
@@ -128,7 +133,7 @@ impl TryFrom<PlanRef> for ExecutionPlanNode {
 }
 
 impl ExecutionPlanNode {
-    pub fn node_type(&self) -> PlanNodeType {
+    pub fn node_type(&self) -> BatchPlanNodeType {
         self.plan_node_type
     }
 }
@@ -141,6 +146,7 @@ pub struct BatchPlanFragmenter {
     catalog_reader: CatalogReader,
 
     batch_parallelism: usize,
+    timezone: String,
 
     stage_graph_builder: Option<StageGraphBuilder>,
     stage_graph: Option<StageGraph>,
@@ -159,6 +165,7 @@ impl BatchPlanFragmenter {
         worker_node_manager: WorkerNodeSelector,
         catalog_reader: CatalogReader,
         batch_parallelism: Option<NonZeroU64>,
+        timezone: String,
         batch_node: PlanRef,
     ) -> SchedulerResult<Self> {
         // if batch_parallelism is None, it means no limit, we will use the available nodes count as
@@ -182,6 +189,7 @@ impl BatchPlanFragmenter {
             worker_node_manager,
             catalog_reader,
             batch_parallelism,
+            timezone,
             stage_graph_builder: Some(StageGraphBuilder::new(batch_parallelism)),
             stage_graph: None,
         };
@@ -268,10 +276,31 @@ impl Query {
 }
 
 #[derive(Debug, Clone)]
+pub enum SourceFetchParameters {
+    IcebergSpecificInfo(IcebergSpecificInfo),
+    KafkaTimebound {
+        lower: Option<i64>,
+        upper: Option<i64>,
+    },
+    Empty,
+}
+
+#[derive(Debug, Clone)]
 pub struct SourceFetchInfo {
+    pub schema: Schema,
+    /// These are user-configured connector properties.
+    /// e.g. host, username, etc...
     pub connector: ConnectorProperties,
-    pub timebound: (Option<i64>, Option<i64>),
+    /// These parameters are internally derived by the plan node.
+    /// e.g. predicate pushdown for iceberg, timebound for kafka.
+    pub fetch_parameters: SourceFetchParameters,
     pub as_of: Option<AsOf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IcebergSpecificInfo {
+    pub iceberg_scan_type: IcebergScanType,
+    pub predicate: IcebergPredicate,
 }
 
 #[derive(Clone, Debug)]
@@ -286,20 +315,27 @@ impl SourceScanInfo {
         Self::Incomplete(fetch_info)
     }
 
-    pub async fn complete(self, batch_parallelism: usize) -> SchedulerResult<Self> {
+    pub async fn complete(
+        self,
+        batch_parallelism: usize,
+        timezone: String,
+    ) -> SchedulerResult<Self> {
         let fetch_info = match self {
             SourceScanInfo::Incomplete(fetch_info) => fetch_info,
             SourceScanInfo::Complete(_) => {
                 unreachable!("Never call complete when SourceScanInfo is already complete")
             }
         };
-        match fetch_info.connector {
-            ConnectorProperties::Kafka(prop) => {
+        match (fetch_info.connector, fetch_info.fetch_parameters) {
+            (
+                ConnectorProperties::Kafka(prop),
+                SourceFetchParameters::KafkaTimebound { lower, upper },
+            ) => {
                 let mut kafka_enumerator =
                     KafkaSplitEnumerator::new(*prop, SourceEnumeratorContext::dummy().into())
                         .await?;
                 let split_info = kafka_enumerator
-                    .list_splits_batch(fetch_info.timebound.0, fetch_info.timebound.1)
+                    .list_splits_batch(lower, upper)
                     .await?
                     .into_iter()
                     .map(SplitImpl::Kafka)
@@ -307,9 +343,21 @@ impl SourceScanInfo {
 
                 Ok(SourceScanInfo::Complete(split_info))
             }
-            ConnectorProperties::OpendalS3(prop) => {
-                let lister: OpendalEnumerator<OpendalS3> =
-                    OpendalEnumerator::new_s3_source(prop.s3_properties, prop.assume_role)?;
+            (ConnectorProperties::Datagen(prop), SourceFetchParameters::Empty) => {
+                let mut datagen_enumerator =
+                    DatagenSplitEnumerator::new(*prop, SourceEnumeratorContext::dummy().into())
+                        .await?;
+                let split_info = datagen_enumerator.list_splits().await?;
+                let res = split_info.into_iter().map(SplitImpl::Datagen).collect_vec();
+
+                Ok(SourceScanInfo::Complete(res))
+            }
+            (ConnectorProperties::OpendalS3(prop), SourceFetchParameters::Empty) => {
+                let lister: OpendalEnumerator<OpendalS3> = OpendalEnumerator::new_s3_source(
+                    &prop.s3_properties,
+                    prop.assume_role,
+                    prop.fs_common.compression_format,
+                )?;
                 let stream = build_opendal_fs_list_for_batch(lister);
 
                 let batch_res: Vec<_> = stream.try_collect().await?;
@@ -320,7 +368,7 @@ impl SourceScanInfo {
 
                 Ok(SourceScanInfo::Complete(res))
             }
-            ConnectorProperties::Gcs(prop) => {
+            (ConnectorProperties::Gcs(prop), SourceFetchParameters::Empty) => {
                 let lister: OpendalEnumerator<OpendalGcs> =
                     OpendalEnumerator::new_gcs_source(*prop)?;
                 let stream = build_opendal_fs_list_for_batch(lister);
@@ -329,36 +377,48 @@ impl SourceScanInfo {
 
                 Ok(SourceScanInfo::Complete(res))
             }
-            ConnectorProperties::Iceberg(prop) => {
+            (ConnectorProperties::Azblob(prop), SourceFetchParameters::Empty) => {
+                let lister: OpendalEnumerator<OpendalAzblob> =
+                    OpendalEnumerator::new_azblob_source(*prop)?;
+                let stream = build_opendal_fs_list_for_batch(lister);
+                let batch_res: Vec<_> = stream.try_collect().await?;
+                let res = batch_res.into_iter().map(SplitImpl::Azblob).collect_vec();
+
+                Ok(SourceScanInfo::Complete(res))
+            }
+            (ConnectorProperties::BatchPosixFs(prop), SourceFetchParameters::Empty) => {
+                use risingwave_connector::source::SplitEnumerator;
+                let mut enumerator = BatchPosixFsEnumerator::new(
+                    *prop,
+                    risingwave_connector::source::SourceEnumeratorContext::dummy().into(),
+                )
+                .await?;
+                let splits = enumerator.list_splits().await?;
+                let res = splits
+                    .into_iter()
+                    .map(SplitImpl::BatchPosixFs)
+                    .collect_vec();
+
+                Ok(SourceScanInfo::Complete(res))
+            }
+            (
+                ConnectorProperties::Iceberg(prop),
+                SourceFetchParameters::IcebergSpecificInfo(iceberg_specific_info),
+            ) => {
                 let iceberg_enumerator =
                     IcebergSplitEnumerator::new(*prop, SourceEnumeratorContext::dummy().into())
                         .await?;
 
-                let time_travel_info = match fetch_info.as_of {
-                    Some(AsOf::VersionNum(v)) => Some(IcebergTimeTravelInfo::Version(v)),
-                    Some(AsOf::TimestampNum(ts)) => {
-                        Some(IcebergTimeTravelInfo::TimestampMs(ts * 1000))
-                    }
-                    Some(AsOf::VersionString(_)) => {
-                        bail!("Unsupported version string in iceberg time travel")
-                    }
-                    Some(AsOf::TimestampString(ts)) => Some(
-                        speedate::DateTime::parse_str_rfc3339(&ts)
-                            .map(|t| {
-                                IcebergTimeTravelInfo::TimestampMs(
-                                    t.timestamp_tz() * 1000 + t.time.microsecond as i64 / 1000,
-                                )
-                            })
-                            .map_err(|_e| anyhow!("fail to parse timestamp"))?,
-                    ),
-                    Some(AsOf::ProcessTime) | Some(AsOf::ProcessTimeWithInterval(_)) => {
-                        unreachable!()
-                    }
-                    None => None,
-                };
+                let time_travel_info = to_iceberg_time_travel_as_of(&fetch_info.as_of, &timezone)?;
 
                 let split_info = iceberg_enumerator
-                    .list_splits_batch(time_travel_info, batch_parallelism)
+                    .list_splits_batch(
+                        fetch_info.schema,
+                        time_travel_info,
+                        batch_parallelism,
+                        iceberg_specific_info.iceberg_scan_type,
+                        iceberg_specific_info.predicate,
+                    )
                     .await?
                     .into_iter()
                     .map(SplitImpl::Iceberg)
@@ -366,8 +426,10 @@ impl SourceScanInfo {
 
                 Ok(SourceScanInfo::Complete(split_info))
             }
-            _ => Err(SchedulerError::Internal(anyhow!(
-                "Unsupported to query directly from this source"
+            (connector, _) => Err(SchedulerError::Internal(anyhow!(
+                "Unsupported to query directly from this {} source, \
+                 please create a table or streaming job from it",
+                connector.kind()
             ))),
         }
     }
@@ -425,7 +487,7 @@ impl TableScanInfo {
 
 #[derive(Clone, Debug)]
 pub struct TablePartitionInfo {
-    pub vnode_bitmap: Buffer,
+    pub vnode_bitmap: Bitmap,
     pub scan_ranges: Vec<ScanRangeProto>,
 }
 
@@ -685,6 +747,7 @@ impl StageGraph {
         self,
         catalog_reader: &CatalogReader,
         worker_node_manager: &WorkerNodeSelector,
+        timezone: String,
     ) -> SchedulerResult<StageGraph> {
         let mut complete_stages = HashMap::new();
         self.complete_stage(
@@ -693,6 +756,7 @@ impl StageGraph {
             &mut complete_stages,
             catalog_reader,
             worker_node_manager,
+            timezone,
         )
         .await?;
         Ok(StageGraph {
@@ -712,6 +776,7 @@ impl StageGraph {
         complete_stages: &mut HashMap<StageId, QueryStageRef>,
         catalog_reader: &CatalogReader,
         worker_node_manager: &WorkerNodeSelector,
+        timezone: String,
     ) -> SchedulerResult<()> {
         let parallelism = if stage.parallelism.is_some() {
             // If the stage has parallelism, it means it's a complete stage.
@@ -726,18 +791,26 @@ impl StageGraph {
                 .as_ref()
                 .unwrap()
                 .clone()
-                .complete(self.batch_parallelism)
+                .complete(self.batch_parallelism, timezone.to_owned())
                 .await?;
 
             // For batch reading file source, the number of files involved is typically large.
             // In order to avoid generating a task for each file, the parallelism of tasks is limited here.
-            // todo(wcy-fdu): Currently it will be divided into half of schedule_unit_count groups, and this will be changed to configurable later.
+            // The minimum `task_parallelism` is 1. Additionally, `task_parallelism`
+            // must be greater than the number of files to read. Therefore, we first take the
+            // minimum of the number of files and (self.batch_parallelism / 2). If the number of
+            // files is 0, we set task_parallelism to 1.
+
             let task_parallelism = match &stage.source_info {
                 Some(SourceScanInfo::Incomplete(source_fetch_info)) => {
                     match source_fetch_info.connector {
-                        ConnectorProperties::Gcs(_) | ConnectorProperties::OpendalS3(_) => {
-                            (self.batch_parallelism / 2) as u32
-                        }
+                        ConnectorProperties::Gcs(_)
+                        | ConnectorProperties::OpendalS3(_)
+                        | ConnectorProperties::Azblob(_) => (min(
+                            complete_source_info.split_info().unwrap().len() as u32,
+                            (self.batch_parallelism / 2) as u32,
+                        ))
+                        .max(1),
                         _ => complete_source_info.split_info().unwrap().len() as u32,
                     }
                 }
@@ -788,11 +861,40 @@ impl StageGraph {
                 complete_stages,
                 catalog_reader,
                 worker_node_manager,
+                timezone.to_owned(),
             )
             .await?;
         }
 
         Ok(())
+    }
+
+    /// Converts the `StageGraph` into a `petgraph::graph::Graph<String, String>`.
+    pub fn to_petgraph(&self) -> Graph<String, String, Directed> {
+        let mut graph = Graph::<String, String, Directed>::new();
+
+        let mut node_indices = HashMap::new();
+
+        // Add all stages as nodes
+        for (&stage_id, stage_ref) in self.stages.iter().sorted_by_key(|(id, _)| **id) {
+            let node_label = format!("Stage {}: {:?}", stage_id, stage_ref);
+            let node_index = graph.add_node(node_label);
+            node_indices.insert(stage_id, node_index);
+        }
+
+        // Add edges between stages based on child_edges
+        for (&parent_id, children) in &self.child_edges {
+            if let Some(&parent_index) = node_indices.get(&parent_id) {
+                for &child_id in children {
+                    if let Some(&child_index) = node_indices.get(&child_id) {
+                        // Add an edge from parent to child
+                        graph.add_edge(parent_index, child_index, "".to_owned());
+                    }
+                }
+            }
+        }
+
+        graph
     }
 }
 
@@ -853,7 +955,11 @@ impl BatchPlanFragmenter {
     pub async fn generate_complete_query(self) -> SchedulerResult<Query> {
         let stage_graph = self.stage_graph.unwrap();
         let new_stage_graph = stage_graph
-            .complete(&self.catalog_reader, &self.worker_node_manager)
+            .complete(
+                &self.catalog_reader,
+                &self.worker_node_manager,
+                self.timezone.to_owned(),
+            )
             .await?;
         Ok(Query {
             query_id: self.query_id,
@@ -902,8 +1008,7 @@ impl BatchPlanFragmenter {
                                 .drain()
                                 .take(1)
                                 .update(|(_, info)| {
-                                    info.vnode_bitmap =
-                                        Bitmap::ones(VirtualNode::COUNT).to_protobuf();
+                                    info.vnode_bitmap = Bitmap::ones(info.vnode_bitmap.len());
                                 })
                                 .collect();
                         }
@@ -976,7 +1081,7 @@ impl BatchPlanFragmenter {
         parent_exec_node: Option<&mut ExecutionPlanNode>,
     ) -> SchedulerResult<()> {
         match node.node_type() {
-            PlanNodeType::BatchExchange => {
+            BatchPlanNodeType::BatchExchange => {
                 self.visit_exchange(node.clone(), builder, parent_exec_node)?;
             }
             _ => {
@@ -1035,7 +1140,7 @@ impl BatchPlanFragmenter {
     ///
     /// For current implementation, we can guarantee that each stage has only one source.
     fn collect_stage_source(node: PlanRef) -> SchedulerResult<Option<SourceScanInfo>> {
-        if node.node_type() == PlanNodeType::BatchExchange {
+        if node.node_type() == BatchPlanNodeType::BatchExchange {
             // Do not visit next stage.
             return Ok(None);
         }
@@ -1048,8 +1153,12 @@ impl BatchPlanFragmenter {
                     ConnectorProperties::extract(source_catalog.with_properties.clone(), false)?;
                 let timestamp_bound = batch_kafka_scan.kafka_timestamp_range_value();
                 return Ok(Some(SourceScanInfo::new(SourceFetchInfo {
+                    schema: batch_kafka_scan.base.schema().clone(),
                     connector: property,
-                    timebound: timestamp_bound,
+                    fetch_parameters: SourceFetchParameters::KafkaTimebound {
+                        lower: timestamp_bound.0,
+                        upper: timestamp_bound.1,
+                    },
                     as_of: None,
                 })));
             }
@@ -1061,8 +1170,14 @@ impl BatchPlanFragmenter {
                     ConnectorProperties::extract(source_catalog.with_properties.clone(), false)?;
                 let as_of = batch_iceberg_scan.as_of();
                 return Ok(Some(SourceScanInfo::new(SourceFetchInfo {
+                    schema: batch_iceberg_scan.base.schema().clone(),
                     connector: property,
-                    timebound: (None, None),
+                    fetch_parameters: SourceFetchParameters::IcebergSpecificInfo(
+                        IcebergSpecificInfo {
+                            predicate: batch_iceberg_scan.predicate.clone(),
+                            iceberg_scan_type: batch_iceberg_scan.iceberg_scan_type(),
+                        },
+                    ),
                     as_of,
                 })));
             }
@@ -1075,8 +1190,9 @@ impl BatchPlanFragmenter {
                     ConnectorProperties::extract(source_catalog.with_properties.clone(), false)?;
                 let as_of = source_node.as_of();
                 return Ok(Some(SourceScanInfo::new(SourceFetchInfo {
+                    schema: source_node.base.schema().clone(),
                     connector: property,
-                    timebound: (None, None),
+                    fetch_parameters: SourceFetchParameters::Empty,
                     as_of,
                 })));
             }
@@ -1089,14 +1205,14 @@ impl BatchPlanFragmenter {
     }
 
     fn collect_stage_file_scan(node: PlanRef) -> SchedulerResult<Option<FileScanInfo>> {
-        if node.node_type() == PlanNodeType::BatchExchange {
+        if node.node_type() == BatchPlanNodeType::BatchExchange {
             // Do not visit next stage.
             return Ok(None);
         }
 
         if let Some(batch_file_scan) = node.as_batch_file_scan() {
             return Ok(Some(FileScanInfo {
-                file_location: batch_file_scan.core.file_location.clone(),
+                file_location: batch_file_scan.core.file_location().clone(),
             }));
         }
 
@@ -1111,37 +1227,31 @@ impl BatchPlanFragmenter {
     /// If there are multiple scan nodes in this stage, they must have the same distribution, but
     /// maybe different vnodes partition. We just use the same partition for all the scan nodes.
     fn collect_stage_table_scan(&self, node: PlanRef) -> SchedulerResult<Option<TableScanInfo>> {
-        let build_table_scan_info = |name, table_desc: &TableDesc, scan_range| {
-            let table_catalog = self
-                .catalog_reader
-                .read_guard()
-                .get_any_table_by_id(&table_desc.table_id)
-                .cloned()
-                .map_err(RwError::from)?;
+        let build_table_scan_info = |name, table_catalog: &TableCatalog, scan_range| {
             let vnode_mapping = self
                 .worker_node_manager
                 .fragment_mapping(table_catalog.fragment_id)?;
-            let partitions = derive_partitions(scan_range, table_desc, &vnode_mapping)?;
+            let partitions = derive_partitions(scan_range, table_catalog, &vnode_mapping)?;
             let info = TableScanInfo::new(name, partitions);
             Ok(Some(info))
         };
-        if node.node_type() == PlanNodeType::BatchExchange {
+        if node.node_type() == BatchPlanNodeType::BatchExchange {
             // Do not visit next stage.
             return Ok(None);
         }
         if let Some(scan_node) = node.as_batch_sys_seq_scan() {
-            let name = scan_node.core().table_name.to_owned();
+            let name = scan_node.core().table.name.clone();
             Ok(Some(TableScanInfo::system_table(name)))
         } else if let Some(scan_node) = node.as_batch_log_seq_scan() {
             build_table_scan_info(
                 scan_node.core().table_name.to_owned(),
-                &scan_node.core().table_desc,
+                &scan_node.core().table,
                 &[],
             )
         } else if let Some(scan_node) = node.as_batch_seq_scan() {
             build_table_scan_info(
-                scan_node.core().table_name.to_owned(),
-                &scan_node.core().table_desc,
+                scan_node.core().table_name().to_owned(),
+                &scan_node.core().table_catalog,
                 scan_node.scan_ranges(),
             )
         } else {
@@ -1154,7 +1264,7 @@ impl BatchPlanFragmenter {
 
     /// Returns the dml table id if any.
     fn collect_dml_table_id(node: &PlanRef) -> Option<TableId> {
-        if node.node_type() == PlanNodeType::BatchExchange {
+        if node.node_type() == BatchPlanNodeType::BatchExchange {
             return None;
         }
         if let Some(insert) = node.as_batch_insert() {
@@ -1174,18 +1284,12 @@ impl BatchPlanFragmenter {
         &self,
         node: PlanRef,
     ) -> SchedulerResult<Option<usize>> {
-        if node.node_type() == PlanNodeType::BatchExchange {
+        if node.node_type() == BatchPlanNodeType::BatchExchange {
             // Do not visit next stage.
             return Ok(None);
         }
         if let Some(lookup_join) = node.as_batch_lookup_join() {
-            let table_desc = lookup_join.right_table_desc();
-            let table_catalog = self
-                .catalog_reader
-                .read_guard()
-                .get_any_table_by_id(&table_desc.table_id)
-                .cloned()
-                .map_err(RwError::from)?;
+            let table_catalog = lookup_join.right_table();
             let vnode_mapping = self
                 .worker_node_manager
                 .fragment_mapping(table_catalog.fragment_id)?;
@@ -1204,10 +1308,26 @@ impl BatchPlanFragmenter {
 /// It can be derived if the value of the distribution key is already known.
 fn derive_partitions(
     scan_ranges: &[ScanRange],
-    table_desc: &TableDesc,
+    table_catalog: &TableCatalog,
     vnode_mapping: &WorkerSlotMapping,
 ) -> SchedulerResult<HashMap<WorkerSlotId, TablePartitionInfo>> {
-    let num_vnodes = vnode_mapping.len();
+    let vnode_mapping = if table_catalog.vnode_count.value() != vnode_mapping.len() {
+        // The vnode count mismatch occurs only in special cases where a hash-distributed fragment
+        // contains singleton internal tables. e.g., the state table of `Source` executors.
+        // In this case, we reduce the vnode mapping to a single vnode as only `SINGLETON_VNODE` is used.
+        assert_eq!(
+            table_catalog.vnode_count.value(),
+            1,
+            "fragment vnode count {} does not match table vnode count {}",
+            vnode_mapping.len(),
+            table_catalog.vnode_count.value(),
+        );
+        &WorkerSlotMapping::new_single(vnode_mapping.iter().next().unwrap())
+    } else {
+        vnode_mapping
+    };
+    let vnode_count = vnode_mapping.len();
+
     let mut partitions: HashMap<WorkerSlotId, (BitmapBuilder, Vec<_>)> = HashMap::new();
 
     if scan_ranges.is_empty() {
@@ -1218,7 +1338,7 @@ fn derive_partitions(
                 (
                     k,
                     TablePartitionInfo {
-                        vnode_bitmap: vnode_bitmap.to_protobuf(),
+                        vnode_bitmap,
                         scan_ranges: vec![],
                     },
                 )
@@ -1227,8 +1347,8 @@ fn derive_partitions(
     }
 
     let table_distribution = TableDistribution::new_from_storage_table_desc(
-        Some(TableDistribution::all_vnodes()),
-        &table_desc.try_to_protobuf()?,
+        Some(Bitmap::ones(vnode_count).into()),
+        &table_catalog.table_desc().try_to_protobuf()?,
     );
 
     for scan_range in scan_ranges {
@@ -1240,7 +1360,7 @@ fn derive_partitions(
                     |(worker_slot_id, vnode_bitmap)| {
                         let (bitmap, scan_ranges) = partitions
                             .entry(worker_slot_id)
-                            .or_insert_with(|| (BitmapBuilder::zeroed(num_vnodes), vec![]));
+                            .or_insert_with(|| (BitmapBuilder::zeroed(vnode_count), vec![]));
                         vnode_bitmap
                             .iter()
                             .enumerate()
@@ -1254,7 +1374,7 @@ fn derive_partitions(
                 let worker_slot_id = vnode_mapping[vnode];
                 let (bitmap, scan_ranges) = partitions
                     .entry(worker_slot_id)
-                    .or_insert_with(|| (BitmapBuilder::zeroed(num_vnodes), vec![]));
+                    .or_insert_with(|| (BitmapBuilder::zeroed(vnode_count), vec![]));
                 bitmap.set(vnode.to_index(), true);
                 scan_ranges.push(scan_range.to_protobuf());
             }
@@ -1267,7 +1387,7 @@ fn derive_partitions(
             (
                 k,
                 TablePartitionInfo {
-                    vnode_bitmap: bitmap.finish().to_protobuf(),
+                    vnode_bitmap: bitmap.finish(),
                     scan_ranges,
                 },
             )
@@ -1281,7 +1401,7 @@ mod tests {
 
     use risingwave_pb::batch_plan::plan_node::NodeBody;
 
-    use crate::optimizer::plan_node::PlanNodeType;
+    use crate::optimizer::plan_node::BatchPlanNodeType;
     use crate::scheduler::plan_fragmenter::StageId;
 
     #[tokio::test]
@@ -1323,14 +1443,17 @@ mod tests {
 
         // Check plan node in each stages.
         let root_exchange = query.stage_graph.stages.get(&0).unwrap();
-        assert_eq!(root_exchange.root.node_type(), PlanNodeType::BatchExchange);
+        assert_eq!(
+            root_exchange.root.node_type(),
+            BatchPlanNodeType::BatchExchange
+        );
         assert_eq!(root_exchange.root.source_stage_id, Some(1));
         assert!(matches!(root_exchange.root.node, NodeBody::Exchange(_)));
         assert_eq!(root_exchange.parallelism, Some(1));
         assert!(!root_exchange.has_table_scan());
 
         let join_node = query.stage_graph.stages.get(&1).unwrap();
-        assert_eq!(join_node.root.node_type(), PlanNodeType::BatchHashJoin);
+        assert_eq!(join_node.root.node_type(), BatchPlanNodeType::BatchHashJoin);
         assert_eq!(join_node.parallelism, Some(24));
 
         assert!(matches!(join_node.root.node, NodeBody::HashJoin(_)));
@@ -1353,13 +1476,13 @@ mod tests {
         assert!(!join_node.has_table_scan());
 
         let scan_node1 = query.stage_graph.stages.get(&2).unwrap();
-        assert_eq!(scan_node1.root.node_type(), PlanNodeType::BatchSeqScan);
+        assert_eq!(scan_node1.root.node_type(), BatchPlanNodeType::BatchSeqScan);
         assert_eq!(scan_node1.root.source_stage_id, None);
         assert_eq!(0, scan_node1.root.children.len());
         assert!(scan_node1.has_table_scan());
 
         let scan_node2 = query.stage_graph.stages.get(&3).unwrap();
-        assert_eq!(scan_node2.root.node_type(), PlanNodeType::BatchFilter);
+        assert_eq!(scan_node2.root.node_type(), BatchPlanNodeType::BatchFilter);
         assert_eq!(scan_node2.root.source_stage_id, None);
         assert_eq!(1, scan_node2.root.children.len());
         assert!(scan_node2.has_table_scan());

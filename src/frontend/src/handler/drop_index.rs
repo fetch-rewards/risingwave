@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,9 +17,9 @@ use risingwave_sqlparser::ast::ObjectName;
 
 use super::RwPgResponse;
 use crate::binder::Binder;
+use crate::catalog::CatalogError;
 use crate::catalog::root_catalog::SchemaPath;
 use crate::catalog::table_catalog::TableType;
-use crate::catalog::CatalogError;
 use crate::error::ErrorCode::PermissionDenied;
 use crate::error::Result;
 use crate::handler::HandlerArgs;
@@ -31,18 +31,22 @@ pub async fn handle_drop_index(
     cascade: bool,
 ) -> Result<RwPgResponse> {
     let session = handler_args.session;
-    let db_name = session.database();
-    let (schema_name, index_name) = Binder::resolve_schema_qualified_name(db_name, index_name)?;
+    let db_name = &session.database();
+    let (schema_name, index_name) = Binder::resolve_schema_qualified_name(db_name, &index_name)?;
     let search_path = session.config().search_path();
-    let user_name = &session.auth_context().user_name;
+    let user_name = &session.user_name();
     let schema_path = SchemaPath::new(schema_name.as_deref(), &search_path, user_name);
 
     let index_id = {
         let reader = session.env().catalog_reader().read_guard();
         match reader.get_index_by_name(db_name, schema_path, &index_name) {
             Ok((index, _)) => {
-                if session.user_id() != index.index_table.owner {
-                    return Err(PermissionDenied("Do not have the privilege".to_string()).into());
+                if !session.is_super_user() && session.user_id() != index.index_table().owner {
+                    return Err(PermissionDenied(format!(
+                        "must be owner of index \"{}\"",
+                        index.name
+                    ))
+                    .into());
                 }
 
                 index.id

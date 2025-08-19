@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use risingwave_common::error::AsReport;
 use risingwave_simulation::cluster::{Cluster, Configuration, Session};
 use tokio::time::sleep;
@@ -28,6 +28,7 @@ const DROP_TABLE: &str = "DROP TABLE t;";
 const SEED_TABLE_500: &str = "INSERT INTO t SELECT generate_series FROM generate_series(1, 500);";
 const SEED_TABLE_100: &str = "INSERT INTO t SELECT generate_series FROM generate_series(1, 100);";
 const SET_BACKGROUND_DDL: &str = "SET BACKGROUND_DDL=true;";
+const RESET_BACKGROUND_DDL: &str = "SET BACKGROUND_DDL=false;";
 const SET_RATE_LIMIT_2: &str = "SET BACKFILL_RATE_LIMIT=2;";
 const SET_RATE_LIMIT_1: &str = "SET BACKFILL_RATE_LIMIT=1;";
 const RESET_RATE_LIMIT: &str = "SET BACKFILL_RATE_LIMIT=DEFAULT;";
@@ -183,24 +184,24 @@ async fn test_ddl_cancel() -> Result<()> {
 
     // Test cancel after kill cn
     kill_cn_and_wait_recover(&cluster).await;
-
     let ids = cancel_stream_jobs(&mut session).await?;
     assert_eq!(ids.len(), 1);
+    tracing::info!("tested cancel background_ddl after recovery");
 
     sleep(Duration::from_secs(2)).await;
 
     create_mv(&mut session).await?;
 
-    // Test cancel after kill meta
+    // Test cancel after kill random nodes
     kill_random_and_wait_recover(&cluster).await;
-
     let ids = cancel_stream_jobs(&mut session).await?;
     assert_eq!(ids.len(), 1);
+    tracing::info!("tested cancel background_ddl after recovery from random node kill");
 
-    // Test cancel by sigkill
-
+    // Test cancel by sigkill (only works for foreground mv)
     let mut session2 = cluster.start_session();
     tokio::spawn(async move {
+        session2.run(RESET_BACKGROUND_DDL).await.unwrap();
         session2.run(SET_RATE_LIMIT_1).await.unwrap();
         let _ = create_mv(&mut session2).await;
     });
@@ -212,9 +213,12 @@ async fn test_ddl_cancel() -> Result<()> {
             .lines()
             .find(|line| line.to_lowercase().contains("mv1"))
         {
-            let pid = line.split_whitespace().next().unwrap();
-            let pid = pid.parse::<usize>().unwrap();
-            session.run(format!("kill {};", pid)).await?;
+            tracing::info!("found mv1 process: {}", line);
+            let mut splits = line.split_whitespace();
+            let _worker_id = splits.next().unwrap();
+            let pid = splits.next().unwrap();
+            session.run(format!("kill '{}';", pid)).await?;
+            sleep(Duration::from_secs(10)).await;
             break;
         }
         sleep(Duration::from_secs(2)).await;
@@ -229,7 +233,7 @@ async fn test_ddl_cancel() -> Result<()> {
         let result = create_mv(&mut session).await;
         match result {
             Ok(_) => break,
-            Err(e) if e.to_string().contains("The table is being created") => {
+            Err(e) if e.to_string().contains("under creation") => {
                 tracing::info!("create mv failed, retrying: {}", e);
             }
             Err(e) => {
@@ -262,12 +266,12 @@ async fn test_high_barrier_latency_cancel(config: Configuration) -> Result<()> {
 
     session.run("CREATE TABLE fact1 (v1 int)").await?;
     session
-        .run("INSERT INTO fact1 select 1 from generate_series(1, 100000)")
+        .run("INSERT INTO fact1 select 1 from generate_series(1, 10000)")
         .await?;
 
     session.run("CREATE TABLE fact2 (v1 int)").await?;
     session
-        .run("INSERT INTO fact2 select 1 from generate_series(1, 100000)")
+        .run("INSERT INTO fact2 select 1 from generate_series(1, 10000)")
         .await?;
     session.flush().await?;
 
@@ -277,6 +281,7 @@ async fn test_high_barrier_latency_cancel(config: Configuration) -> Result<()> {
     // Keep creating mv1, if it's not created.
     loop {
         session.run(SET_BACKGROUND_DDL).await?;
+        session.run(SET_RATE_LIMIT_2).await?;
         session.run("CREATE MATERIALIZED VIEW mv1 as select fact1.v1 from fact1 join fact2 on fact1.v1 = fact2.v1").await?;
         tracing::info!("created mv in background");
         sleep(Duration::from_secs(1)).await;
@@ -317,9 +322,9 @@ async fn test_high_barrier_latency_cancel(config: Configuration) -> Result<()> {
             .await
             .unwrap();
         tracing::info!(progress, "get progress before cancel stream job");
-        let progress = progress.replace('%', "");
+        let progress = progress.split_once("%").unwrap().0;
         let progress = progress.parse::<f64>().unwrap();
-        if progress > 0.01 {
+        if progress >= 0.01 {
             break;
         } else {
             sleep(Duration::from_micros(1)).await;

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::mem::replace;
 use std::sync::Arc;
 
 use risingwave_common::bitmap::Bitmap;
@@ -19,12 +22,13 @@ use risingwave_common::catalog::{TableId, TableOption};
 use risingwave_common::metrics::{
     LabelGuardedHistogram, LabelGuardedIntCounter, LabelGuardedIntGauge,
 };
-use risingwave_connector::sink::log_store::LogStoreFactory;
 use risingwave_connector::sink::SinkParam;
+use risingwave_connector::sink::log_store::LogStoreFactory;
 use risingwave_pb::catalog::Table;
-use risingwave_storage::store::{NewLocalOptions, OpConsistencyLevel};
 use risingwave_storage::StateStore;
-use tokio::sync::watch;
+use risingwave_storage::store::{LocalStateStore, NewLocalOptions, OpConsistencyLevel};
+use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::{oneshot, watch};
 
 use crate::common::log_store_impl::kv_log_store::buffer::new_log_store_buffer;
 use crate::common::log_store_impl::kv_log_store::reader::KvLogStoreReader;
@@ -32,54 +36,170 @@ use crate::common::log_store_impl::kv_log_store::serde::LogStoreRowSerde;
 use crate::common::log_store_impl::kv_log_store::writer::KvLogStoreWriter;
 use crate::executor::monitor::StreamingMetrics;
 
-mod buffer;
-mod reader;
+pub(crate) mod buffer;
+pub mod reader;
 pub(crate) mod serde;
+pub(crate) mod state;
 #[cfg(test)]
-mod test_utils;
+pub mod test_utils;
 mod writer;
 
 pub(crate) use reader::{REWIND_BACKOFF_FACTOR, REWIND_BASE_DELAY, REWIND_MAX_DELAY};
-use risingwave_common::hash::VirtualNode;
+use risingwave_common::hash::{VirtualNode, VnodeBitmapExt};
 use risingwave_common::row::ArrayVec;
 use risingwave_common::types::{DataType, Datum};
 use risingwave_common::util::sort_util::OrderType;
 
-pub(crate) type SeqIdType = i32;
+#[derive(Debug)]
+pub(crate) enum LogStoreVnodeProgress {
+    None,
+    PerVnode(HashMap<VirtualNode, (Epoch, Option<SeqId>)>),
+    Aligned(Arc<Bitmap>, Epoch, Option<SeqId>),
+}
+
+impl LogStoreVnodeProgress {
+    pub(crate) fn take(&mut self) -> Self {
+        replace(self, Self::None)
+    }
+
+    fn assert_progress_increase(
+        prev_epoch: Epoch,
+        prev_progress: Option<SeqId>,
+        epoch: Epoch,
+        progress: Option<SeqId>,
+    ) {
+        match prev_progress {
+            None => {
+                assert!(
+                    prev_epoch < epoch,
+                    "barrier epoch {} decrease to {}",
+                    prev_epoch,
+                    epoch
+                );
+            }
+            Some(prev_progress) => {
+                assert_eq!(prev_epoch, epoch);
+                if let Some(progress) = progress {
+                    assert!(progress > prev_progress);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn apply_per_vnode(&mut self, epoch: Epoch, progress: HashMap<VirtualNode, SeqId>) {
+        fn apply_to_progress_map(
+            prev_progress: &mut HashMap<VirtualNode, (Epoch, Option<SeqId>)>,
+            epoch: Epoch,
+            progress: HashMap<VirtualNode, SeqId>,
+        ) {
+            for (vnode, seq_id) in progress {
+                match prev_progress.entry(vnode) {
+                    Entry::Occupied(entry) => {
+                        let (prev_epoch, prev_seq_id) = entry.into_mut();
+                        LogStoreVnodeProgress::assert_progress_increase(
+                            *prev_epoch,
+                            *prev_seq_id,
+                            epoch,
+                            Some(seq_id),
+                        );
+                        *prev_epoch = epoch;
+                        *prev_seq_id = Some(seq_id);
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert((epoch, Some(seq_id)));
+                    }
+                }
+            }
+        }
+        match self {
+            LogStoreVnodeProgress::None => {
+                *self = LogStoreVnodeProgress::PerVnode(
+                    progress
+                        .into_iter()
+                        .map(|(vnode, seq_id)| (vnode, (epoch, Some(seq_id))))
+                        .collect(),
+                )
+            }
+            LogStoreVnodeProgress::PerVnode(prev_progress) => {
+                apply_to_progress_map(prev_progress, epoch, progress);
+            }
+            LogStoreVnodeProgress::Aligned(vnodes, prev_epoch, prev_progress) => {
+                let mut progress_map = vnodes
+                    .iter_vnodes()
+                    .map(|vnode| (vnode, (*prev_epoch, *prev_progress)))
+                    .collect();
+                apply_to_progress_map(&mut progress_map, epoch, progress);
+                *self = LogStoreVnodeProgress::PerVnode(progress_map);
+            }
+        }
+    }
+
+    pub(crate) fn apply_aligned(
+        &mut self,
+        vnodes: Arc<Bitmap>,
+        epoch: Epoch,
+        progress: Option<SeqId>,
+    ) {
+        match self {
+            LogStoreVnodeProgress::None => {}
+            LogStoreVnodeProgress::PerVnode(prev_progress) => {
+                for (vnode, (prev_epoch, prev_progress)) in prev_progress.drain() {
+                    assert!(
+                        vnodes.is_set(vnode.to_index()),
+                        "aligned progress not covered existing vnode {}",
+                        vnode
+                    );
+                    Self::assert_progress_increase(prev_epoch, prev_progress, epoch, progress);
+                }
+            }
+            LogStoreVnodeProgress::Aligned(prev_vnodes, prev_epoch, prev_progress) => {
+                assert_eq!(vnodes.len(), prev_vnodes.len());
+                assert!(prev_vnodes.iter_ones().all(|vnode| vnodes.is_set(vnode)));
+                Self::assert_progress_increase(*prev_epoch, *prev_progress, epoch, progress);
+            }
+        }
+        *self = LogStoreVnodeProgress::Aligned(vnodes, epoch, progress);
+    }
+}
+
+// TODO: unify with `risingwave_common::Epoch`
+pub(crate) type Epoch = u64;
+
+pub(crate) type SeqId = i32;
 type RowOpCodeType = i16;
 
-pub(crate) const FIRST_SEQ_ID: SeqIdType = 0;
+pub(crate) const FIRST_SEQ_ID: SeqId = 0;
 
 /// Readers truncate the offset at the granularity of seq id.
 /// None `SeqIdType` means that the whole epoch is truncated.
-pub(crate) type ReaderTruncationOffsetType = (u64, Option<SeqIdType>);
+pub(crate) type ReaderTruncationOffsetType = (u64, Option<SeqId>);
 
 #[derive(Clone)]
-pub(crate) struct KvLogStoreReadMetrics {
-    pub storage_read_count: LabelGuardedIntCounter<5>,
-    pub storage_read_size: LabelGuardedIntCounter<5>,
+pub struct KvLogStoreReadMetrics {
+    pub storage_read_count: LabelGuardedIntCounter,
+    pub storage_read_size: LabelGuardedIntCounter,
 }
 
 impl KvLogStoreReadMetrics {
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
         Self {
-            storage_read_count: LabelGuardedIntCounter::test_int_counter(),
-            storage_read_size: LabelGuardedIntCounter::test_int_counter(),
+            storage_read_count: LabelGuardedIntCounter::test_int_counter::<5>(),
+            storage_read_size: LabelGuardedIntCounter::test_int_counter::<5>(),
         }
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct KvLogStoreMetrics {
-    pub storage_write_count: LabelGuardedIntCounter<4>,
-    pub storage_write_size: LabelGuardedIntCounter<4>,
-    pub rewind_count: LabelGuardedIntCounter<4>,
-    pub rewind_delay: LabelGuardedHistogram<4>,
-    pub buffer_unconsumed_item_count: LabelGuardedIntGauge<4>,
-    pub buffer_unconsumed_row_count: LabelGuardedIntGauge<4>,
-    pub buffer_unconsumed_epoch_count: LabelGuardedIntGauge<4>,
-    pub buffer_unconsumed_min_epoch: LabelGuardedIntGauge<4>,
+    pub storage_write_count: LabelGuardedIntCounter,
+    pub storage_write_size: LabelGuardedIntCounter,
+    pub rewind_count: LabelGuardedIntCounter,
+    pub rewind_delay: LabelGuardedHistogram,
+    pub buffer_unconsumed_item_count: LabelGuardedIntGauge,
+    pub buffer_unconsumed_row_count: LabelGuardedIntGauge,
+    pub buffer_unconsumed_epoch_count: LabelGuardedIntGauge,
+    pub buffer_unconsumed_min_epoch: LabelGuardedIntGauge,
     pub persistent_log_read_metrics: KvLogStoreReadMetrics,
     pub flushed_buffer_read_metrics: KvLogStoreReadMetrics,
 }
@@ -91,15 +211,28 @@ impl KvLogStoreMetrics {
         sink_param: &SinkParam,
         connector: &'static str,
     ) -> Self {
-        let actor_id_str = actor_id.to_string();
-        let sink_id_str = sink_param.sink_id.sink_id.to_string();
+        let id = sink_param.sink_id.sink_id;
+        let name = &sink_param.sink_name;
+        Self::new_inner(metrics, actor_id, id, name, connector)
+    }
 
-        let labels = &[
-            &actor_id_str,
-            connector,
-            &sink_id_str,
-            &sink_param.sink_name,
-        ];
+    /// `id`: refers to a unique way to identify the logstore. This can be the sink id,
+    ///       or for joins, it can be the `fragment_id`.
+    /// `name`: refers to the MV / Sink that the log store is associated with.
+    /// `target`: refers to the target of the log store,
+    ///           for instance `MySql` Sink, PG sink, etc...
+    ///           or unaligned join.
+    pub(crate) fn new_inner(
+        metrics: &StreamingMetrics,
+        actor_id: ActorId,
+        id: u32,
+        name: &str,
+        target: &'static str,
+    ) -> Self {
+        let actor_id_str = actor_id.to_string();
+        let id_str = id.to_string();
+
+        let labels = &[&actor_id_str, target, &id_str, name];
         let storage_write_size = metrics
             .kv_log_store_storage_write_size
             .with_guarded_label_values(labels);
@@ -113,38 +246,38 @@ impl KvLogStoreMetrics {
         let persistent_log_read_size = metrics
             .kv_log_store_storage_read_size
             .with_guarded_label_values(&[
-                &actor_id_str,
-                connector,
-                &sink_id_str,
-                &sink_param.sink_name,
+                actor_id_str.as_str(),
+                target,
+                id_str.as_str(),
+                name,
                 READ_PERSISTENT_LOG,
             ]);
         let persistent_log_read_count = metrics
             .kv_log_store_storage_read_count
             .with_guarded_label_values(&[
-                &actor_id_str,
-                connector,
-                &sink_id_str,
-                &sink_param.sink_name,
+                actor_id_str.as_str(),
+                target,
+                id_str.as_str(),
+                name,
                 READ_PERSISTENT_LOG,
             ]);
 
         let flushed_buffer_read_size = metrics
             .kv_log_store_storage_read_size
             .with_guarded_label_values(&[
-                &actor_id_str,
-                connector,
-                &sink_id_str,
-                &sink_param.sink_name,
+                actor_id_str.as_str(),
+                target,
+                id_str.as_str(),
+                name,
                 READ_FLUSHED_BUFFER,
             ]);
         let flushed_buffer_read_count = metrics
             .kv_log_store_storage_read_count
             .with_guarded_label_values(&[
-                &actor_id_str,
-                connector,
-                &sink_id_str,
-                &sink_param.sink_name,
+                actor_id_str.as_str(),
+                target,
+                id_str.as_str(),
+                name,
                 READ_FLUSHED_BUFFER,
             ]);
 
@@ -190,16 +323,16 @@ impl KvLogStoreMetrics {
     }
 
     #[cfg(test)]
-    fn for_test() -> Self {
+    pub(crate) fn for_test() -> Self {
         KvLogStoreMetrics {
-            storage_write_count: LabelGuardedIntCounter::test_int_counter(),
-            storage_write_size: LabelGuardedIntCounter::test_int_counter(),
-            buffer_unconsumed_item_count: LabelGuardedIntGauge::test_int_gauge(),
-            buffer_unconsumed_row_count: LabelGuardedIntGauge::test_int_gauge(),
-            buffer_unconsumed_epoch_count: LabelGuardedIntGauge::test_int_gauge(),
-            buffer_unconsumed_min_epoch: LabelGuardedIntGauge::test_int_gauge(),
-            rewind_count: LabelGuardedIntCounter::test_int_counter(),
-            rewind_delay: LabelGuardedHistogram::test_histogram(),
+            storage_write_count: LabelGuardedIntCounter::test_int_counter::<4>(),
+            storage_write_size: LabelGuardedIntCounter::test_int_counter::<4>(),
+            buffer_unconsumed_item_count: LabelGuardedIntGauge::test_int_gauge::<4>(),
+            buffer_unconsumed_row_count: LabelGuardedIntGauge::test_int_gauge::<4>(),
+            buffer_unconsumed_epoch_count: LabelGuardedIntGauge::test_int_gauge::<4>(),
+            buffer_unconsumed_min_epoch: LabelGuardedIntGauge::test_int_gauge::<4>(),
+            rewind_count: LabelGuardedIntCounter::test_int_counter::<4>(),
+            rewind_delay: LabelGuardedHistogram::test_histogram::<4>(),
             persistent_log_read_metrics: KvLogStoreReadMetrics::for_test(),
             flushed_buffer_read_metrics: KvLogStoreReadMetrics::for_test(),
         }
@@ -239,7 +372,7 @@ pub(crate) struct KvLogStorePkInfo {
     pub predefined_columns: &'static [(&'static str, DataType)],
     pub pk_orderings: &'static [OrderType],
     pub compute_pk:
-        fn(vnode: VirtualNode, encoded_epoch: i64, seq_id: Option<SeqIdType>) -> KvLogStorePkRow,
+        fn(vnode: VirtualNode, encoded_epoch: i64, seq_id: Option<SeqId>) -> KvLogStorePkRow,
 }
 
 impl KvLogStorePkInfo {
@@ -272,14 +405,14 @@ mod v1 {
     use risingwave_common::types::ScalarImpl;
 
     use super::{KvLogStorePkInfo, KvLogStorePkRow};
-    use crate::common::log_store_impl::kv_log_store::SeqIdType;
+    use crate::common::log_store_impl::kv_log_store::SeqId;
 
     #[deprecated]
     pub(crate) static KV_LOG_STORE_V1_INFO: LazyLock<KvLogStorePkInfo> = LazyLock::new(|| {
         fn compute_pk(
             _vnode: VirtualNode,
             encoded_epoch: i64,
-            seq_id: Option<SeqIdType>,
+            seq_id: Option<SeqId>,
         ) -> KvLogStorePkRow {
             KvLogStorePkRow::from_array_len(
                 [
@@ -303,6 +436,7 @@ mod v1 {
 
 pub(crate) use v2::KV_LOG_STORE_V2_INFO;
 
+use crate::common::log_store_impl::kv_log_store::state::new_log_store_state;
 use crate::task::ActorId;
 
 /// A new version of log store schema. Compared to v1, the v2 added a new vnode column to the log store pk,
@@ -322,13 +456,13 @@ mod v2 {
     use risingwave_common::types::ScalarImpl;
 
     use super::{KvLogStorePkInfo, KvLogStorePkRow};
-    use crate::common::log_store_impl::kv_log_store::SeqIdType;
+    use crate::common::log_store_impl::kv_log_store::SeqId;
 
     pub(crate) static KV_LOG_STORE_V2_INFO: LazyLock<KvLogStorePkInfo> = LazyLock::new(|| {
         fn compute_pk(
             vnode: VirtualNode,
             encoded_epoch: i64,
-            seq_id: Option<SeqIdType>,
+            seq_id: Option<SeqId>,
         ) -> KvLogStorePkRow {
             KvLogStorePkRow::from([
                 Some(ScalarImpl::Int64(encoded_epoch)),
@@ -354,7 +488,8 @@ pub struct KvLogStoreFactory<S: StateStore> {
 
     vnodes: Option<Arc<Bitmap>>,
 
-    max_row_count: usize,
+    max_buffer_row_count: usize,
+    chunk_size: usize,
 
     metrics: KvLogStoreMetrics,
 
@@ -364,11 +499,13 @@ pub struct KvLogStoreFactory<S: StateStore> {
 }
 
 impl<S: StateStore> KvLogStoreFactory<S> {
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         state_store: S,
         table_catalog: Table,
         vnodes: Option<Arc<Bitmap>>,
-        max_row_count: usize,
+        max_buffer_row_count: usize,
+        chunk_size: usize,
         metrics: KvLogStoreMetrics,
         identity: impl Into<String>,
         pk_info: &'static KvLogStorePkInfo,
@@ -377,7 +514,8 @@ impl<S: StateStore> KvLogStoreFactory<S> {
             state_store,
             table_catalog,
             vnodes,
-            max_row_count,
+            max_buffer_row_count,
+            chunk_size,
             metrics,
             identity: identity.into(),
             pk_info,
@@ -386,8 +524,11 @@ impl<S: StateStore> KvLogStoreFactory<S> {
 }
 
 impl<S: StateStore> LogStoreFactory for KvLogStoreFactory<S> {
-    type Reader = KvLogStoreReader<S>;
+    type Reader = KvLogStoreReader<<S::Local as LocalStateStore>::FlushedSnapshotReader>;
     type Writer = KvLogStoreWriter<S::Local>;
+
+    const ALLOW_REWIND: bool = true;
+    const REBUILD_SINK_ON_UPDATE_VNODE_BITMAP: bool = true;
 
     async fn build(self) -> (Self::Reader, Self::Writer) {
         let table_id = TableId::new(self.table_catalog.id);
@@ -396,35 +537,44 @@ impl<S: StateStore> LogStoreFactory for KvLogStoreFactory<S> {
         let local_state_store = self
             .state_store
             .new_local(NewLocalOptions {
-                table_id: TableId {
-                    table_id: self.table_catalog.id,
-                },
+                table_id,
                 op_consistency_level: OpConsistencyLevel::Inconsistent,
                 table_option: TableOption {
                     retention_seconds: None,
                 },
                 is_replicated: false,
                 vnodes: serde.vnodes().clone(),
+                upload_on_flush: false,
             })
             .await;
 
-        let (tx, rx) = new_log_store_buffer(self.max_row_count, self.metrics.clone());
+        let (tx, rx) = new_log_store_buffer(
+            self.max_buffer_row_count,
+            self.chunk_size,
+            self.metrics.clone(),
+        );
+
+        let (read_state, write_state) =
+            new_log_store_state(table_id, local_state_store, serde, self.chunk_size);
+
+        let (init_epoch_tx, init_epoch_rx) = oneshot::channel();
+        let (update_vnode_bitmap_tx, update_vnode_bitmap_rx) = unbounded_channel();
 
         let reader = KvLogStoreReader::new(
-            table_id,
-            self.state_store,
-            serde.clone(),
+            read_state,
             rx,
+            init_epoch_rx,
+            update_vnode_bitmap_rx,
             self.metrics.clone(),
             pause_rx,
             self.identity.clone(),
         );
 
         let writer = KvLogStoreWriter::new(
-            table_id,
-            local_state_store,
-            serde,
+            write_state,
             tx,
+            init_epoch_tx,
+            update_vnode_bitmap_tx,
             self.metrics,
             pause_tx,
             self.identity,
@@ -437,7 +587,7 @@ impl<S: StateStore> LogStoreFactory for KvLogStoreFactory<S> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::future::{poll_fn, Future};
+    use std::future::{Future, poll_fn};
     use std::iter::empty;
     use std::pin::pin;
     use std::sync::Arc;
@@ -452,19 +602,15 @@ mod tests {
     use risingwave_connector::sink::log_store::{
         ChunkId, LogReader, LogStoreFactory, LogStoreReadItem, LogWriter, TruncateOffset,
     };
-    use risingwave_hummock_sdk::HummockReadEpoch;
     use risingwave_hummock_test::test_utils::prepare_hummock_test_env;
-    use risingwave_storage::hummock::HummockStorage;
-    use risingwave_storage::StateStore;
 
-    use crate::common::log_store_impl::kv_log_store::reader::KvLogStoreReader;
     use crate::common::log_store_impl::kv_log_store::test_utils::{
-        calculate_vnode_bitmap, check_rows_eq, check_stream_chunk_eq,
-        gen_multi_vnode_stream_chunks, gen_stream_chunk_with_info, gen_test_log_store_table,
-        TEST_DATA_SIZE,
+        LogWriterTestExt, TEST_DATA_SIZE, calculate_vnode_bitmap, check_rows_eq,
+        check_stream_chunk_eq, gen_multi_vnode_stream_chunks, gen_stream_chunk_with_info,
+        gen_test_log_store_table,
     };
     use crate::common::log_store_impl::kv_log_store::{
-        KvLogStoreFactory, KvLogStoreMetrics, KvLogStorePkInfo, KV_LOG_STORE_V2_INFO,
+        KV_LOG_STORE_V2_INFO, KvLogStoreFactory, KvLogStoreMetrics, KvLogStorePkInfo,
     };
 
     #[tokio::test]
@@ -497,6 +643,7 @@ mod tests {
             table.clone(),
             Some(Arc::new(bitmap)),
             max_row_count,
+            1024,
             KvLogStoreMetrics::for_test(),
             "test",
             pk_info,
@@ -506,8 +653,8 @@ mod tests {
         let epoch1 = test_env
             .storage
             .get_pinned_version()
-            .version()
-            .max_committed_epoch
+            .table_committed_epoch(TableId::new(table.id))
+            .unwrap()
             .next_epoch();
         test_env
             .storage
@@ -521,16 +668,26 @@ mod tests {
         test_env
             .storage
             .start_epoch(epoch2, HashSet::from_iter([TableId::new(table.id)]));
-        writer.flush_current_epoch(epoch2, false).await.unwrap();
+        writer
+            .flush_current_epoch_for_test(epoch2, false)
+            .await
+            .unwrap();
         writer.write_chunk(stream_chunk2.clone()).await.unwrap();
         let epoch3 = epoch2.next_epoch();
-        writer.flush_current_epoch(epoch3, true).await.unwrap();
+        writer
+            .flush_current_epoch_for_test(epoch3, true)
+            .await
+            .unwrap();
 
-        test_env.storage.seal_epoch(epoch1, false);
-        let sync_result = test_env.storage.seal_and_sync_epoch(epoch2).await.unwrap();
+        let sync_result = test_env
+            .storage
+            .seal_and_sync_epoch(epoch2, HashSet::from_iter([table.id.into()]))
+            .await
+            .unwrap();
         assert!(!sync_result.uncommitted_ssts.is_empty());
 
         reader.init().await.unwrap();
+        reader.start_from(None).await.unwrap();
         match reader.next_item().await.unwrap() {
             (
                 epoch,
@@ -545,7 +702,7 @@ mod tests {
             _ => unreachable!(),
         }
         match reader.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert_eq!(epoch, epoch1);
                 assert!(!is_checkpoint)
             }
@@ -565,7 +722,7 @@ mod tests {
             _ => unreachable!(),
         }
         match reader.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert_eq!(epoch, epoch2);
                 assert!(is_checkpoint)
             }
@@ -604,6 +761,7 @@ mod tests {
             table.clone(),
             Some(bitmap.clone()),
             max_row_count,
+            1024,
             KvLogStoreMetrics::for_test(),
             "test",
             pk_info,
@@ -613,8 +771,8 @@ mod tests {
         let epoch1 = test_env
             .storage
             .get_pinned_version()
-            .version()
-            .max_committed_epoch
+            .table_committed_epoch(TableId::new(table.id))
+            .unwrap()
             .next_epoch();
         test_env
             .storage
@@ -628,14 +786,19 @@ mod tests {
         test_env
             .storage
             .start_epoch(epoch2, HashSet::from_iter([TableId::new(table.id)]));
-        writer.flush_current_epoch(epoch2, false).await.unwrap();
+        writer
+            .flush_current_epoch_for_test(epoch2, false)
+            .await
+            .unwrap();
         writer.write_chunk(stream_chunk2.clone()).await.unwrap();
         let epoch3 = epoch2.next_epoch();
-        writer.flush_current_epoch(epoch3, true).await.unwrap();
-
-        test_env.storage.seal_epoch(epoch1, false);
+        writer
+            .flush_current_epoch_for_test(epoch3, true)
+            .await
+            .unwrap();
 
         reader.init().await.unwrap();
+        reader.start_from(None).await.unwrap();
         match reader.next_item().await.unwrap() {
             (
                 epoch,
@@ -650,7 +813,7 @@ mod tests {
             _ => unreachable!(),
         }
         match reader.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert_eq!(epoch, epoch1);
                 assert!(!is_checkpoint)
             }
@@ -670,7 +833,7 @@ mod tests {
             _ => unreachable!(),
         }
         match reader.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert_eq!(epoch, epoch2);
                 assert!(is_checkpoint)
             }
@@ -682,16 +845,11 @@ mod tests {
         reader
             .truncate(TruncateOffset::Barrier { epoch: epoch2 })
             .unwrap();
-        test_env
-            .storage
-            .try_wait_epoch(HummockReadEpoch::Committed(epoch2))
-            .await
-            .unwrap();
 
         drop(writer);
 
         // Recovery
-        test_env.storage.clear_shared_buffer(epoch2).await;
+        test_env.storage.clear_shared_buffer().await;
 
         // Rebuild log reader and writer in recovery
         let factory = KvLogStoreFactory::new(
@@ -699,6 +857,7 @@ mod tests {
             table.clone(),
             Some(bitmap),
             max_row_count,
+            1024,
             KvLogStoreMetrics::for_test(),
             "test",
             pk_info,
@@ -712,6 +871,7 @@ mod tests {
             .await
             .unwrap();
         reader.init().await.unwrap();
+        reader.start_from(None).await.unwrap();
         match reader.next_item().await.unwrap() {
             (
                 epoch,
@@ -726,7 +886,7 @@ mod tests {
             _ => unreachable!(),
         }
         match reader.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert_eq!(epoch, epoch1);
                 assert!(!is_checkpoint)
             }
@@ -746,7 +906,7 @@ mod tests {
             _ => unreachable!(),
         }
         match reader.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert_eq!(epoch, epoch2);
                 assert!(is_checkpoint)
             }
@@ -793,6 +953,7 @@ mod tests {
             table.clone(),
             Some(bitmap.clone()),
             max_row_count,
+            1024,
             KvLogStoreMetrics::for_test(),
             "test",
             pk_info,
@@ -802,8 +963,8 @@ mod tests {
         let epoch1 = test_env
             .storage
             .get_pinned_version()
-            .version()
-            .max_committed_epoch
+            .table_committed_epoch(TableId::new(table.id))
+            .unwrap()
             .next_epoch();
         test_env
             .storage
@@ -818,12 +979,16 @@ mod tests {
         test_env
             .storage
             .start_epoch(epoch2, HashSet::from_iter([TableId::new(table.id)]));
-        writer.flush_current_epoch(epoch2, true).await.unwrap();
+        writer
+            .flush_current_epoch_for_test(epoch2, true)
+            .await
+            .unwrap();
         writer.write_chunk(stream_chunk2.clone()).await.unwrap();
 
         test_env.commit_epoch(epoch1).await;
 
         reader.init().await.unwrap();
+        reader.start_from(None).await.unwrap();
         let chunk_id1 = match reader.next_item().await.unwrap() {
             (
                 epoch,
@@ -854,7 +1019,7 @@ mod tests {
         };
         assert!(chunk_id2 > chunk_id1);
         match reader.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert_eq!(epoch, epoch1);
                 assert!(is_checkpoint)
             }
@@ -883,10 +1048,13 @@ mod tests {
             })
             .unwrap();
         let epoch3 = epoch2.next_epoch();
-        writer.flush_current_epoch(epoch3, true).await.unwrap();
+        writer
+            .flush_current_epoch_for_test(epoch3, true)
+            .await
+            .unwrap();
 
         match reader.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert_eq!(epoch, epoch2);
                 assert!(is_checkpoint)
             }
@@ -895,16 +1063,11 @@ mod tests {
 
         // Truncation on epoch1 should work because it is before this sync
         test_env.commit_epoch(epoch2).await;
-        test_env
-            .storage
-            .try_wait_epoch(HummockReadEpoch::Committed(epoch2))
-            .await
-            .unwrap();
 
         drop(writer);
 
         // Recovery
-        test_env.storage.clear_shared_buffer(epoch2).await;
+        test_env.storage.clear_shared_buffer().await;
 
         // Rebuild log reader and writer in recovery
         let factory = KvLogStoreFactory::new(
@@ -912,6 +1075,7 @@ mod tests {
             table.clone(),
             Some(bitmap),
             max_row_count,
+            1024,
             KvLogStoreMetrics::for_test(),
             "test",
             pk_info,
@@ -929,6 +1093,7 @@ mod tests {
         writer.write_chunk(stream_chunk3.clone()).await.unwrap();
 
         reader.init().await.unwrap();
+        reader.start_from(None).await.unwrap();
         match reader.next_item().await.unwrap() {
             (
                 epoch,
@@ -943,7 +1108,7 @@ mod tests {
             _ => unreachable!(),
         }
         match reader.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert_eq!(epoch, epoch1);
                 assert!(is_checkpoint)
             }
@@ -963,7 +1128,7 @@ mod tests {
             _ => unreachable!(),
         }
         match reader.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert_eq!(epoch, epoch2);
                 assert!(is_checkpoint)
             }
@@ -994,21 +1159,22 @@ mod tests {
         test_env.register_table(table.clone()).await;
 
         fn build_bitmap(indexes: impl Iterator<Item = usize>) -> Arc<Bitmap> {
-            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT);
+            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT_FOR_TEST);
             for i in indexes {
                 builder.set(i, true);
             }
             Arc::new(builder.finish())
         }
 
-        let vnodes1 = build_bitmap((0..VirtualNode::COUNT).filter(|i| i % 2 == 0));
-        let vnodes2 = build_bitmap((0..VirtualNode::COUNT).filter(|i| i % 2 == 1));
+        let vnodes1 = build_bitmap((0..VirtualNode::COUNT_FOR_TEST).filter(|i| i % 2 == 0));
+        let vnodes2 = build_bitmap((0..VirtualNode::COUNT_FOR_TEST).filter(|i| i % 2 == 1));
 
         let factory1 = KvLogStoreFactory::new(
             test_env.storage.clone(),
             table.clone(),
             Some(vnodes1),
             10 * TEST_DATA_SIZE,
+            1024,
             KvLogStoreMetrics::for_test(),
             "test",
             pk_info,
@@ -1018,6 +1184,7 @@ mod tests {
             table.clone(),
             Some(vnodes2),
             10 * TEST_DATA_SIZE,
+            1024,
             KvLogStoreMetrics::for_test(),
             "test",
             pk_info,
@@ -1028,8 +1195,8 @@ mod tests {
         let epoch1 = test_env
             .storage
             .get_pinned_version()
-            .version()
-            .max_committed_epoch
+            .table_committed_epoch(TableId::new(table.id))
+            .unwrap()
             .next_epoch();
         test_env
             .storage
@@ -1043,7 +1210,9 @@ mod tests {
             .await
             .unwrap();
         reader1.init().await.unwrap();
+        reader1.start_from(None).await.unwrap();
         reader2.init().await.unwrap();
+        reader2.start_from(None).await.unwrap();
         let [chunk1_1, chunk1_2] = gen_multi_vnode_stream_chunks::<2>(0, 100, pk_info);
         writer1.write_chunk(chunk1_1.clone()).await.unwrap();
         writer2.write_chunk(chunk1_2.clone()).await.unwrap();
@@ -1051,8 +1220,14 @@ mod tests {
         test_env
             .storage
             .start_epoch(epoch2, HashSet::from_iter([TableId::new(table.id)]));
-        writer1.flush_current_epoch(epoch2, false).await.unwrap();
-        writer2.flush_current_epoch(epoch2, false).await.unwrap();
+        writer1
+            .flush_current_epoch_for_test(epoch2, false)
+            .await
+            .unwrap();
+        writer2
+            .flush_current_epoch_for_test(epoch2, false)
+            .await
+            .unwrap();
         let [chunk2_1, chunk2_2] = gen_multi_vnode_stream_chunks::<2>(200, 100, pk_info);
         writer1.write_chunk(chunk2_1.clone()).await.unwrap();
         writer2.write_chunk(chunk2_2.clone()).await.unwrap();
@@ -1065,7 +1240,7 @@ mod tests {
             _ => unreachable!(),
         };
         match reader1.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert_eq!(epoch, epoch1);
                 assert!(!is_checkpoint);
             }
@@ -1080,7 +1255,7 @@ mod tests {
             _ => unreachable!(),
         }
         match reader2.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert_eq!(epoch, epoch1);
                 assert!(!is_checkpoint);
             }
@@ -1108,18 +1283,24 @@ mod tests {
         }
 
         let epoch3 = epoch2.next_epoch();
-        writer1.flush_current_epoch(epoch3, true).await.unwrap();
-        writer2.flush_current_epoch(epoch3, true).await.unwrap();
+        writer1
+            .flush_current_epoch_for_test(epoch3, true)
+            .await
+            .unwrap();
+        writer2
+            .flush_current_epoch_for_test(epoch3, true)
+            .await
+            .unwrap();
 
         match reader1.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert_eq!(epoch, epoch2);
                 assert!(is_checkpoint);
             }
             _ => unreachable!(),
         }
         match reader2.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert_eq!(epoch, epoch2);
                 assert!(is_checkpoint);
             }
@@ -1127,26 +1308,21 @@ mod tests {
         }
 
         // Truncation of reader1 on epoch1 should work because it is before this sync
-        test_env.storage.seal_epoch(epoch1, false);
         test_env.commit_epoch(epoch2).await;
-        test_env
-            .storage
-            .try_wait_epoch(HummockReadEpoch::Committed(epoch2))
-            .await
-            .unwrap();
 
         drop(writer1);
         drop(writer2);
 
         // Recovery
-        test_env.storage.clear_shared_buffer(epoch2).await;
+        test_env.storage.clear_shared_buffer().await;
 
-        let vnodes = build_bitmap(0..VirtualNode::COUNT);
+        let vnodes = build_bitmap(0..VirtualNode::COUNT_FOR_TEST);
         let factory = KvLogStoreFactory::new(
             test_env.storage.clone(),
             table.clone(),
             Some(vnodes),
             10 * TEST_DATA_SIZE,
+            1024,
             KvLogStoreMetrics::for_test(),
             "test",
             pk_info,
@@ -1160,19 +1336,25 @@ mod tests {
             .await
             .unwrap();
         reader.init().await.unwrap();
-        match reader.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::StreamChunk { chunk, .. }) => {
-                assert_eq!(epoch, epoch1);
-                assert!(check_stream_chunk_eq(&chunk1_2, &chunk));
+        reader.start_from(None).await.unwrap();
+        {
+            // Though we don't truncate reader2 with epoch1, we have truncated reader1 with epoch1, and with align_init_epoch
+            // set to true, we won't receive the following commented items.
+            match reader.next_item().await.unwrap() {
+                (epoch, LogStoreReadItem::StreamChunk { chunk, .. }) => {
+                    assert_eq!(epoch, epoch1);
+                    assert!(check_stream_chunk_eq(&chunk1_2, &chunk));
+                }
+
+                _ => unreachable!(),
             }
-            _ => unreachable!(),
-        }
-        match reader.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
-                assert_eq!(epoch, epoch1);
-                assert!(!is_checkpoint);
+            match reader.next_item().await.unwrap() {
+                (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
+                    assert_eq!(epoch, epoch1);
+                    assert!(!is_checkpoint);
+                }
+                _ => unreachable!(),
             }
-            _ => unreachable!(),
         }
         match reader.next_item().await.unwrap() {
             (epoch, LogStoreReadItem::StreamChunk { chunk, .. }) => {
@@ -1185,7 +1367,7 @@ mod tests {
             _ => unreachable!(),
         }
         match reader.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert_eq!(epoch, epoch2);
                 assert!(is_checkpoint);
             }
@@ -1212,6 +1394,7 @@ mod tests {
             table.clone(),
             Some(Arc::new(bitmap)),
             0,
+            1024,
             KvLogStoreMetrics::for_test(),
             "test",
             pk_info,
@@ -1221,8 +1404,8 @@ mod tests {
         let epoch1 = test_env
             .storage
             .get_pinned_version()
-            .version()
-            .max_committed_epoch
+            .table_committed_epoch(TableId::new(table.id))
+            .unwrap()
             .next_epoch();
         test_env
             .storage
@@ -1233,15 +1416,21 @@ mod tests {
             .unwrap();
         writer.write_chunk(stream_chunk1.clone()).await.unwrap();
         let epoch2 = epoch1.next_epoch();
-        writer.flush_current_epoch(epoch2, true).await.unwrap();
+        writer
+            .flush_current_epoch_for_test(epoch2, true)
+            .await
+            .unwrap();
 
         reader.init().await.unwrap();
+        reader.start_from(None).await.unwrap();
 
         {
             let mut future = pin!(reader.next_item());
-            assert!(poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx)))
-                .await
-                .is_pending());
+            assert!(
+                poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
         }
 
         match reader.next_item().await.unwrap() {
@@ -1255,10 +1444,10 @@ mod tests {
                 assert_eq!(epoch, epoch1);
                 assert!(check_stream_chunk_eq(&stream_chunk1, &read_stream_chunk));
             }
-            _ => unreachable!(),
+            item => unreachable!("{:?}", item),
         }
         match reader.next_item().await.unwrap() {
-            (epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                 assert_eq!(epoch, epoch1);
                 assert!(is_checkpoint)
             }
@@ -1292,21 +1481,21 @@ mod tests {
         let bitmap = Arc::new(bitmap);
 
         async fn check_reader<'a, 'b>(
-            reader: &'a mut KvLogStoreReader<HummockStorage>,
+            reader: &'a mut impl LogReader,
             data: impl Iterator<Item = &'b (u64, Option<&'b StreamChunk>)>,
         ) -> Vec<ChunkId> {
             check_reader_inner(reader, data, true).await
         }
 
         async fn check_reader_last_unsealed<'a, 'b>(
-            reader: &'a mut KvLogStoreReader<HummockStorage>,
+            reader: &'a mut impl LogReader,
             data: impl Iterator<Item = &'b (u64, Option<&'b StreamChunk>)>,
         ) -> Vec<ChunkId> {
             check_reader_inner(reader, data, false).await
         }
 
         async fn check_reader_inner<'a, 'b>(
-            reader: &'a mut KvLogStoreReader<HummockStorage>,
+            reader: &'a mut impl LogReader,
             data: impl Iterator<Item = &'b (u64, Option<&'b StreamChunk>)>,
             last_sealed: bool,
         ) -> Vec<ChunkId> {
@@ -1332,7 +1521,7 @@ mod tests {
                 }
                 if last_sealed || i != size - 1 {
                     match reader.next_item().await.unwrap() {
-                        (item_epoch, LogStoreReadItem::Barrier { is_checkpoint }) => {
+                        (item_epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
                             assert_eq!(item_epoch, *epoch);
                             assert!(is_checkpoint)
                         }
@@ -1341,9 +1530,11 @@ mod tests {
                 }
             }
             let mut future = pin!(reader.next_item());
-            assert!(poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx)))
-                .await
-                .is_pending());
+            assert!(
+                poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
             chunk_ids
         }
 
@@ -1351,6 +1542,7 @@ mod tests {
             test_env.storage.clone(),
             table.clone(),
             Some(bitmap.clone()),
+            1024,
             1024,
             KvLogStoreMetrics::for_test(),
             "test",
@@ -1361,8 +1553,8 @@ mod tests {
         let epoch1 = test_env
             .storage
             .get_pinned_version()
-            .version()
-            .max_committed_epoch
+            .table_committed_epoch(TableId::new(table.id))
+            .unwrap()
             .next_epoch();
         test_env
             .storage
@@ -1376,27 +1568,31 @@ mod tests {
         test_env
             .storage
             .start_epoch(epoch2, HashSet::from_iter([TableId::new(table.id)]));
-        writer.flush_current_epoch(epoch2, true).await.unwrap();
+        writer
+            .flush_current_epoch_for_test(epoch2, true)
+            .await
+            .unwrap();
         writer.write_chunk(stream_chunk2.clone()).await.unwrap();
         let epoch3 = epoch2.next_epoch();
         test_env
             .storage
             .start_epoch(epoch3, HashSet::from_iter([TableId::new(table.id)]));
-        writer.flush_current_epoch(epoch3, true).await.unwrap();
+        writer
+            .flush_current_epoch_for_test(epoch3, true)
+            .await
+            .unwrap();
         writer.write_chunk(stream_chunk3.clone()).await.unwrap();
-        writer.flush_current_epoch(u64::MAX, true).await.unwrap();
+        writer
+            .flush_current_epoch_for_test(u64::MAX, true)
+            .await
+            .unwrap();
 
         test_env.commit_epoch(epoch1).await;
         test_env.commit_epoch(epoch2).await;
         test_env.commit_epoch(epoch3).await;
 
-        test_env
-            .storage
-            .try_wait_epoch(HummockReadEpoch::Committed(epoch3))
-            .await
-            .unwrap();
-
         reader.init().await.unwrap();
+        reader.start_from(None).await.unwrap();
 
         let chunk_ids = check_reader(
             &mut reader,
@@ -1417,6 +1613,7 @@ mod tests {
             })
             .unwrap();
         reader.rewind().await.unwrap();
+        reader.start_from(None).await.unwrap();
         let chunk_ids = check_reader(
             &mut reader,
             [
@@ -1433,6 +1630,7 @@ mod tests {
             .truncate(TruncateOffset::Barrier { epoch: epoch1 })
             .unwrap();
         reader.rewind().await.unwrap();
+        reader.start_from(None).await.unwrap();
         let chunk_ids = check_reader(
             &mut reader,
             [
@@ -1451,6 +1649,7 @@ mod tests {
             })
             .unwrap();
         reader.rewind().await.unwrap();
+        reader.start_from(None).await.unwrap();
         let chunk_ids = check_reader(&mut reader, [(epoch3, None)].iter()).await;
         assert_eq!(0, chunk_ids.len());
 
@@ -1462,6 +1661,7 @@ mod tests {
             test_env.storage.clone(),
             table.clone(),
             Some(bitmap.clone()),
+            1024,
             1024,
             KvLogStoreMetrics::for_test(),
             "test",
@@ -1479,6 +1679,7 @@ mod tests {
             .unwrap();
 
         reader.init().await.unwrap();
+        reader.start_from(None).await.unwrap();
 
         let data = [
             (epoch1, Some(&stream_chunk1)),
@@ -1492,6 +1693,7 @@ mod tests {
             .truncate(TruncateOffset::Barrier { epoch: epoch1 })
             .unwrap();
         reader.rewind().await.unwrap();
+        reader.start_from(None).await.unwrap();
         let chunk_ids = check_reader(&mut reader, data[1..].iter()).await;
         assert_eq!(2, chunk_ids.len());
 
@@ -1502,13 +1704,22 @@ mod tests {
             })
             .unwrap();
         reader.rewind().await.unwrap();
+        reader.start_from(None).await.unwrap();
         let chunk_ids = check_reader(&mut reader, data[1..].iter()).await;
         assert_eq!(2, chunk_ids.len());
+
+        reader
+            .truncate(TruncateOffset::Chunk {
+                epoch: epoch2,
+                chunk_id: chunk_ids[0],
+            })
+            .unwrap();
 
         reader
             .truncate(TruncateOffset::Barrier { epoch: epoch2 })
             .unwrap();
         reader.rewind().await.unwrap();
+        reader.start_from(None).await.unwrap();
         let chunk_ids = check_reader(&mut reader, data[2..].iter()).await;
         assert_eq!(1, chunk_ids.len());
 
@@ -1520,6 +1731,7 @@ mod tests {
             test_env.storage.clone(),
             table.clone(),
             Some(bitmap.clone()),
+            1024,
             1024,
             KvLogStoreMetrics::for_test(),
             "test",
@@ -1536,11 +1748,14 @@ mod tests {
         test_env
             .storage
             .start_epoch(epoch5, HashSet::from_iter([TableId::new(table.id)]));
-        writer.flush_current_epoch(epoch5, true).await.unwrap();
+        writer
+            .flush_current_epoch_for_test(epoch5, true)
+            .await
+            .unwrap();
         writer.write_chunk(stream_chunk5.clone()).await.unwrap();
 
         reader.init().await.unwrap();
-
+        reader.start_from(None).await.unwrap();
         let data = [
             (epoch1, Some(&stream_chunk1)),
             (epoch2, Some(&stream_chunk2)),
@@ -1560,6 +1775,7 @@ mod tests {
             .truncate(TruncateOffset::Barrier { epoch: epoch1 })
             .unwrap();
         reader.rewind().await.unwrap();
+        reader.start_from(None).await.unwrap();
         let chunk_ids = check_reader_last_unsealed(&mut reader, data[1..].iter()).await;
         assert_eq!(4, chunk_ids.len());
 
@@ -1570,6 +1786,7 @@ mod tests {
             })
             .unwrap();
         reader.rewind().await.unwrap();
+        reader.start_from(None).await.unwrap();
         let chunk_ids = check_reader_last_unsealed(&mut reader, data[1..].iter()).await;
         assert_eq!(4, chunk_ids.len());
 
@@ -1577,6 +1794,7 @@ mod tests {
             .truncate(TruncateOffset::Barrier { epoch: epoch2 })
             .unwrap();
         reader.rewind().await.unwrap();
+        reader.start_from(None).await.unwrap();
         let chunk_ids = check_reader_last_unsealed(&mut reader, data[2..].iter()).await;
         assert_eq!(3, chunk_ids.len());
 
@@ -1584,6 +1802,7 @@ mod tests {
             .truncate(TruncateOffset::Barrier { epoch: epoch3 })
             .unwrap();
         reader.rewind().await.unwrap();
+        reader.start_from(None).await.unwrap();
         let chunk_ids = check_reader_last_unsealed(&mut reader, data[3..].iter()).await;
         assert_eq!(2, chunk_ids.len());
 
@@ -1594,6 +1813,7 @@ mod tests {
             })
             .unwrap();
         reader.rewind().await.unwrap();
+        reader.start_from(None).await.unwrap();
         let chunk_ids = check_reader_last_unsealed(
             &mut reader,
             [(epoch4, None), (epoch5, Some(&stream_chunk5))].iter(),
@@ -1605,6 +1825,7 @@ mod tests {
             .truncate(TruncateOffset::Barrier { epoch: epoch4 })
             .unwrap();
         reader.rewind().await.unwrap();
+        reader.start_from(None).await.unwrap();
         let chunk_ids =
             check_reader_last_unsealed(&mut reader, [(epoch5, Some(&stream_chunk5))].iter()).await;
         assert_eq!(1, chunk_ids.len());
@@ -1616,6 +1837,7 @@ mod tests {
             })
             .unwrap();
         reader.rewind().await.unwrap();
+        reader.start_from(None).await.unwrap();
         let chunk_ids = check_reader_last_unsealed(&mut reader, empty()).await;
         assert!(chunk_ids.is_empty());
     }
@@ -1640,8 +1862,9 @@ mod tests {
                 (
                     LogStoreReadItem::Barrier {
                         is_checkpoint: expected_is_checkpoint,
+                        ..
                     },
-                    LogStoreReadItem::Barrier { is_checkpoint },
+                    LogStoreReadItem::Barrier { is_checkpoint, .. },
                 ) => {
                     assert_eq!(expected_is_checkpoint, is_checkpoint);
                 }
@@ -1682,6 +1905,7 @@ mod tests {
             table.clone(),
             Some(bitmap.clone()),
             max_row_count,
+            1024,
             KvLogStoreMetrics::for_test(),
             "test",
             pk_info,
@@ -1691,8 +1915,8 @@ mod tests {
         let epoch1 = test_env
             .storage
             .get_pinned_version()
-            .version()
-            .max_committed_epoch
+            .table_committed_epoch(TableId::new(table.id))
+            .unwrap()
             .next_epoch();
         test_env
             .storage
@@ -1706,15 +1930,21 @@ mod tests {
         test_env
             .storage
             .start_epoch(epoch2, HashSet::from_iter([TableId::new(table.id)]));
-        writer.flush_current_epoch(epoch2, false).await.unwrap();
+        writer
+            .flush_current_epoch_for_test(epoch2, false)
+            .await
+            .unwrap();
         writer.write_chunk(stream_chunk2.clone()).await.unwrap();
         let epoch3 = epoch2.next_epoch();
-        writer.flush_current_epoch(epoch3, true).await.unwrap();
+        writer
+            .flush_current_epoch_for_test(epoch3, true)
+            .await
+            .unwrap();
 
-        test_env.storage.seal_epoch(epoch1, false);
         test_env.commit_epoch(epoch2).await;
 
         reader.init().await.unwrap();
+        reader.start_from(None).await.unwrap();
         validate_reader(
             &mut reader,
             [
@@ -1729,6 +1959,8 @@ mod tests {
                     epoch1,
                     LogStoreReadItem::Barrier {
                         is_checkpoint: false,
+                        new_vnode_bitmap: None,
+                        is_stop: false,
                     },
                 ),
                 (
@@ -1742,6 +1974,8 @@ mod tests {
                     epoch2,
                     LogStoreReadItem::Barrier {
                         is_checkpoint: true,
+                        new_vnode_bitmap: None,
+                        is_stop: false,
                     },
                 ),
             ],
@@ -1751,7 +1985,7 @@ mod tests {
         drop(writer);
 
         // Recovery
-        test_env.storage.clear_shared_buffer(epoch2).await;
+        test_env.storage.clear_shared_buffer().await;
 
         // Rebuild log reader and writer in recovery
         let factory = KvLogStoreFactory::new(
@@ -1759,6 +1993,7 @@ mod tests {
             table.clone(),
             Some(bitmap.clone()),
             max_row_count,
+            1024,
             KvLogStoreMetrics::for_test(),
             "test",
             pk_info,
@@ -1772,6 +2007,7 @@ mod tests {
             .await
             .unwrap();
         reader.init().await.unwrap();
+        reader.start_from(None).await.unwrap();
         validate_reader(
             &mut reader,
             [
@@ -1786,6 +2022,8 @@ mod tests {
                     epoch1,
                     LogStoreReadItem::Barrier {
                         is_checkpoint: false,
+                        new_vnode_bitmap: None,
+                        is_stop: false,
                     },
                 ),
                 (
@@ -1799,6 +2037,8 @@ mod tests {
                     epoch2,
                     LogStoreReadItem::Barrier {
                         is_checkpoint: true,
+                        new_vnode_bitmap: None,
+                        is_stop: false,
                     },
                 ),
             ],
@@ -1809,13 +2049,16 @@ mod tests {
             .truncate(TruncateOffset::Barrier { epoch: epoch1 })
             .unwrap();
         let epoch4 = epoch3.next_epoch();
-        writer.flush_current_epoch(epoch4, true).await.unwrap();
+        writer
+            .flush_current_epoch_for_test(epoch4, true)
+            .await
+            .unwrap();
         test_env.commit_epoch(epoch3).await;
 
         drop(writer);
 
         // Recovery
-        test_env.storage.clear_shared_buffer(epoch3).await;
+        test_env.storage.clear_shared_buffer().await;
 
         // Rebuild log reader and writer in recovery
         let factory = KvLogStoreFactory::new(
@@ -1823,6 +2066,7 @@ mod tests {
             table.clone(),
             Some(bitmap),
             max_row_count,
+            1024,
             KvLogStoreMetrics::for_test(),
             "test",
             pk_info,
@@ -1836,6 +2080,7 @@ mod tests {
             .await
             .unwrap();
         reader.init().await.unwrap();
+        reader.start_from(None).await.unwrap();
         validate_reader(
             &mut reader,
             [
@@ -1850,6 +2095,8 @@ mod tests {
                     epoch2,
                     LogStoreReadItem::Barrier {
                         is_checkpoint: true,
+                        new_vnode_bitmap: None,
+                        is_stop: false,
                     },
                 ),
             ],

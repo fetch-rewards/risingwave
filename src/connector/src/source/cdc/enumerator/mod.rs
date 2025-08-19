@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,19 +16,20 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::str::FromStr;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use itertools::Itertools;
 use prost::Message;
+use risingwave_common::global_jvm::JVM;
 use risingwave_common::util::addr::HostAddr;
 use risingwave_jni_core::call_static_method;
-use risingwave_jni_core::jvm_runtime::{execute_with_jni_env, JVM};
+use risingwave_jni_core::jvm_runtime::execute_with_jni_env;
 use risingwave_pb::connector_service::{SourceType, ValidateSourceRequest, ValidateSourceResponse};
 
 use crate::error::ConnectorResult;
 use crate::source::cdc::{
-    table_schema_exclude_additional_columns, CdcProperties, CdcSourceTypeTrait, Citus,
-    DebeziumCdcSplit, Mongodb, Mysql, Postgres,
+    CdcProperties, CdcSourceTypeTrait, Citus, DebeziumCdcSplit, Mongodb, Mysql, Postgres,
+    SqlServer, table_schema_exclude_additional_columns,
 };
 use crate::source::{SourceEnumeratorContextRef, SplitEnumerator};
 
@@ -127,6 +128,7 @@ where
 
 pub trait ListCdcSplits {
     type CdcSourceType: CdcSourceTypeTrait;
+    /// Generates a single split for shared source.
     fn list_cdc_splits(&mut self) -> Vec<DebeziumCdcSplit<Self::CdcSourceType>>;
 }
 
@@ -178,6 +180,18 @@ impl ListCdcSplits for DebeziumSplitEnumerator<Mongodb> {
 
     fn list_cdc_splits(&mut self) -> Vec<DebeziumCdcSplit<Self::CdcSourceType>> {
         // CDC source only supports single split
+        vec![DebeziumCdcSplit::<Self::CdcSourceType>::new(
+            self.source_id,
+            None,
+            None,
+        )]
+    }
+}
+
+impl ListCdcSplits for DebeziumSplitEnumerator<SqlServer> {
+    type CdcSourceType = SqlServer;
+
+    fn list_cdc_splits(&mut self) -> Vec<DebeziumCdcSplit<Self::CdcSourceType>> {
         vec![DebeziumCdcSplit::<Self::CdcSourceType>::new(
             self.source_id,
             None,

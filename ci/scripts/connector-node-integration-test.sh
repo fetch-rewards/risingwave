@@ -30,6 +30,7 @@ shift $((OPTIND -1))
 RISINGWAVE_ROOT=${PWD}
 
 echo "--- install java"
+sudo apt-get update -y
 if [ "$VERSION" = "11" ]; then
   echo "The test imgae default java version is 11, no need to install"
 else
@@ -43,7 +44,7 @@ echo "$java_version"
 # cd ${RISINGWAVE_ROOT}/java
 # mvn --batch-mode --update-snapshots clean package -DskipTests
 
-echo "--- install postgresql client"
+echo "--- install postgresql server"
 DEBIAN_FRONTEND=noninteractive TZ=America/New_York apt-get -y install tzdata
 sudo apt install postgresql postgresql-contrib libpq-dev -y
 sudo service postgresql start || sudo pg_ctlcluster 14 main start
@@ -54,15 +55,15 @@ sudo -u postgres psql -d test -c "CREATE TABLE test (id serial PRIMARY KEY, name
 
 echo "--- starting minio"
 echo "setting up minio"
-wget https://dl.minio.io/server/minio/release/linux-amd64/minio > /dev/null
+wget --no-verbose https://dl.minio.io/server/minio/release/linux-amd64/minio > /dev/null
 chmod +x minio
 sudo ./minio server /tmp/minio &
 # wait for minio to start
 sleep 3
-wget https://dl.minio.io/client/mc/release/linux-amd64/mc > /dev/null
+wget --no-verbose https://dl.minio.io/client/mc/release/linux-amd64/mc > /dev/null
 chmod +x mc
 MC_PATH=${PWD}/mc
-${MC_PATH} config host add minio http://127.0.0.1:9000 minioadmin minioadmin
+${MC_PATH} alias set minio http://127.0.0.1:9000 minioadmin minioadmin
 
 echo "--- starting connector-node service"
 mkdir -p "${RISINGWAVE_ROOT}"/java/connector-node/assembly/target/

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,16 +14,16 @@
 
 use std::sync::{Arc, OnceLock};
 
-use prometheus::core::{AtomicU64, Collector, Desc, GenericCounter, GenericGauge};
+use prometheus::core::{AtomicU64, Collector, Desc, GenericCounter};
 use prometheus::{
-    exponential_buckets, histogram_opts, proto, register_histogram_vec_with_registry,
-    register_histogram_with_registry, register_int_counter_vec_with_registry,
-    register_int_gauge_with_registry, Gauge, Histogram, HistogramVec, IntGauge, Opts, Registry,
+    Gauge, Histogram, HistogramVec, IntGauge, Opts, Registry, exponential_buckets, histogram_opts,
+    proto, register_histogram_vec_with_registry, register_histogram_with_registry,
+    register_int_counter_vec_with_registry, register_int_gauge_with_registry,
 };
 use risingwave_common::config::MetricLevel;
 use risingwave_common::metrics::{
     RelabeledCounterVec, RelabeledGuardedHistogramVec, RelabeledGuardedIntCounterVec,
-    RelabeledHistogramVec, RelabeledMetricVec,
+    RelabeledHistogramVec, RelabeledMetricVec, UintGauge,
 };
 use risingwave_common::monitor::GLOBAL_METRICS_REGISTRY;
 use risingwave_common::{
@@ -39,20 +39,20 @@ use tracing::warn;
 /// job or an executor should be collected by views like `StateStats` and `JobStats`.
 #[derive(Debug, Clone)]
 pub struct HummockStateStoreMetrics {
-    pub bloom_filter_true_negative_counts: RelabeledGuardedIntCounterVec<2>,
-    pub bloom_filter_check_counts: RelabeledGuardedIntCounterVec<2>,
+    pub bloom_filter_true_negative_counts: RelabeledGuardedIntCounterVec,
+    pub bloom_filter_check_counts: RelabeledGuardedIntCounterVec,
     pub iter_merge_sstable_counts: RelabeledHistogramVec,
-    pub sst_store_block_request_counts: RelabeledGuardedIntCounterVec<2>,
-    pub iter_scan_key_counts: RelabeledGuardedIntCounterVec<2>,
+    pub sst_store_block_request_counts: RelabeledGuardedIntCounterVec,
+    pub iter_scan_key_counts: RelabeledGuardedIntCounterVec,
     pub get_shared_buffer_hit_counts: RelabeledCounterVec,
     pub remote_read_time: RelabeledHistogramVec,
-    pub iter_fetch_meta_duration: RelabeledGuardedHistogramVec<1>,
+    pub iter_fetch_meta_duration: RelabeledGuardedHistogramVec,
     pub iter_fetch_meta_cache_unhits: IntGauge,
     pub iter_slow_fetch_meta_cache_unhits: IntGauge,
 
-    pub read_req_bloom_filter_positive_counts: RelabeledGuardedIntCounterVec<2>,
-    pub read_req_positive_but_non_exist_counts: RelabeledGuardedIntCounterVec<2>,
-    pub read_req_check_bloom_filter_counts: RelabeledGuardedIntCounterVec<2>,
+    pub read_req_bloom_filter_positive_counts: RelabeledGuardedIntCounterVec,
+    pub read_req_positive_but_non_exist_counts: RelabeledGuardedIntCounterVec,
+    pub read_req_check_bloom_filter_counts: RelabeledGuardedIntCounterVec,
 
     pub write_batch_tuple_counts: RelabeledCounterVec,
     pub write_batch_duration: RelabeledHistogramVec,
@@ -73,9 +73,9 @@ pub struct HummockStateStoreMetrics {
     pub spill_task_size_from_sealed: GenericCounter<AtomicU64>,
 
     // uploading task
-    pub uploader_uploading_task_size: GenericGauge<AtomicU64>,
+    pub uploader_uploading_task_size: UintGauge,
     pub uploader_uploading_task_count: IntGauge,
-    pub uploader_imm_size: GenericGauge<AtomicU64>,
+    pub uploader_imm_size: UintGauge,
     pub uploader_upload_task_latency: Histogram,
     pub uploader_syncing_epoch_count: IntGauge,
     pub uploader_wait_poll_latency: Histogram,
@@ -89,6 +89,9 @@ pub struct HummockStateStoreMetrics {
 
     pub event_handler_pending_event: IntGauge,
     pub event_handler_latency: HistogramVec,
+
+    pub safe_version_hit: GenericCounter<AtomicU64>,
+    pub safe_version_miss: GenericCounter<AtomicU64>,
 }
 
 pub static GLOBAL_HUMMOCK_STATE_STORE_METRICS: OnceLock<HummockStateStoreMetrics> = OnceLock::new();
@@ -242,10 +245,10 @@ impl HummockStateStoreMetrics {
         );
 
         let opts = histogram_opts!(
-                "state_store_write_batch_duration",
-                "Total time of batched write that have been issued to state store. With shared buffer on, this is the latency writing to the shared buffer",
-                time_buckets.clone()
-            );
+            "state_store_write_batch_duration",
+            "Total time of batched write that have been issued to state store. With shared buffer on, this is the latency writing to the shared buffer",
+            time_buckets.clone()
+        );
         let write_batch_duration =
             register_histogram_vec_with_registry!(opts, &["table_id"], registry).unwrap();
         let write_batch_duration = RelabeledHistogramVec::with_metric_level(
@@ -309,7 +312,7 @@ impl HummockStateStoreMetrics {
         )
         .unwrap();
 
-        let uploader_uploading_task_size = GenericGauge::new(
+        let uploader_uploading_task_size = UintGauge::new(
             "state_store_uploader_uploading_task_size",
             "Total size of uploader uploading tasks",
         )
@@ -325,7 +328,7 @@ impl HummockStateStoreMetrics {
         )
         .unwrap();
 
-        let uploader_imm_size = GenericGauge::new(
+        let uploader_imm_size = UintGauge::new(
             "state_store_uploader_imm_size",
             "Total size of imms tracked by uploader",
         )
@@ -445,6 +448,24 @@ impl HummockStateStoreMetrics {
         let event_handler_latency =
             register_histogram_vec_with_registry!(opts, &["event_type"], registry).unwrap();
 
+        let safe_version_hit = GenericCounter::new(
+            "state_store_safe_version_hit",
+            "The total count of a safe version that can be retrieved successfully",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(safe_version_hit.clone()))
+            .unwrap();
+
+        let safe_version_miss = GenericCounter::new(
+            "state_store_safe_version_miss",
+            "The total count of a safe version that cannot be retrieved",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(safe_version_miss.clone()))
+            .unwrap();
+
         Self {
             bloom_filter_true_negative_counts,
             bloom_filter_check_counts,
@@ -480,6 +501,8 @@ impl HummockStateStoreMetrics {
             block_efficiency_histogram,
             event_handler_pending_event,
             event_handler_latency,
+            safe_version_hit,
+            safe_version_miss,
         }
     }
 

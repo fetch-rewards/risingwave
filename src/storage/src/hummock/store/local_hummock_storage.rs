@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,39 +17,42 @@ use std::iter::once;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use await_tree::InstrumentAwait;
+use await_tree::{InstrumentAwait, SpanExt};
 use bytes::Bytes;
 use risingwave_common::bitmap::Bitmap;
 use risingwave_common::catalog::{TableId, TableOption};
 use risingwave_common::hash::VirtualNode;
-use risingwave_common::util::epoch::MAX_SPILL_TIMES;
-use risingwave_hummock_sdk::key::{is_empty_key_range, vnode_range, TableKey, TableKeyRange};
+use risingwave_common::util::epoch::{EpochPair, MAX_EPOCH, MAX_SPILL_TIMES};
+use risingwave_hummock_sdk::EpochWithGap;
+use risingwave_hummock_sdk::key::{
+    FullKey, TableKey, TableKeyRange, UserKey, is_empty_key_range, vnode_range,
+};
 use risingwave_hummock_sdk::sstable_info::SstableInfo;
-use risingwave_hummock_sdk::{EpochWithGap, HummockEpoch};
-use tracing::{warn, Instrument};
+use risingwave_hummock_sdk::table_watermark::WatermarkSerdeType;
+use tracing::{Instrument, warn};
 
-use super::version::{StagingData, VersionUpdate};
+use super::version::VersionUpdate;
 use crate::error::StorageResult;
 use crate::hummock::event_handler::hummock_event_handler::HummockEventSender;
 use crate::hummock::event_handler::{HummockEvent, HummockReadVersionRef, LocalInstanceGuard};
-use crate::hummock::iterator::change_log::ChangeLogIterator;
 use crate::hummock::iterator::{
     Backward, BackwardUserIterator, ConcatIteratorInner, Forward, HummockIteratorUnion,
     IteratorFactory, MergeIterator, UserIterator,
 };
+use crate::hummock::local_version::pinned_version::PinnedVersion;
 use crate::hummock::shared_buffer::shared_buffer_batch::{
     SharedBufferBatch, SharedBufferBatchIterator, SharedBufferBatchOldValues, SharedBufferItem,
     SharedBufferValue,
 };
-use crate::hummock::store::version::{read_filter_for_version, HummockVersionReader};
+use crate::hummock::store::version::{HummockVersionReader, read_filter_for_version};
 use crate::hummock::utils::{
     do_delete_sanity_check, do_insert_sanity_check, do_update_sanity_check, sanity_check_enabled,
     wait_for_epoch,
 };
 use crate::hummock::write_limiter::WriteLimiterRef;
 use crate::hummock::{
-    BackwardSstableIterator, MemoryLimiter, SstableIterator, SstableIteratorReadOptions,
-    SstableStoreRef,
+    BackwardSstableIterator, HummockError, MemoryLimiter, SstableIterator,
+    SstableIteratorReadOptions, SstableStoreRef,
 };
 use crate::mem_table::{KeyOp, MemTable, MemTableHummockIterator, MemTableHummockRevIterator};
 use crate::monitor::{HummockStateStoreMetrics, IterLocalMetricsGuard, StoreLocalStatistic};
@@ -57,12 +60,11 @@ use crate::store::*;
 
 /// `LocalHummockStorage` is a handle for a state table shard to access data from and write data to
 /// the hummock state backend. It is created via `HummockStorage::new_local`.
-
 pub struct LocalHummockStorage {
     mem_table: MemTable,
 
     spill_offset: u16,
-    epoch: Option<u64>,
+    epoch: Option<EpochPair>,
 
     table_id: TableId,
     op_consistency_level: OpConsistencyLevel,
@@ -85,6 +87,9 @@ pub struct LocalHummockStorage {
     /// by ignoring the replicated `ReadVersion`.
     is_replicated: bool,
 
+    /// Whether or not send imm to uploader on every flush.
+    upload_on_flush: bool,
+
     /// Event sender.
     event_sender: HummockEventSender,
 
@@ -96,57 +101,51 @@ pub struct LocalHummockStorage {
 
     write_limiter: WriteLimiterRef,
 
-    version_update_notifier_tx: Arc<tokio::sync::watch::Sender<HummockEpoch>>,
+    version_update_notifier_tx: Arc<tokio::sync::watch::Sender<PinnedVersion>>,
 
     mem_table_spill_threshold: usize,
 }
 
-impl LocalHummockStorage {
-    /// See `HummockReadVersion::update` for more details.
-    pub fn update(&self, info: VersionUpdate) {
-        self.read_version.write().update(info)
-    }
-
-    pub async fn get_inner(
-        &self,
-        table_key: TableKey<Bytes>,
-        epoch: u64,
+impl LocalHummockFlushedSnapshotReader {
+    async fn get_flushed<O>(
+        hummock_version_reader: &HummockVersionReader,
+        read_version: &HummockReadVersionRef,
+        user_key: UserKey<Bytes>,
         read_options: ReadOptions,
-    ) -> StorageResult<Option<Bytes>> {
+        on_key_value_fn: impl crate::store::KeyValueFn<O>,
+    ) -> StorageResult<Option<O>> {
         let table_key_range = (
-            Bound::Included(table_key.clone()),
-            Bound::Included(table_key.clone()),
+            Bound::Included(user_key.table_key.clone()),
+            Bound::Included(user_key.table_key.clone()),
         );
 
-        let (table_key_range, read_snapshot) = read_filter_for_version(
-            epoch,
-            read_options.table_id,
-            table_key_range,
-            &self.read_version,
-        )?;
+        let (table_key_range, read_snapshot) =
+            read_filter_for_version(MAX_EPOCH, user_key.table_id, table_key_range, read_version)?;
 
         if is_empty_key_range(&table_key_range) {
             return Ok(None);
         }
 
-        self.hummock_version_reader
-            .get(table_key, epoch, read_options, read_snapshot)
+        hummock_version_reader
+            .get(
+                user_key.table_key,
+                MAX_EPOCH,
+                user_key.table_id,
+                read_options,
+                read_snapshot,
+                on_key_value_fn,
+            )
             .await
     }
 
-    pub async fn wait_for_epoch(&self, wait_epoch: u64) -> StorageResult<()> {
-        wait_for_epoch(&self.version_update_notifier_tx, wait_epoch).await
-    }
-
-    pub async fn iter_flushed(
+    async fn iter_flushed(
         &self,
         table_key_range: TableKeyRange,
-        epoch: u64,
         read_options: ReadOptions,
     ) -> StorageResult<HummockStorageIterator> {
         let (table_key_range, read_snapshot) = read_filter_for_version(
-            epoch,
-            read_options.table_id,
+            MAX_EPOCH,
+            self.table_id,
             table_key_range,
             &self.read_version,
         )?;
@@ -154,19 +153,24 @@ impl LocalHummockStorage {
         let table_key_range = table_key_range;
 
         self.hummock_version_reader
-            .iter(table_key_range, epoch, read_options, read_snapshot)
+            .iter(
+                table_key_range,
+                MAX_EPOCH,
+                self.table_id,
+                read_options,
+                read_snapshot,
+            )
             .await
     }
 
-    pub async fn rev_iter_flushed(
+    async fn rev_iter_flushed(
         &self,
         table_key_range: TableKeyRange,
-        epoch: u64,
         read_options: ReadOptions,
     ) -> StorageResult<HummockStorageRevIterator> {
         let (table_key_range, read_snapshot) = read_filter_for_version(
-            epoch,
-            read_options.table_id,
+            MAX_EPOCH,
+            self.table_id,
             table_key_range,
             &self.read_version,
         )?;
@@ -174,14 +178,31 @@ impl LocalHummockStorage {
         let table_key_range = table_key_range;
 
         self.hummock_version_reader
-            .rev_iter(table_key_range, epoch, read_options, read_snapshot, None)
+            .rev_iter(
+                table_key_range,
+                MAX_EPOCH,
+                self.table_id,
+                read_options,
+                read_snapshot,
+                None,
+            )
             .await
+    }
+}
+
+impl LocalHummockStorage {
+    fn epoch(&self) -> u64 {
+        self.epoch.expect("should have set the epoch").curr
+    }
+
+    fn current_epoch_with_gap(&self) -> EpochWithGap {
+        EpochWithGap::new(self.epoch(), self.spill_offset)
     }
 
     fn mem_table_iter(&self) -> MemTableHummockIterator<'_> {
         MemTableHummockIterator::new(
             &self.mem_table.buffer,
-            EpochWithGap::new(self.epoch(), self.spill_offset),
+            self.current_epoch_with_gap(),
             self.table_id,
         )
     }
@@ -189,28 +210,25 @@ impl LocalHummockStorage {
     fn mem_table_rev_iter(&self) -> MemTableHummockRevIterator<'_> {
         MemTableHummockRevIterator::new(
             &self.mem_table.buffer,
-            EpochWithGap::new(self.epoch(), self.spill_offset),
+            self.current_epoch_with_gap(),
             self.table_id,
         )
     }
 
-    pub async fn iter_all(
+    async fn iter_all(
         &self,
         table_key_range: TableKeyRange,
         epoch: u64,
         read_options: ReadOptions,
     ) -> StorageResult<LocalHummockStorageIterator<'_>> {
-        let (table_key_range, read_snapshot) = read_filter_for_version(
-            epoch,
-            read_options.table_id,
-            table_key_range,
-            &self.read_version,
-        )?;
+        let (table_key_range, read_snapshot) =
+            read_filter_for_version(epoch, self.table_id, table_key_range, &self.read_version)?;
 
         self.hummock_version_reader
             .iter_with_memtable(
                 table_key_range,
                 epoch,
+                self.table_id,
                 read_options,
                 read_snapshot,
                 Some(self.mem_table_iter()),
@@ -218,23 +236,20 @@ impl LocalHummockStorage {
             .await
     }
 
-    pub async fn rev_iter_all(
+    async fn rev_iter_all(
         &self,
         table_key_range: TableKeyRange,
         epoch: u64,
         read_options: ReadOptions,
     ) -> StorageResult<LocalHummockStorageRevIterator<'_>> {
-        let (table_key_range, read_snapshot) = read_filter_for_version(
-            epoch,
-            read_options.table_id,
-            table_key_range,
-            &self.read_version,
-        )?;
+        let (table_key_range, read_snapshot) =
+            read_filter_for_version(epoch, self.table_id, table_key_range, &self.read_version)?;
 
         self.hummock_version_reader
             .rev_iter(
                 table_key_range,
                 epoch,
+                self.table_id,
                 read_options,
                 read_snapshot,
                 Some(self.mem_table_rev_iter()),
@@ -243,75 +258,95 @@ impl LocalHummockStorage {
     }
 }
 
-impl StateStoreRead for LocalHummockStorage {
-    type ChangeLogIter = ChangeLogIterator;
-    type Iter = HummockStorageIterator;
-    type RevIter = HummockStorageRevIterator;
+#[derive(Clone)]
+pub struct LocalHummockFlushedSnapshotReader {
+    table_id: TableId,
+    read_version: HummockReadVersionRef,
+    hummock_version_reader: HummockVersionReader,
+}
 
-    fn get(
+impl StateStoreGet for LocalHummockFlushedSnapshotReader {
+    async fn on_key_value<O: Send + 'static>(
         &self,
         key: TableKey<Bytes>,
-        epoch: u64,
         read_options: ReadOptions,
-    ) -> impl Future<Output = StorageResult<Option<Bytes>>> + '_ {
-        assert!(epoch <= self.epoch());
-        self.get_inner(key, epoch, read_options)
+        on_key_value_fn: impl KeyValueFn<O>,
+    ) -> StorageResult<Option<O>> {
+        let key = UserKey::new(self.table_id, key);
+        Self::get_flushed(
+            &self.hummock_version_reader,
+            &self.read_version,
+            key,
+            read_options,
+            on_key_value_fn,
+        )
+        .await
     }
+}
+
+impl StateStoreRead for LocalHummockFlushedSnapshotReader {
+    type Iter = HummockStorageIterator;
+    type RevIter = HummockStorageRevIterator;
 
     fn iter(
         &self,
         key_range: TableKeyRange,
-        epoch: u64,
         read_options: ReadOptions,
     ) -> impl Future<Output = StorageResult<Self::Iter>> + '_ {
-        assert!(epoch <= self.epoch());
-        self.iter_flushed(key_range, epoch, read_options)
+        self.iter_flushed(key_range, read_options)
             .instrument(tracing::trace_span!("hummock_iter"))
     }
 
     fn rev_iter(
         &self,
         key_range: TableKeyRange,
-        epoch: u64,
         read_options: ReadOptions,
     ) -> impl Future<Output = StorageResult<Self::RevIter>> + '_ {
-        assert!(epoch <= self.epoch());
-        self.rev_iter_flushed(key_range, epoch, read_options)
+        self.rev_iter_flushed(key_range, read_options)
             .instrument(tracing::trace_span!("hummock_rev_iter"))
-    }
-
-    async fn iter_log(
-        &self,
-        epoch_range: (u64, u64),
-        key_range: TableKeyRange,
-        options: ReadLogOptions,
-    ) -> StorageResult<Self::ChangeLogIter> {
-        let version = self.read_version.read().committed().clone();
-        let iter = self
-            .hummock_version_reader
-            .iter_log(version, epoch_range, key_range, options)
-            .await?;
-        Ok(iter)
     }
 }
 
-impl LocalStateStore for LocalHummockStorage {
-    type Iter<'a> = LocalHummockStorageIterator<'a>;
-    type RevIter<'a> = LocalHummockStorageRevIterator<'a>;
-
-    async fn get(
+impl StateStoreGet for LocalHummockStorage {
+    async fn on_key_value<O: Send + 'static>(
         &self,
         key: TableKey<Bytes>,
         read_options: ReadOptions,
-    ) -> StorageResult<Option<Bytes>> {
-        match self.mem_table.buffer.get(&key) {
-            None => self.get_inner(key, self.epoch(), read_options).await,
+        on_key_value_fn: impl KeyValueFn<O>,
+    ) -> StorageResult<Option<O>> {
+        let key = UserKey::new(self.table_id, key);
+        match self.mem_table.buffer.get(&key.table_key) {
+            None => {
+                LocalHummockFlushedSnapshotReader::get_flushed(
+                    &self.hummock_version_reader,
+                    &self.read_version,
+                    key,
+                    read_options,
+                    on_key_value_fn,
+                )
+                .await
+            }
             Some(op) => match op {
-                KeyOp::Insert(value) | KeyOp::Update((_, value)) => Ok(Some(value.clone())),
+                KeyOp::Insert(value) | KeyOp::Update((_, value)) => Ok({
+                    Some(on_key_value_fn(
+                        FullKey::new_with_gap_epoch(
+                            self.table_id,
+                            key.table_key.to_ref(),
+                            self.current_epoch_with_gap(),
+                        ),
+                        value.as_ref(),
+                    )?)
+                }),
                 KeyOp::Delete(_) => Ok(None),
             },
         }
     }
+}
+
+impl LocalStateStore for LocalHummockStorage {
+    type FlushedSnapshotReader = LocalHummockFlushedSnapshotReader;
+    type Iter<'a> = LocalHummockStorageIterator<'a>;
+    type RevIter<'a> = LocalHummockStorageRevIterator<'a>;
 
     async fn iter(
         &self,
@@ -324,7 +359,7 @@ impl LocalStateStore for LocalHummockStorage {
             1,
             "read range {:?} for table {} iter contains more than one vnode",
             key_range,
-            read_options.table_id
+            self.table_id
         );
         self.iter_all(key_range.clone(), self.epoch(), read_options)
             .await
@@ -341,10 +376,14 @@ impl LocalStateStore for LocalHummockStorage {
             1,
             "read range {:?} for table {} iter contains more than one vnode",
             key_range,
-            read_options.table_id
+            self.table_id
         );
         self.rev_iter_all(key_range.clone(), self.epoch(), read_options)
             .await
+    }
+
+    fn new_flushed_snapshot_reader(&self) -> Self::FlushedSnapshotReader {
+        self.new_flushed_snapshot_reader_inner()
     }
 
     fn get_table_watermark(&self, vnode: VirtualNode) -> Option<Bytes> {
@@ -371,11 +410,22 @@ impl LocalStateStore for LocalHummockStorage {
         Ok(())
     }
 
+    async fn update_vnode_bitmap(&mut self, vnodes: Arc<Bitmap>) -> StorageResult<Arc<Bitmap>> {
+        self.update_vnode_bitmap_impl(vnodes).await
+    }
+}
+
+impl StateStoreWriteEpochControl for LocalHummockStorage {
     async fn flush(&mut self) -> StorageResult<usize> {
         let buffer = self.mem_table.drain().into_parts();
         let mut kv_pairs = Vec::with_capacity(buffer.len());
         let mut old_values = if self.is_flush_old_value() {
             Some(Vec::with_capacity(buffer.len()))
+        } else {
+            None
+        };
+        let sanity_check_flushed_snapshot_reader = if sanity_check_enabled() {
+            Some(self.new_flushed_snapshot_reader_inner())
         } else {
             None
         };
@@ -385,13 +435,11 @@ impl LocalStateStore for LocalHummockStorage {
                 // a workaround you may call disable the check by initializing the
                 // state store with `is_consistent_op=false`.
                 KeyOp::Insert(value) => {
-                    if sanity_check_enabled() {
+                    if let Some(sanity_check_reader) = &sanity_check_flushed_snapshot_reader {
                         do_insert_sanity_check(
                             &key,
                             &value,
-                            self,
-                            self.epoch(),
-                            self.table_id,
+                            sanity_check_reader,
                             self.table_option,
                             &self.op_consistency_level,
                         )
@@ -403,13 +451,11 @@ impl LocalStateStore for LocalHummockStorage {
                     }
                 }
                 KeyOp::Delete(old_value) => {
-                    if sanity_check_enabled() {
+                    if let Some(sanity_check_reader) = &sanity_check_flushed_snapshot_reader {
                         do_delete_sanity_check(
                             &key,
                             &old_value,
-                            self,
-                            self.epoch(),
-                            self.table_id,
+                            sanity_check_reader,
                             self.table_option,
                             &self.op_consistency_level,
                         )
@@ -421,14 +467,12 @@ impl LocalStateStore for LocalHummockStorage {
                     }
                 }
                 KeyOp::Update((old_value, new_value)) => {
-                    if sanity_check_enabled() {
+                    if let Some(sanity_check_reader) = &sanity_check_flushed_snapshot_reader {
                         do_update_sanity_check(
                             &key,
                             &old_value,
                             &new_value,
-                            self,
-                            self.epoch(),
-                            self.table_id,
+                            sanity_check_reader,
                             self.table_option,
                             &self.op_consistency_level,
                         )
@@ -441,15 +485,7 @@ impl LocalStateStore for LocalHummockStorage {
                 }
             }
         }
-        self.flush_inner(
-            kv_pairs,
-            old_values,
-            WriteOptions {
-                epoch: self.epoch(),
-                table_id: self.table_id,
-            },
-        )
-        .await
+        self.flush_inner(kv_pairs, old_values).await
     }
 
     async fn try_flush(&mut self) -> StorageResult<()> {
@@ -471,21 +507,12 @@ impl LocalStateStore for LocalHummockStorage {
         Ok(())
     }
 
-    fn epoch(&self) -> u64 {
-        self.epoch.expect("should have set the epoch")
-    }
-
-    fn is_dirty(&self) -> bool {
-        self.mem_table.is_dirty()
-    }
-
     async fn init(&mut self, options: InitOptions) -> StorageResult<()> {
         let epoch = options.epoch;
-        if self.is_replicated {
-            self.wait_for_epoch(epoch.prev).await?;
-        }
-        assert!(
-            self.epoch.replace(epoch.curr).is_none(),
+        wait_for_epoch(&self.version_update_notifier_tx, epoch.prev, self.table_id).await?;
+        assert_eq!(
+            self.epoch.replace(epoch),
+            None,
             "local state store of table id {:?} is init for more than once",
             self.table_id
         );
@@ -495,21 +522,45 @@ impl LocalStateStore for LocalHummockStorage {
                     instance_id: self.instance_id(),
                     init_epoch: options.epoch.curr,
                 })
-                .expect("should succeed");
+                .map_err(|_| {
+                    HummockError::other("failed to send InitEpoch. maybe shutting down")
+                })?;
         }
         Ok(())
     }
 
     fn seal_current_epoch(&mut self, next_epoch: u64, mut opts: SealCurrentEpochOptions) {
-        assert!(!self.is_dirty());
+        assert!(!self.mem_table.is_dirty());
+        if !self.is_replicated {
+            if self.upload_on_flush {
+                debug_assert_eq!(self.read_version.write().pending_imm_size(), 0);
+            } else {
+                let pending_imms = self.read_version.write().start_upload_pending_imms();
+                if !pending_imms.is_empty()
+                    && self
+                        .event_sender
+                        .send(HummockEvent::ImmToUploader {
+                            instance_id: self.instance_id(),
+                            imms: pending_imms,
+                        })
+                        .is_err()
+                {
+                    warn!("failed to send ImmToUploader during seal. maybe shutting down");
+                }
+            }
+        }
+
         if let Some(new_level) = &opts.switch_op_consistency_level {
             self.mem_table.op_consistency_level.update(new_level);
             self.op_consistency_level.update(new_level);
         }
-        let prev_epoch = self
+        let epoch = self
             .epoch
-            .replace(next_epoch)
+            .as_mut()
             .expect("should have init epoch before seal the first epoch");
+        let prev_epoch = epoch.curr;
+        epoch.prev = prev_epoch;
+        epoch.curr = next_epoch;
         self.spill_offset = 0;
         assert!(
             next_epoch > prev_epoch,
@@ -517,7 +568,11 @@ impl LocalStateStore for LocalHummockStorage {
             next_epoch,
             prev_epoch
         );
-        if let Some((direction, watermarks)) = &mut opts.table_watermarks {
+
+        // only update the PkPrefix watermark for read
+        if let Some((direction, watermarks, WatermarkSerdeType::PkPrefix)) =
+            &mut opts.table_watermarks
+        {
             let mut read_version = self.read_version.write();
             read_version.filter_regress_watermarks(watermarks);
             if !watermarks.is_empty() {
@@ -525,38 +580,63 @@ impl LocalStateStore for LocalHummockStorage {
                     direction: *direction,
                     epoch: prev_epoch,
                     vnode_watermarks: watermarks.clone(),
+                    watermark_type: WatermarkSerdeType::PkPrefix,
                 });
             }
         }
-        if !self.is_replicated {
-            self.event_sender
+
+        if !self.is_replicated
+            && self
+                .event_sender
                 .send(HummockEvent::LocalSealEpoch {
                     instance_id: self.instance_id(),
                     next_epoch,
                     opts,
                 })
-                .expect("should be able to send");
+                .is_err()
+        {
+            warn!("failed to send LocalSealEpoch. maybe shutting down");
         }
-    }
-
-    fn update_vnode_bitmap(&mut self, vnodes: Arc<Bitmap>) -> Arc<Bitmap> {
-        let mut read_version = self.read_version.write();
-        assert!(read_version.staging().is_empty(), "There is uncommitted staging data in read version table_id {:?} instance_id {:?} on vnode bitmap update",
-            self.table_id(), self.instance_id()
-        );
-        read_version.update_vnode_bitmap(vnodes)
     }
 }
 
 impl LocalHummockStorage {
+    async fn update_vnode_bitmap_impl(
+        &mut self,
+        vnodes: Arc<Bitmap>,
+    ) -> StorageResult<Arc<Bitmap>> {
+        wait_for_epoch(
+            &self.version_update_notifier_tx,
+            self.epoch.expect("should have init").prev,
+            self.table_id,
+        )
+        .await?;
+        assert!(!self.mem_table.is_dirty());
+        let mut read_version = self.read_version.write();
+        assert!(
+            read_version.staging().is_empty(),
+            "There is uncommitted staging data in read version table_id {:?} instance_id {:?} on vnode bitmap update",
+            self.table_id(),
+            self.instance_id()
+        );
+        Ok(read_version.update_vnode_bitmap(vnodes))
+    }
+
+    fn new_flushed_snapshot_reader_inner(&self) -> LocalHummockFlushedSnapshotReader {
+        LocalHummockFlushedSnapshotReader {
+            table_id: self.table_id,
+            read_version: self.read_version.clone(),
+            hummock_version_reader: self.hummock_version_reader.clone(),
+        }
+    }
+
     async fn flush_inner(
         &mut self,
         sorted_items: Vec<SharedBufferItem>,
         old_values: Option<Vec<Bytes>>,
-        write_options: WriteOptions,
     ) -> StorageResult<usize> {
-        let epoch = write_options.epoch;
-        let table_id = write_options.table_id;
+        let epoch = self.epoch();
+        let table_id = self.table_id;
 
         let table_id_label = table_id.to_string();
         self.stats
@@ -575,27 +655,28 @@ impl LocalHummockStorage {
 
             self.write_limiter.wait_permission(self.table_id).await;
             let limiter = self.memory_limiter.as_ref();
-            let tracker = if let Some(tracker) = limiter.try_require_memory(size as u64) {
-                tracker
-            } else {
-                warn!(
-                    "blocked at requiring memory: {}, current {}",
-                    size,
-                    limiter.get_memory_usage()
-                );
-                self.event_sender
-                    .send(HummockEvent::BufferMayFlush)
-                    .expect("should be able to send");
-                let tracker = limiter
-                    .require_memory(size as u64)
-                    .verbose_instrument_await("hummock_require_memory")
-                    .await;
-                warn!(
-                    "successfully requiring memory: {}, current {}",
-                    size,
-                    limiter.get_memory_usage()
-                );
-                tracker
+            let tracker = match limiter.try_require_memory(size as u64) {
+                Some(tracker) => tracker,
+                _ => {
+                    warn!(
+                        "blocked at requiring memory: {}, current {}",
+                        size,
+                        limiter.get_memory_usage()
+                    );
+                    self.event_sender
+                        .send(HummockEvent::BufferMayFlush)
+                        .expect("should be able to send");
+                    let tracker = limiter
+                        .require_memory(size as u64)
+                        .instrument_await("hummock_require_memory".verbose())
+                        .await;
+                    warn!(
+                        "successfully requiring memory: {}, current {}",
+                        size,
+                        limiter.get_memory_usage()
+                    );
+                    tracker
+                }
             };
 
             let old_values = old_values.map(|old_values| {
@@ -618,13 +699,20 @@ impl LocalHummockStorage {
             );
             self.spill_offset += 1;
             let imm_size = imm.size();
-            self.update(VersionUpdate::Staging(StagingData::ImmMem(imm.clone())));
+            let mut read_version = self.read_version.write();
+            read_version.add_imm(imm);
 
             // insert imm to uploader
-            if !self.is_replicated {
+            if !self.is_replicated
+                && (self.upload_on_flush
+                    || read_version.pending_imm_size() >= self.mem_table_spill_threshold)
+            {
+                let imms = read_version.start_upload_pending_imms();
                 self.event_sender
-                    .send(HummockEvent::ImmToUploader { instance_id, imm })
-                    .unwrap();
+                    .send(HummockEvent::ImmToUploader { instance_id, imms })
+                    .map_err(|_| {
+                        HummockError::other("failed to send imm to uploader. maybe shutting down")
+                    })?;
             }
             imm_size
         } else {
@@ -651,7 +739,7 @@ impl LocalHummockStorage {
         memory_limiter: Arc<MemoryLimiter>,
         write_limiter: WriteLimiterRef,
         option: NewLocalOptions,
-        version_update_notifier_tx: Arc<tokio::sync::watch::Sender<HummockEpoch>>,
+        version_update_notifier_tx: Arc<tokio::sync::watch::Sender<PinnedVersion>>,
         mem_table_spill_threshold: usize,
     ) -> Self {
         let stats = hummock_version_reader.stats().clone();
@@ -672,6 +760,7 @@ impl LocalHummockStorage {
             write_limiter,
             version_update_notifier_tx,
             mem_table_spill_threshold,
+            upload_on_flush: option.upload_on_flush,
         }
     }
 
@@ -736,8 +825,8 @@ pub struct HummockStorageIteratorInner<'a> {
     stats_guard: IterLocalMetricsGuard,
 }
 
-impl<'a> StateStoreIter for HummockStorageIteratorInner<'a> {
-    async fn try_next<'b>(&'b mut self) -> StorageResult<Option<StateStoreIterItemRef<'b>>> {
+impl StateStoreIter for HummockStorageIteratorInner<'_> {
+    async fn try_next(&mut self) -> StorageResult<Option<StateStoreKeyedRowRef<'_>>> {
         let iter = &mut self.inner;
         if !self.initial_read {
             self.initial_read = true;
@@ -773,7 +862,7 @@ impl<'a> HummockStorageIteratorInner<'a> {
     }
 }
 
-impl<'a> Drop for HummockStorageIteratorInner<'a> {
+impl Drop for HummockStorageIteratorInner<'_> {
     fn drop(&mut self) {
         self.inner
             .collect_local_statistic(&mut self.stats_guard.local_stats);
@@ -818,8 +907,8 @@ pub struct HummockStorageRevIteratorInner<'a> {
     stats_guard: IterLocalMetricsGuard,
 }
 
-impl<'a> StateStoreIter for HummockStorageRevIteratorInner<'a> {
-    async fn try_next<'b>(&'b mut self) -> StorageResult<Option<StateStoreIterItemRef<'b>>> {
+impl StateStoreIter for HummockStorageRevIteratorInner<'_> {
+    async fn try_next(&mut self) -> StorageResult<Option<StateStoreKeyedRowRef<'_>>> {
         let iter = &mut self.inner;
         if !self.initial_read {
             self.initial_read = true;
@@ -855,7 +944,7 @@ impl<'a> HummockStorageRevIteratorInner<'a> {
     }
 }
 
-impl<'a> Drop for HummockStorageRevIteratorInner<'a> {
+impl Drop for HummockStorageRevIteratorInner<'_> {
     fn drop(&mut self) {
         self.inner
             .collect_local_statistic(&mut self.stats_guard.local_stats);

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,12 +15,13 @@
 #![feature(proc_macro_hygiene)]
 #![feature(stmt_expr_attributes)]
 #![feature(let_chains)]
+#![recursion_limit = "256"]
 
 use core::str::FromStr;
 use core::sync::atomic::Ordering;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use anyhow::anyhow;
 use clap::Parser;
@@ -39,6 +40,7 @@ use plotters::series::{LineSeries, PointSeries};
 use plotters::style::{IntoFont, RED, WHITE};
 use risingwave_common::bitmap::Bitmap;
 use risingwave_common::catalog::ColumnId;
+use risingwave_common::types::DataType;
 use risingwave_connector::dispatch_sink;
 use risingwave_connector::parser::{
     EncodingProperties, ParserConfig, ProtocolProperties, SpecificParserConfig,
@@ -51,17 +53,18 @@ use risingwave_connector::sink::log_store::{
 };
 use risingwave_connector::sink::mock_coordination_client::MockMetaClient;
 use risingwave_connector::sink::{
-    build_sink, LogSinker, Sink, SinkError, SinkMetaClient, SinkParam, SinkWriterParam,
-    SINK_TYPE_APPEND_ONLY, SINK_TYPE_UPSERT,
+    LogSinker, SINK_TYPE_APPEND_ONLY, SINK_TYPE_UPSERT, Sink, SinkError, SinkMetaClient, SinkParam,
+    SinkWriterParam, build_sink,
 };
 use risingwave_connector::source::datagen::{
     DatagenProperties, DatagenSplitEnumerator, DatagenSplitReader,
 };
 use risingwave_connector::source::{
-    Column, DataType, SourceContext, SourceEnumeratorContext, SplitEnumerator, SplitReader,
+    Column, SourceContext, SourceEnumeratorContext, SplitEnumerator, SplitReader,
 };
 use risingwave_stream::executor::test_utils::prelude::ColumnDesc;
 use risingwave_stream::executor::{Barrier, Message, MessageStreamItem, StreamExecutorError};
+use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Deserializer};
 use thiserror_ext::AsReport;
 use tokio::sync::oneshot::Sender;
@@ -106,6 +109,8 @@ impl LogReader for MockRangeLogReader {
                             prev_epoch,
                             LogStoreReadItem::Barrier {
                                 is_checkpoint: true,
+                                new_vnode_bitmap: None,
+                                is_stop: false,
                             },
                         ))
                     }
@@ -120,7 +125,7 @@ impl LogReader for MockRangeLogReader {
                             },
                         ))
                     }
-                    _ => Err(anyhow!("Can't assert message type".to_string())),
+                    _ => Err(anyhow!("Can't assert message type".to_owned())),
                 }
             }
         }
@@ -130,8 +135,12 @@ impl LogReader for MockRangeLogReader {
         Ok(())
     }
 
-    async fn rewind(&mut self) -> LogStoreResult<(bool, Option<Bitmap>)> {
-        Ok((false, None))
+    async fn rewind(&mut self) -> LogStoreResult<()> {
+        Err(anyhow!("should not call rewind"))
+    }
+
+    async fn start_from(&mut self, _start_offset: Option<u64>) -> LogStoreResult<()> {
+        Ok(())
     }
 }
 
@@ -347,8 +356,8 @@ impl MockDatagenSource {
                 Either::Right(Message::Chunk(chunk)) => yield Message::Chunk(chunk),
                 _ => {
                     return Err(StreamExecutorError::from(
-                        "Can't assert message type".to_string(),
-                    ))
+                        "Can't assert message type".to_owned(),
+                    ));
                 }
             }
         }
@@ -376,17 +385,20 @@ where
     <S as risingwave_connector::sink::Sink>::Coordinator: std::marker::Send,
     <S as risingwave_connector::sink::Sink>::Coordinator: 'static,
 {
-    if let Ok(coordinator) = sink.new_coordinator().await {
+    if let Ok(coordinator) = sink
+        .new_coordinator(DatabaseConnection::Disconnected, None)
+        .await
+    {
         sink_writer_param.meta_client = Some(SinkMetaClient::MockMetaClient(MockMetaClient::new(
             Box::new(coordinator),
         )));
         sink_writer_param.vnode_bitmap = Some(Bitmap::ones(1));
     }
     let log_sinker = sink.new_log_sinker(sink_writer_param).await.unwrap();
-    if let Err(e) = log_sinker.consume_log_and_sink(&mut log_reader).await {
-        return Err(e.to_report_string());
+    match log_sinker.consume_log_and_sink(&mut log_reader).await {
+        Ok(_) => Err("Stream closed".to_owned()),
+        Err(e) => Err(e.to_report_string()),
     }
-    Err("Stream closed".to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -468,8 +480,8 @@ fn mock_from_legacy_type(
     connector: &str,
     r#type: &str,
 ) -> Result<Option<SinkFormatDesc>, SinkError> {
-    use risingwave_connector::sink::redis::RedisSink;
     use risingwave_connector::sink::Sink as _;
+    use risingwave_connector::sink::redis::RedisSink;
     if connector.eq(RedisSink::SINK_NAME) {
         let format = match r#type {
             SINK_TYPE_APPEND_ONLY => SinkFormat::AppendOnly,
@@ -478,7 +490,7 @@ fn mock_from_legacy_type(
                 return Err(SinkError::Config(anyhow!(
                     "sink type unsupported: {}",
                     r#type
-                )))
+                )));
             }
         };
         Ok(Some(SinkFormatDesc {
@@ -487,6 +499,7 @@ fn mock_from_legacy_type(
             options: Default::default(),
             secret_refs: Default::default(),
             key_encode: None,
+            connection_id: None,
         }))
     } else {
         SinkFormatDesc::from_legacy_type(connector, r#type)
@@ -513,7 +526,7 @@ async fn main() {
         stop_rx,
         data_size_tx,
     );
-    if cfg.sink.eq(&BENCH_TEST.to_string()) {
+    if cfg.sink.eq(&BENCH_TEST.to_owned()) {
         println!("Start Sink Bench!, Wait {:?}s", BENCH_TIME);
         tokio::spawn(async move {
             mock_range_log_reader.init().await.unwrap();
@@ -530,7 +543,7 @@ async fn main() {
         let connector = properties.get("connector").unwrap().clone();
         let format_desc = mock_from_legacy_type(
             &connector.clone(),
-            properties.get("type").unwrap_or(&"append-only".to_string()),
+            properties.get("type").unwrap_or(&"append-only".to_owned()),
         )
         .unwrap();
         let sink_param = SinkParam {
@@ -541,15 +554,15 @@ async fn main() {
             downstream_pk: table_schema.pk_indices,
             sink_type: SinkType::AppendOnly,
             format_desc,
-            db_name: "not_need_set".to_string(),
-            sink_from_name: "not_need_set".to_string(),
+            db_name: "not_need_set".to_owned(),
+            sink_from_name: "not_need_set".to_owned(),
         };
         let sink = build_sink(sink_param).unwrap();
         let sink_writer_param = SinkWriterParam::for_test();
         println!("Start Sink Bench!, Wait {:?}s", BENCH_TIME);
         tokio::spawn(async move {
             dispatch_sink!(sink, sink, {
-                consume_log_stream(sink, mock_range_log_reader, sink_writer_param).boxed()
+                consume_log_stream(*sink, mock_range_log_reader, sink_writer_param).boxed()
             })
             .await
             .unwrap();

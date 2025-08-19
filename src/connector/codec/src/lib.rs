@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,8 +21,6 @@
 #![feature(stmt_expr_attributes)]
 #![feature(box_patterns)]
 #![feature(trait_alias)]
-#![feature(lint_reasons)]
-#![feature(lazy_cell)]
 #![feature(let_chains)]
 #![feature(box_into_inner)]
 #![feature(type_alias_impl_trait)]
@@ -39,6 +37,7 @@
 #![register_tool(rw)]
 #![recursion_limit = "256"]
 
+pub mod common;
 /// Converts JSON/AVRO/Protobuf data to RisingWave datum.
 /// The core API is [`decoder::Access`].
 pub mod decoder;
